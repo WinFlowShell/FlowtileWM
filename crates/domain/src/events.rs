@@ -1,6 +1,6 @@
 use crate::{
-    ColumnMode, CorrelationId, FocusOrigin, MonitorId, Rect, Size, StateVersion, WidthSemantics,
-    WindowClassification, WindowId, WindowLayer,
+    ColumnMode, ConfigProjection, CorrelationId, FocusOrigin, MonitorId, Rect, Size, StateVersion,
+    WidthSemantics, WindowClassification, WindowId, WindowLayer,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,9 +35,13 @@ pub enum DomainEventName {
     ExplorerRestartObserved,
     CmdFocusNext,
     CmdFocusPrev,
+    CmdScrollStripLeft,
+    CmdScrollStripRight,
     CmdMoveWindow,
     CmdToggleFloating,
     CmdToggleTabbed,
+    CmdToggleMaximized,
+    CmdToggleFullscreen,
     CmdToggleOverview,
     CmdEmergencyUnwind,
     ConfigReloadRequested,
@@ -70,9 +74,13 @@ impl DomainEventName {
             Self::ExplorerRestartObserved => "EVT-EXPLORER-RESTART-OBSERVED",
             Self::CmdFocusNext => "EVT-CMD-FOCUS-NEXT",
             Self::CmdFocusPrev => "EVT-CMD-FOCUS-PREV",
+            Self::CmdScrollStripLeft => "EVT-CMD-SCROLL-STRIP-LEFT",
+            Self::CmdScrollStripRight => "EVT-CMD-SCROLL-STRIP-RIGHT",
             Self::CmdMoveWindow => "EVT-CMD-MOVE-WINDOW",
             Self::CmdToggleFloating => "EVT-CMD-TOGGLE-FLOATING",
             Self::CmdToggleTabbed => "EVT-CMD-TOGGLE-TABBED",
+            Self::CmdToggleMaximized => "EVT-CMD-TOGGLE-MAXIMIZED",
+            Self::CmdToggleFullscreen => "EVT-CMD-TOGGLE-FULLSCREEN",
             Self::CmdToggleOverview => "EVT-CMD-TOGGLE-OVERVIEW",
             Self::CmdEmergencyUnwind => "EVT-CMD-EMERGENCY-UNWIND",
             Self::ConfigReloadRequested => "EVT-CONFIG-RELOAD-REQUESTED",
@@ -124,6 +132,13 @@ impl Default for WindowPlacement {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NavigationScope {
+    #[default]
+    WorkspaceStrip,
+    ColumnTabs,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowDiscoveredPayload {
     pub monitor_id: MonitorId,
@@ -149,11 +164,71 @@ pub struct WindowFocusObservedPayload {
     pub focus_origin: FocusOrigin,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FocusCommandPayload {
+    pub scope: NavigationScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StripScrollPayload {
+    pub scope: NavigationScope,
+    pub step: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowCommandPayload {
+    pub window_id: Option<WindowId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverviewCommandPayload {
+    pub monitor_id: Option<MonitorId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigReloadRequestedPayload {
+    pub source: EventSource,
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigReloadSucceededPayload {
+    pub config_generation: u64,
+    pub changed_sections: Vec<String>,
+    pub projection: ConfigProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigReloadFailedPayload {
+    pub error_code: String,
+    pub human_message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RulesUpdatedPayload {
+    pub rule_set_version: u64,
+    pub changed_rules: Vec<String>,
+    pub active_rule_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DomainEventPayload {
     WindowDiscovered(WindowDiscoveredPayload),
     WindowDestroyed(WindowDestroyedPayload),
     WindowFocusObserved(WindowFocusObservedPayload),
+    CmdFocusNext(FocusCommandPayload),
+    CmdFocusPrev(FocusCommandPayload),
+    CmdScrollStripLeft(StripScrollPayload),
+    CmdScrollStripRight(StripScrollPayload),
+    CmdToggleFloating(WindowCommandPayload),
+    CmdToggleTabbed(WindowCommandPayload),
+    CmdToggleMaximized(WindowCommandPayload),
+    CmdToggleFullscreen(WindowCommandPayload),
+    CmdToggleOverview(OverviewCommandPayload),
+    ConfigReloadRequested(ConfigReloadRequestedPayload),
+    ConfigReloadSucceeded(ConfigReloadSucceededPayload),
+    ConfigReloadFailed(ConfigReloadFailedPayload),
+    RulesUpdated(RulesUpdatedPayload),
     ReconcileRequested,
     FullScanRequested,
 }
@@ -258,6 +333,176 @@ impl DomainEvent {
                 monitor_id,
                 window_id,
                 focus_origin: FocusOrigin::PlatformObservation,
+            }),
+        )
+    }
+
+    pub fn focus_next(correlation_id: CorrelationId, scope: NavigationScope) -> Self {
+        Self::new(
+            DomainEventName::CmdFocusNext,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdFocusNext(FocusCommandPayload { scope }),
+        )
+    }
+
+    pub fn focus_prev(correlation_id: CorrelationId, scope: NavigationScope) -> Self {
+        Self::new(
+            DomainEventName::CmdFocusPrev,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdFocusPrev(FocusCommandPayload { scope }),
+        )
+    }
+
+    pub fn scroll_strip_left(
+        correlation_id: CorrelationId,
+        scope: NavigationScope,
+        step: u32,
+    ) -> Self {
+        Self::new(
+            DomainEventName::CmdScrollStripLeft,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdScrollStripLeft(StripScrollPayload { scope, step }),
+        )
+    }
+
+    pub fn scroll_strip_right(
+        correlation_id: CorrelationId,
+        scope: NavigationScope,
+        step: u32,
+    ) -> Self {
+        Self::new(
+            DomainEventName::CmdScrollStripRight,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdScrollStripRight(StripScrollPayload { scope, step }),
+        )
+    }
+
+    pub fn toggle_floating(correlation_id: CorrelationId, window_id: Option<WindowId>) -> Self {
+        Self::new(
+            DomainEventName::CmdToggleFloating,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdToggleFloating(WindowCommandPayload { window_id }),
+        )
+    }
+
+    pub fn toggle_tabbed(correlation_id: CorrelationId, window_id: Option<WindowId>) -> Self {
+        Self::new(
+            DomainEventName::CmdToggleTabbed,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdToggleTabbed(WindowCommandPayload { window_id }),
+        )
+    }
+
+    pub fn toggle_maximized(correlation_id: CorrelationId, window_id: Option<WindowId>) -> Self {
+        Self::new(
+            DomainEventName::CmdToggleMaximized,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdToggleMaximized(WindowCommandPayload { window_id }),
+        )
+    }
+
+    pub fn toggle_fullscreen(correlation_id: CorrelationId, window_id: Option<WindowId>) -> Self {
+        Self::new(
+            DomainEventName::CmdToggleFullscreen,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdToggleFullscreen(WindowCommandPayload { window_id }),
+        )
+    }
+
+    pub fn toggle_overview(correlation_id: CorrelationId, monitor_id: Option<MonitorId>) -> Self {
+        Self::new(
+            DomainEventName::CmdToggleOverview,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdToggleOverview(OverviewCommandPayload { monitor_id }),
+        )
+    }
+
+    pub fn config_reload_requested(
+        correlation_id: CorrelationId,
+        source: EventSource,
+        path: Option<String>,
+    ) -> Self {
+        Self::new(
+            DomainEventName::ConfigReloadRequested,
+            EventCategory::ConfigRulesDerived,
+            source,
+            correlation_id,
+            DomainEventPayload::ConfigReloadRequested(ConfigReloadRequestedPayload {
+                source,
+                path,
+            }),
+        )
+    }
+
+    pub fn config_reload_succeeded(
+        correlation_id: CorrelationId,
+        config_generation: u64,
+        changed_sections: Vec<String>,
+        projection: ConfigProjection,
+    ) -> Self {
+        Self::new(
+            DomainEventName::ConfigReloadSucceeded,
+            EventCategory::ConfigRulesDerived,
+            EventSource::ConfigRules,
+            correlation_id,
+            DomainEventPayload::ConfigReloadSucceeded(ConfigReloadSucceededPayload {
+                config_generation,
+                changed_sections,
+                projection,
+            }),
+        )
+    }
+
+    pub fn config_reload_failed(
+        correlation_id: CorrelationId,
+        error_code: impl Into<String>,
+        human_message: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            DomainEventName::ConfigReloadFailed,
+            EventCategory::ConfigRulesDerived,
+            EventSource::ConfigRules,
+            correlation_id,
+            DomainEventPayload::ConfigReloadFailed(ConfigReloadFailedPayload {
+                error_code: error_code.into(),
+                human_message: human_message.into(),
+            }),
+        )
+    }
+
+    pub fn rules_updated(
+        correlation_id: CorrelationId,
+        rule_set_version: u64,
+        changed_rules: Vec<String>,
+        active_rule_count: usize,
+    ) -> Self {
+        Self::new(
+            DomainEventName::RulesUpdated,
+            EventCategory::ConfigRulesDerived,
+            EventSource::ConfigRules,
+            correlation_id,
+            DomainEventPayload::RulesUpdated(RulesUpdatedPayload {
+                rule_set_version,
+                changed_rules,
+                active_rule_count,
             }),
         )
     }

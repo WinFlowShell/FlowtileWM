@@ -7,6 +7,10 @@ publish = false
 description = "Bootstrap entry point for the FlowtileWM core daemon."
 
 [dependencies]
+flowtile-config-rules.workspace = true
 flowtile-domain.workspace = true
+flowtile-ipc.workspace = true
 flowtile-windows-adapter.workspace = true
 flowtile-wm-core.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -8,20 +8,23 @@ mod ids;
 mod model;
 
 pub use events::{
+    ConfigReloadFailedPayload, ConfigReloadRequestedPayload, ConfigReloadSucceededPayload,
     DomainEvent, DomainEventName, DomainEventPayload, EventCategory, EventSource, FocusBehavior,
-    WindowDestroyedPayload, WindowDiscoveredPayload, WindowFocusObservedPayload, WindowPlacement,
+    FocusCommandPayload, NavigationScope, OverviewCommandPayload, RulesUpdatedPayload,
+    StripScrollPayload, WindowCommandPayload, WindowDestroyedPayload, WindowDiscoveredPayload,
+    WindowFocusObservedPayload, WindowPlacement,
 };
 pub use geometry::{Point, Rect, Size};
 pub use ids::{ColumnId, CorrelationId, MonitorId, WindowId, WorkspaceId, WorkspaceSetId};
 pub use model::{
     CapturePolicy, Column, ColumnMode, ConfigProjection, DiagnosticsSummary, FloatingLayer,
-    FocusOrigin, FocusState, LayoutState, MaximizedState, Monitor, OverviewState, RuntimeMode,
-    RuntimeState, ScrollingStrip, StripLayoutMode, TopologyRole, WidthSemantics,
+    FocusOrigin, FocusState, LayoutState, MaximizedState, Monitor, OverviewState, RestoreTarget,
+    RuntimeMode, RuntimeState, ScrollingStrip, StripLayoutMode, TopologyRole, WidthSemantics,
     WindowClassification, WindowLayer, WindowNode, WmState, Workspace, WorkspaceSet,
     all_column_modes,
 };
 
-pub const VERSION_LINE: &str = "v.0.0.4";
+pub const VERSION_LINE: &str = "v.1.0.0";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct StateVersion(u64);

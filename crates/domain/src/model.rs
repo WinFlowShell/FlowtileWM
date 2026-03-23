@@ -326,7 +326,11 @@ pub struct ConfigProjection {
     pub config_version: u64,
     pub live_reload_enabled: bool,
     pub rollback_supported: bool,
-    pub source_path: &'static str,
+    pub source_path: String,
+    pub strip_scroll_step: u32,
+    pub default_column_mode: ColumnMode,
+    pub default_column_width: WidthSemantics,
+    pub active_rule_count: usize,
 }
 
 impl Default for ConfigProjection {
@@ -335,7 +339,11 @@ impl Default for ConfigProjection {
             config_version: 0,
             live_reload_enabled: true,
             rollback_supported: true,
-            source_path: "config/flowtile.kdl",
+            source_path: "config/flowtile.kdl".to_string(),
+            strip_scroll_step: 240,
+            default_column_mode: ColumnMode::Normal,
+            default_column_width: WidthSemantics::default(),
+            active_rule_count: 0,
         }
     }
 }

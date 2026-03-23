@@ -1,0 +1,39 @@
+general {
+  mode "wm-only"
+}
+
+layout {
+  strip-scroll-step 240
+  default-column-mode "normal"
+  default-column-width "fraction" 1 2
+}
+
+input {
+  hotkey "Alt+J" "focus-next"
+  hotkey "Alt+K" "focus-prev"
+  hotkey "Alt+H" "scroll-strip-left"
+  hotkey "Alt+L" "scroll-strip-right"
+  hotkey "Alt+Shift+F" "toggle-floating"
+  hotkey "Alt+Shift+Space" "toggle-fullscreen"
+  hotkey "Alt+Shift+Backspace" "disable-management-and-unwind"
+}
+
+rules {
+  rule "float-dialogs" {
+    priority 100
+    enabled true
+    match-class-substring "Dialog"
+    actions {
+      layer "floating"
+    }
+  }
+
+  rule "float-settings" {
+    priority 110
+    enabled true
+    match-title-substring "Settings"
+    actions {
+      layer "floating"
+    }
+  }
+}

@@ -15,7 +15,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.94"
-version = "0.0.4"
+version = "1.0.0"
 
 [workspace.dependencies]
 flowtile-config-rules = { path = "crates/config-rules" }

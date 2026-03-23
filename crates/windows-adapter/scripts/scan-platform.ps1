@@ -54,6 +54,9 @@ public static class FlowtileNative
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
@@ -76,8 +79,13 @@ public static class FlowtileNative
 
     [DllImport("Shcore.dll")]
     public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 }
 "@
+
+$DWMWA_CLOAKED = 14
 
 function Convert-Rect {
     param(
@@ -117,6 +125,22 @@ function Get-MonitorObject {
         dpi = [int]$dpiX
         is_primary = (($info.dwFlags -band 1) -ne 0)
     }
+}
+
+function Test-IsCloakedWindow {
+    param(
+        [IntPtr]$WindowHandle
+    )
+
+    $cloaked = 0
+    $result = [FlowtileNative]::DwmGetWindowAttribute(
+        $WindowHandle,
+        $DWMWA_CLOAKED,
+        [ref]$cloaked,
+        4
+    )
+
+    return ($result -eq 0) -and ($cloaked -ne 0)
 }
 
 try {
@@ -162,6 +186,14 @@ try {
             return $true
         }
 
+        if ([FlowtileNative]::IsIconic($WindowHandle)) {
+            return $true
+        }
+
+        if (Test-IsCloakedWindow -WindowHandle $WindowHandle) {
+            return $true
+        }
+
         $owner = [FlowtileNative]::GetWindow($WindowHandle, 4)
         if ($owner -ne [IntPtr]::Zero) {
             return $true
@@ -194,6 +226,15 @@ try {
 
         $processId = [uint32]0
         [void][FlowtileNative]::GetWindowThreadProcessId($WindowHandle, [ref]$processId)
+        $processName = $null
+        if ($processId -ne 0) {
+            try {
+                $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName
+            }
+            catch {
+                $processName = $null
+            }
+        }
 
         $monitorHandle = [FlowtileNative]::MonitorFromWindow($WindowHandle, 2)
         $monitor = Get-MonitorObject -MonitorHandle $monitorHandle
@@ -206,6 +247,7 @@ try {
             title = $titleBuilder.ToString()
             class_name = $className
             process_id = [int]$processId
+            process_name = $processName
             rect = $rect
             monitor_binding = $monitor.binding
             is_visible = $true

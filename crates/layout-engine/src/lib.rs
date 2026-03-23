@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use flowtile_domain::{
-    ColumnMode, Rect, WidthSemantics, WindowId, WindowLayer, WmState, WorkspaceId, all_column_modes,
+    Column, ColumnMode, MaximizedState, Rect, WindowId, WindowLayer, WmState, WorkspaceId,
+    all_column_modes,
 };
 
 pub fn bootstrap_modes() -> [ColumnMode; 4] {
@@ -60,7 +61,7 @@ pub fn recompute_workspace(
             .columns
             .get(column_id)
             .ok_or(LayoutError::ColumnMissing)?;
-        let column_width = resolve_width(column.width_semantics, monitor.work_area_rect.width);
+        let column_width = resolve_width(column, monitor.work_area_rect.width);
         content_width = content_width.saturating_add(column_width);
 
         match column.mode {
@@ -130,7 +131,9 @@ pub fn recompute_workspace(
             .windows
             .get(window_id)
             .ok_or(LayoutError::WindowMissing(*window_id))?;
-        let rect = if window.last_known_rect.width > 0 && window.last_known_rect.height > 0 {
+        let rect = if window.layer == WindowLayer::Fullscreen || window.is_fullscreen {
+            viewport
+        } else if window.last_known_rect.width > 0 && window.last_known_rect.height > 0 {
             window.last_known_rect
         } else {
             Rect::new(
@@ -144,7 +147,7 @@ pub fn recompute_workspace(
         window_geometries.push(WindowGeometryProjection {
             window_id: *window_id,
             rect,
-            layer: WindowLayer::Floating,
+            layer: window.layer,
         });
     }
 
@@ -165,8 +168,14 @@ pub fn recompute_workspace(
     })
 }
 
-fn resolve_width(width_semantics: WidthSemantics, monitor_width: u32) -> u32 {
-    width_semantics.resolve(monitor_width)
+fn resolve_width(column: &Column, monitor_width: u32) -> u32 {
+    if column.maximized_state == MaximizedState::Maximized
+        || column.mode == ColumnMode::MaximizedColumn
+    {
+        monitor_width.max(1)
+    } else {
+        column.width_semantics.resolve(monitor_width)
+    }
 }
 
 #[cfg(test)]
@@ -275,5 +284,106 @@ mod tests {
         assert_eq!(tiled.rect.x, -200);
         assert_eq!(floating.rect.x, 300);
         assert_eq!(floating.rect.y, 120);
+    }
+
+    #[test]
+    fn maximized_column_uses_full_monitor_width() {
+        let mut state = WmState::new(RuntimeMode::WmOnly);
+        let monitor_id = state.add_monitor(Rect::new(0, 0, 1200, 800), 96, true);
+        let workspace_id = state
+            .active_workspace_id_for_monitor(monitor_id)
+            .expect("workspace should exist");
+        let window_id = state.allocate_window_id();
+        let column_id = state.allocate_column_id();
+        let column = Column::new(
+            column_id,
+            flowtile_domain::ColumnMode::Normal,
+            WidthSemantics::Fixed(400),
+            vec![window_id],
+        );
+        state.layout.columns.insert(
+            column_id,
+            flowtile_domain::Column {
+                maximized_state: flowtile_domain::MaximizedState::Maximized,
+                ..column
+            },
+        );
+        state
+            .workspaces
+            .get_mut(&workspace_id)
+            .expect("workspace should exist")
+            .strip
+            .ordered_column_ids
+            .push(column_id);
+        state.windows.insert(
+            window_id,
+            flowtile_domain::WindowNode {
+                id: window_id,
+                current_hwnd_binding: Some(10),
+                classification: flowtile_domain::WindowClassification::Application,
+                layer: flowtile_domain::WindowLayer::Tiled,
+                workspace_id,
+                column_id: Some(column_id),
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(0, 0, 400, 800),
+                desired_size: Size::new(400, 800),
+            },
+        );
+
+        let projection = recompute_workspace(&state, workspace_id).expect("layout should succeed");
+        let geometry = projection
+            .window_geometries
+            .iter()
+            .find(|geometry| geometry.window_id == window_id)
+            .expect("geometry should exist");
+
+        assert_eq!(geometry.rect.width, 1200);
+    }
+
+    #[test]
+    fn fullscreen_window_uses_viewport_geometry() {
+        let mut state = WmState::new(RuntimeMode::WmOnly);
+        let monitor_id = state.add_monitor(Rect::new(0, 0, 1200, 800), 96, true);
+        let workspace_id = state
+            .active_workspace_id_for_monitor(monitor_id)
+            .expect("workspace should exist");
+        let window_id = state.allocate_window_id();
+        state
+            .workspaces
+            .get_mut(&workspace_id)
+            .expect("workspace should exist")
+            .floating_layer
+            .ordered_window_ids
+            .push(window_id);
+        state.windows.insert(
+            window_id,
+            flowtile_domain::WindowNode {
+                id: window_id,
+                current_hwnd_binding: Some(10),
+                classification: flowtile_domain::WindowClassification::Application,
+                layer: flowtile_domain::WindowLayer::Fullscreen,
+                workspace_id,
+                column_id: None,
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: true,
+                restore_target: None,
+                last_known_rect: Rect::new(20, 20, 400, 300),
+                desired_size: Size::new(400, 300),
+            },
+        );
+
+        let projection = recompute_workspace(&state, workspace_id).expect("layout should succeed");
+        let geometry = projection
+            .window_geometries
+            .iter()
+            .find(|geometry| geometry.window_id == window_id)
+            .expect("geometry should exist");
+
+        assert_eq!(geometry.rect, Rect::new(0, 0, 1200, 800));
+        assert_eq!(geometry.layer, flowtile_domain::WindowLayer::Fullscreen);
     }
 }

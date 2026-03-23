@@ -7,4 +7,5 @@ publish = false
 description = "Bootstrap configuration and rules metadata for FlowtileWM."
 
 [dependencies]
-
+flowtile-domain.workspace = true
+kdl = "6.5"
