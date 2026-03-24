@@ -10,10 +10,8 @@ layout {
 
 input {
   bind-control-mode "coexistence"
-  hotkey "Win+Y" "focus-next"
-  hotkey "Win+U" "focus-prev"
-  hotkey "Win+H" "scroll-strip-left"
-  hotkey "Win+J" "scroll-strip-right"
+  hotkey "Win+H" "focus-prev"
+  hotkey "Win+J" "focus-next"
   hotkey "Win+Ctrl+Shift+F" "toggle-floating"
   hotkey "Win+Ctrl+Shift+Space" "toggle-fullscreen"
   hotkey "Win+Ctrl+Shift+Backspace" "disable-management-and-unwind"

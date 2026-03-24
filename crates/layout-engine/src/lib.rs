@@ -52,7 +52,21 @@ pub fn recompute_workspace(
         .ok_or(LayoutError::MonitorMissing)?;
     let viewport = workspace.strip.visible_region;
     let mut content_width = 0_u32;
-    let mut x_cursor = viewport.x - workspace.strip.scroll_offset;
+    for column_id in &workspace.strip.ordered_column_ids {
+        let column = state
+            .layout
+            .columns
+            .get(column_id)
+            .ok_or(LayoutError::ColumnMissing)?;
+        content_width =
+            content_width.saturating_add(resolve_width(column, monitor.work_area_rect.width));
+    }
+    let leading_inset = single_column_center_inset(
+        viewport.width,
+        content_width,
+        workspace.strip.ordered_column_ids.len(),
+    );
+    let mut x_cursor = viewport.x + leading_inset - workspace.strip.scroll_offset;
     let mut window_geometries = Vec::new();
 
     for column_id in &workspace.strip.ordered_column_ids {
@@ -62,7 +76,6 @@ pub fn recompute_workspace(
             .get(column_id)
             .ok_or(LayoutError::ColumnMissing)?;
         let column_width = resolve_width(column, monitor.work_area_rect.width);
-        content_width = content_width.saturating_add(column_width);
 
         match column.mode {
             ColumnMode::Tabbed => {
@@ -178,6 +191,14 @@ fn resolve_width(column: &Column, monitor_width: u32) -> u32 {
     }
 }
 
+fn single_column_center_inset(viewport_width: u32, content_width: u32, column_count: usize) -> i32 {
+    if column_count != 1 || content_width >= viewport_width {
+        return 0;
+    }
+
+    ((viewport_width - content_width) / 2).min(i32::MAX as u32) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use flowtile_domain::{Column, Rect, RuntimeMode, Size, WidthSemantics, WmState};
@@ -281,7 +302,7 @@ mod tests {
             .find(|geometry| geometry.window_id == floating_window_id)
             .expect("floating geometry should exist");
 
-        assert_eq!(tiled.rect.x, -200);
+        assert_eq!(tiled.rect.x, 200);
         assert_eq!(floating.rect.x, 300);
         assert_eq!(floating.rect.y, 120);
     }
@@ -341,6 +362,145 @@ mod tests {
             .expect("geometry should exist");
 
         assert_eq!(geometry.rect.width, 1200);
+    }
+
+    #[test]
+    fn tiled_columns_form_gapless_strip_projection() {
+        let mut state = WmState::new(RuntimeMode::WmOnly);
+        let monitor_id = state.add_monitor(Rect::new(0, 0, 1200, 800), 96, true);
+        let workspace_id = state
+            .active_workspace_id_for_monitor(monitor_id)
+            .expect("workspace should exist");
+        let window_ids = [
+            state.allocate_window_id(),
+            state.allocate_window_id(),
+            state.allocate_window_id(),
+        ];
+        let column_ids = [
+            state.allocate_column_id(),
+            state.allocate_column_id(),
+            state.allocate_column_id(),
+        ];
+
+        for ((window_id, column_id), width) in window_ids
+            .iter()
+            .copied()
+            .zip(column_ids.iter().copied())
+            .zip([200_u32, 350, 400])
+        {
+            state.layout.columns.insert(
+                column_id,
+                Column::new(
+                    column_id,
+                    flowtile_domain::ColumnMode::Normal,
+                    WidthSemantics::Fixed(width),
+                    vec![window_id],
+                ),
+            );
+            state.windows.insert(
+                window_id,
+                flowtile_domain::WindowNode {
+                    id: window_id,
+                    current_hwnd_binding: Some(window_id.get()),
+                    classification: flowtile_domain::WindowClassification::Application,
+                    layer: flowtile_domain::WindowLayer::Tiled,
+                    workspace_id,
+                    column_id: Some(column_id),
+                    is_managed: true,
+                    is_floating: false,
+                    is_fullscreen: false,
+                    restore_target: None,
+                    last_known_rect: Rect::new(0, 0, width, 800),
+                    desired_size: Size::new(width, 800),
+                },
+            );
+            state
+                .workspaces
+                .get_mut(&workspace_id)
+                .expect("workspace should exist")
+                .strip
+                .ordered_column_ids
+                .push(column_id);
+        }
+        state
+            .workspaces
+            .get_mut(&workspace_id)
+            .expect("workspace should exist")
+            .strip
+            .scroll_offset = 75;
+
+        let projection = recompute_workspace(&state, workspace_id).expect("layout should succeed");
+        let mut geometries = projection
+            .window_geometries
+            .iter()
+            .filter(|geometry| geometry.layer == flowtile_domain::WindowLayer::Tiled)
+            .collect::<Vec<_>>();
+        geometries.sort_by_key(|geometry| geometry.rect.x);
+
+        assert_eq!(geometries.len(), 3);
+        assert_eq!(
+            geometries[1].rect.x,
+            geometries[0].rect.x + geometries[0].rect.width as i32
+        );
+        assert_eq!(
+            geometries[2].rect.x,
+            geometries[1].rect.x + geometries[1].rect.width as i32
+        );
+    }
+
+    #[test]
+    fn single_narrow_column_is_centered_in_viewport() {
+        let mut state = WmState::new(RuntimeMode::WmOnly);
+        let monitor_id = state.add_monitor(Rect::new(0, 0, 1200, 800), 96, true);
+        let workspace_id = state
+            .active_workspace_id_for_monitor(monitor_id)
+            .expect("workspace should exist");
+        let window_id = state.allocate_window_id();
+        let column_id = state.allocate_column_id();
+
+        state.layout.columns.insert(
+            column_id,
+            Column::new(
+                column_id,
+                flowtile_domain::ColumnMode::Normal,
+                WidthSemantics::Fixed(400),
+                vec![window_id],
+            ),
+        );
+        state.windows.insert(
+            window_id,
+            flowtile_domain::WindowNode {
+                id: window_id,
+                current_hwnd_binding: Some(10),
+                classification: flowtile_domain::WindowClassification::Application,
+                layer: flowtile_domain::WindowLayer::Tiled,
+                workspace_id,
+                column_id: Some(column_id),
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(0, 0, 400, 800),
+                desired_size: Size::new(400, 800),
+            },
+        );
+        state
+            .workspaces
+            .get_mut(&workspace_id)
+            .expect("workspace should exist")
+            .strip
+            .ordered_column_ids
+            .push(column_id);
+
+        let projection = recompute_workspace(&state, workspace_id).expect("layout should succeed");
+        let geometry = projection
+            .window_geometries
+            .iter()
+            .find(|geometry| geometry.window_id == window_id)
+            .expect("window geometry should exist");
+
+        assert_eq!(geometry.rect.x, 400);
+        assert_eq!(geometry.rect.width, 400);
     }
 
     #[test]

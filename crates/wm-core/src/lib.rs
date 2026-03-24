@@ -22,7 +22,7 @@ use flowtile_windows_adapter::{
     ApplyBatchResult, ApplyOperation, ObservationEnvelope, ObservationKind,
     PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff,
     WindowsAdapter, WindowsAdapterError, bootstrap as windows_bootstrap, diff_snapshots,
-    needs_geometry_apply,
+    needs_activation_apply, needs_geometry_apply,
 };
 use std::{
     path::{Path, PathBuf},
@@ -165,9 +165,9 @@ impl RuntimeCycleReport {
             format!("windows observed: {}", self.observed_window_count),
             format!("windows discovered: {}", self.discovered_windows),
             format!("windows destroyed: {}", self.destroyed_windows),
-            format!("geometry operations planned: {}", self.planned_operations),
-            format!("geometry operations applied: {}", self.applied_operations),
-            format!("geometry apply failures: {}", self.apply_failures),
+            format!("platform operations planned: {}", self.planned_operations),
+            format!("platform operations applied: {}", self.applied_operations),
+            format!("platform apply failures: {}", self.apply_failures),
             format!("recovery rescans: {}", self.recovery_rescans),
             format!(
                 "validation operations remaining: {}",
@@ -345,6 +345,9 @@ impl StateStore {
                             .get_mut(&column_id)
                             .ok_or(CoreError::UnknownColumn(column_id))?;
                         column.ordered_window_ids.push(window_id);
+                        if column.active_window_id.is_none() {
+                            column.active_window_id = Some(window_id);
+                        }
                         if column.mode == ColumnMode::Tabbed {
                             column.tab_selection = Some(window_id);
                         }
@@ -428,6 +431,7 @@ impl StateStore {
             workspace_set.active_workspace_id = workspace_id;
         }
 
+        let previous_column_id = focused_column_id;
         if !should_preserve_current_focus {
             self.set_focus_to_window(
                 payload.monitor_id,
@@ -442,7 +446,7 @@ impl StateStore {
         if !should_preserve_current_focus {
             self.clamp_scroll_offset(workspace_id)?;
             if let Some(column_id) = target_column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id)?;
+                self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
             }
         }
         Ok(Some(workspace_id))
@@ -456,7 +460,8 @@ impl StateStore {
             .state
             .windows
             .get(&payload.window_id)
-            .ok_or(CoreError::UnknownWindow(payload.window_id))?;
+            .ok_or(CoreError::UnknownWindow(payload.window_id))?
+            .clone();
         let workspace_id = window.workspace_id;
         let monitor_id = self
             .state
@@ -469,7 +474,7 @@ impl StateStore {
         self.state.windows.remove(&payload.window_id);
 
         if self.state.focus.focused_window_id == Some(payload.window_id) {
-            self.retarget_focus_after_destroy(workspace_id)?;
+            self.retarget_focus_after_destroy(workspace_id, window.column_id)?;
         }
 
         self.state.ensure_tail_workspace(monitor_id);
@@ -504,6 +509,7 @@ impl StateStore {
         }
 
         let focused_column_id = window.column_id;
+        let previous_column_id = self.focused_column_in_workspace(workspace_id);
         self.set_focus_to_window(
             payload.monitor_id,
             workspace_id,
@@ -512,7 +518,7 @@ impl StateStore {
             payload.focus_origin,
         )?;
         if let Some(column_id) = focused_column_id {
-            self.reveal_column_in_workspace(workspace_id, column_id)?;
+            self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
         }
 
         Ok(Some(workspace_id))
@@ -562,6 +568,7 @@ impl StateStore {
             .map(|workspace| workspace.monitor_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
 
+        let previous_column_id = self.focused_column_in_workspace(workspace_id);
         self.set_focus_to_window(
             monitor_id,
             workspace_id,
@@ -570,7 +577,7 @@ impl StateStore {
             FocusOrigin::UserCommand,
         )?;
         if let Some(column_id) = column_id {
-            self.reveal_column_in_workspace(workspace_id, column_id)?;
+            self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
         }
 
         Ok(Some(workspace_id))
@@ -635,6 +642,7 @@ impl StateStore {
             window.is_floating = false;
             window.is_fullscreen = false;
             window.restore_target = None;
+            let previous_column_id = self.focused_column_in_workspace(workspace_id);
             self.set_focus_to_window(
                 monitor_id,
                 workspace_id,
@@ -643,7 +651,7 @@ impl StateStore {
                 FocusOrigin::UserCommand,
             )?;
             if let Some(column_id) = restored_column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id)?;
+                self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
             }
         } else {
             let restore_target = RestoreTarget {
@@ -706,8 +714,13 @@ impl StateStore {
             column.mode = ColumnMode::Tabbed;
             column.tab_selection = Some(window_id);
         }
+        column.active_window_id = Some(window_id);
 
-        self.reveal_column_in_workspace(workspace_id, column_id)?;
+        self.reveal_column_in_workspace(
+            workspace_id,
+            column_id,
+            self.focused_column_in_workspace(workspace_id),
+        )?;
         Ok(Some(workspace_id))
     }
 
@@ -739,7 +752,11 @@ impl StateStore {
             MaximizedState::Maximized => MaximizedState::Normal,
         };
 
-        self.reveal_column_in_workspace(workspace_id, column_id)?;
+        self.reveal_column_in_workspace(
+            workspace_id,
+            column_id,
+            self.focused_column_in_workspace(workspace_id),
+        )?;
         Ok(Some(workspace_id))
     }
 
@@ -785,6 +802,7 @@ impl StateStore {
             window.is_floating = restore_target.layer == WindowLayer::Floating;
             window.is_fullscreen = false;
             window.restore_target = None;
+            let previous_column_id = self.focused_column_in_workspace(workspace_id);
             self.set_focus_to_window(
                 monitor_id,
                 workspace_id,
@@ -793,7 +811,7 @@ impl StateStore {
                 FocusOrigin::UserCommand,
             )?;
             if let Some(column_id) = restored_column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id)?;
+                self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
             }
         } else {
             let restore_target = RestoreTarget {
@@ -949,6 +967,19 @@ impl StateStore {
             .then_some(focused_column_id)
     }
 
+    fn column_active_window(&self, column: &Column) -> Option<WindowId> {
+        if column.mode == ColumnMode::Tabbed {
+            column
+                .tab_selection
+                .or(column.active_window_id)
+                .or_else(|| column.ordered_window_ids.first().copied())
+        } else {
+            column
+                .active_window_id
+                .or_else(|| column.ordered_window_ids.first().copied())
+        }
+    }
+
     fn active_workspace_id_for_commands(&self) -> Result<WorkspaceId, CoreError> {
         if let Some(monitor_id) = self.state.focus.focused_monitor_id
             && let Some(workspace_id) = self.state.active_workspace_id_for_monitor(monitor_id)
@@ -1010,6 +1041,11 @@ impl StateStore {
                     .retain(|candidate_window_id| *candidate_window_id != window_id);
                 if column.tab_selection == Some(window_id) {
                     column.tab_selection = column.ordered_window_ids.first().copied();
+                }
+                if column.active_window_id == Some(window_id) {
+                    column.active_window_id = column
+                        .tab_selection
+                        .or_else(|| column.ordered_window_ids.first().copied());
                 }
                 column_is_empty = column.ordered_window_ids.is_empty();
             }
@@ -1073,6 +1109,9 @@ impl StateStore {
                         if !column.ordered_window_ids.contains(&window_id) {
                             column.ordered_window_ids.push(window_id);
                         }
+                        if column.active_window_id.is_none() {
+                            column.active_window_id = Some(window_id);
+                        }
                         if column.mode == ColumnMode::Tabbed {
                             column.tab_selection = Some(window_id);
                         }
@@ -1115,17 +1154,8 @@ impl StateStore {
                 .columns
                 .get(column_id)
                 .ok_or(CoreError::UnknownColumn(*column_id))?;
-            if column.mode == ColumnMode::Tabbed {
-                if let Some(window_id) = column
-                    .tab_selection
-                    .or_else(|| column.ordered_window_ids.first().copied())
-                {
-                    sequence.push((window_id, Some(*column_id)));
-                }
-            } else {
-                for window_id in &column.ordered_window_ids {
-                    sequence.push((*window_id, Some(*column_id)));
-                }
+            if let Some(window_id) = self.column_active_window(column) {
+                sequence.push((window_id, Some(*column_id)));
             }
         }
 
@@ -1162,6 +1192,7 @@ impl StateStore {
 
             let current_window_id = column
                 .tab_selection
+                .or(column.active_window_id)
                 .or(self.focused_window_in_workspace(workspace_id))
                 .or_else(|| column.ordered_window_ids.first().copied())
                 .ok_or(CoreError::InvalidEvent(
@@ -1204,7 +1235,7 @@ impl StateStore {
             Some(column_id),
             FocusOrigin::UserCommand,
         )?;
-        self.reveal_column_in_workspace(workspace_id, column_id)?;
+        self.reveal_column_in_workspace(workspace_id, column_id, Some(column_id))?;
         Ok(true)
     }
 
@@ -1233,9 +1264,11 @@ impl StateStore {
 
         if let Some(column_id) = column_id
             && let Some(column) = self.state.layout.columns.get_mut(&column_id)
-            && column.mode == ColumnMode::Tabbed
         {
-            column.tab_selection = Some(window_id);
+            column.active_window_id = Some(window_id);
+            if column.mode == ColumnMode::Tabbed {
+                column.tab_selection = Some(window_id);
+            }
         }
 
         Ok(())
@@ -1311,11 +1344,11 @@ impl StateStore {
         Ok(total_width)
     }
 
-    fn reveal_column_in_workspace(
-        &mut self,
+    fn column_bounds_in_workspace(
+        &self,
         workspace_id: WorkspaceId,
         target_column_id: ColumnId,
-    ) -> Result<(), CoreError> {
+    ) -> Result<Option<(i32, i32, i32)>, CoreError> {
         let workspace = self
             .state
             .workspaces
@@ -1326,9 +1359,6 @@ impl StateStore {
             .monitors
             .get(&workspace.monitor_id)
             .ok_or(CoreError::UnknownMonitor(workspace.monitor_id))?;
-        let viewport_width = workspace.strip.visible_region.width.min(i32::MAX as u32) as i32;
-        let visible_left = workspace.strip.scroll_offset;
-        let visible_right = visible_left.saturating_add(viewport_width);
         let mut column_left = 0_i32;
 
         for column_id in &workspace.strip.ordered_column_ids {
@@ -1344,23 +1374,73 @@ impl StateStore {
             let column_right = column_left.saturating_add(column_width);
 
             if *column_id == target_column_id {
-                let desired_scroll_offset =
-                    if column_width >= viewport_width || column_left < visible_left {
-                        column_left
-                    } else if column_right > visible_right {
-                        column_right.saturating_sub(viewport_width)
-                    } else {
-                        visible_left
-                    };
-                self.apply_scroll_delta(
-                    workspace_id,
-                    desired_scroll_offset.saturating_sub(visible_left),
-                )?;
-                return Ok(());
+                return Ok(Some((column_left, column_right, column_width)));
             }
 
             column_left = column_right;
         }
+
+        Ok(None)
+    }
+
+    fn reveal_column_in_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        target_column_id: ColumnId,
+        previous_column_id: Option<ColumnId>,
+    ) -> Result<(), CoreError> {
+        let workspace = self
+            .state
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
+        let viewport_width = workspace.strip.visible_region.width.min(i32::MAX as u32) as i32;
+        let visible_left = workspace.strip.scroll_offset;
+        let visible_right = visible_left.saturating_add(viewport_width);
+        let is_single_column_workspace = workspace.strip.ordered_column_ids.len() == 1;
+        let Some((column_left, column_right, column_width)) =
+            self.column_bounds_in_workspace(workspace_id, target_column_id)?
+        else {
+            return Ok(());
+        };
+        let previous_bounds = previous_column_id
+            .filter(|column_id| *column_id != target_column_id)
+            .and_then(|column_id| {
+                self.column_bounds_in_workspace(workspace_id, column_id)
+                    .ok()
+            })
+            .flatten();
+        let should_center_target = if column_width < viewport_width {
+            if is_single_column_workspace {
+                true
+            } else {
+                previous_bounds.is_some_and(|(previous_left, previous_right, _)| {
+                    let reveal_span_left = previous_left.min(column_left);
+                    let reveal_span_right = previous_right.max(column_right);
+                    reveal_span_right.saturating_sub(reveal_span_left) > viewport_width
+                })
+            }
+        } else {
+            false
+        };
+        let max_scroll_offset = self.max_scroll_offset(workspace_id)?;
+        let desired_scroll_offset = if should_center_target {
+            column_left
+                .saturating_add(column_width / 2)
+                .saturating_sub(viewport_width / 2)
+                .clamp(0, max_scroll_offset)
+        } else if column_width >= viewport_width || column_left < visible_left {
+            column_left
+        } else if column_right > visible_right {
+            column_right.saturating_sub(viewport_width)
+        } else {
+            visible_left
+        };
+        let desired_scroll_offset = desired_scroll_offset.clamp(0, max_scroll_offset);
+        self.apply_scroll_delta(
+            workspace_id,
+            desired_scroll_offset.saturating_sub(visible_left),
+        )?;
 
         Ok(())
     }
@@ -1375,23 +1455,36 @@ impl StateStore {
         }
     }
 
-    fn retarget_focus_after_destroy(&mut self, workspace_id: WorkspaceId) -> Result<(), CoreError> {
+    fn retarget_focus_after_destroy(
+        &mut self,
+        workspace_id: WorkspaceId,
+        preferred_column_id: Option<ColumnId>,
+    ) -> Result<(), CoreError> {
         let workspace = self
             .state
             .workspaces
             .get(&workspace_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
         let monitor_id = workspace.monitor_id;
-        let next_focus = workspace
-            .strip
-            .ordered_column_ids
-            .iter()
-            .find_map(|column_id| {
-                let column = self.state.layout.columns.get(column_id)?;
-                let window_id = column
-                    .tab_selection
-                    .or_else(|| column.ordered_window_ids.first().copied())?;
-                Some((window_id, Some(*column_id)))
+        let next_focus = preferred_column_id
+            .and_then(|column_id| {
+                let column = self.state.layout.columns.get(&column_id)?;
+                self.column_active_window(column)
+                    .map(|window_id| (window_id, Some(column_id)))
+            })
+            .or_else(|| {
+                workspace
+                    .strip
+                    .ordered_column_ids
+                    .iter()
+                    .find_map(|column_id| {
+                        if Some(*column_id) == preferred_column_id {
+                            return None;
+                        }
+                        let column = self.state.layout.columns.get(column_id)?;
+                        self.column_active_window(column)
+                            .map(|window_id| (window_id, Some(*column_id)))
+                    })
             })
             .or_else(|| {
                 workspace
@@ -1411,7 +1504,7 @@ impl StateStore {
                 FocusOrigin::ReducerDefault,
             )?;
             if let Some(column_id) = column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id)?;
+                self.reveal_column_in_workspace(workspace_id, column_id, preferred_column_id)?;
             }
         } else {
             self.state.focus.focused_monitor_id = Some(monitor_id);
@@ -1891,6 +1984,15 @@ impl CoreDaemonRuntime {
             .iter()
             .map(|window| (window.hwnd, window))
             .collect::<std::collections::HashMap<_, _>>();
+        let desired_focused_hwnd = self
+            .store
+            .state()
+            .focus
+            .focused_window_id
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .filter(|window| window.is_managed)
+            .and_then(|window| window.current_hwnd_binding);
+        let actual_focused_hwnd = snapshot.focused_window().map(|window| window.hwnd);
         let mut operations = Vec::new();
 
         for workspace in self.store.state().workspaces.values() {
@@ -1912,10 +2014,16 @@ impl CoreDaemonRuntime {
                 let Some(actual_window) = actual_windows.get(&hwnd) else {
                     continue;
                 };
-                if needs_geometry_apply(actual_window.rect, geometry.rect) {
+                let activate = desired_focused_hwnd
+                    .filter(|desired_hwnd| *desired_hwnd == hwnd)
+                    .is_some_and(|desired_hwnd| {
+                        needs_activation_apply(actual_focused_hwnd, desired_hwnd)
+                    });
+                if needs_geometry_apply(actual_window.rect, geometry.rect) || activate {
                     operations.push(ApplyOperation {
                         hwnd,
                         rect: geometry.rect,
+                        activate,
                     });
                 }
             }
@@ -2293,7 +2401,7 @@ mod tests {
             first_window_id,
         );
 
-        assert_eq!(first_rect_before, first_rect_after);
+        assert_eq!(first_rect_before.1, first_rect_after.1);
     }
 
     #[test]
@@ -2631,6 +2739,175 @@ mod tests {
     }
 
     #[test]
+    fn strip_navigation_returns_to_remembered_active_window_of_column() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 600, 700), 96, true);
+
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(1),
+                monitor_id,
+                100,
+                Size::new(400, 350),
+                Rect::new(0, 0, 400, 350),
+                WindowPlacement::AppendToWorkspaceEnd {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(400),
+                },
+                FocusBehavior::FollowNewWindow,
+            ))
+            .expect("first window discovery should succeed");
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(2),
+                monitor_id,
+                101,
+                Size::new(400, 350),
+                Rect::new(0, 350, 400, 350),
+                WindowPlacement::AppendToFocusedColumn,
+                FocusBehavior::FollowNewWindow,
+            ))
+            .expect("second window discovery should succeed");
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(3),
+                monitor_id,
+                102,
+                Size::new(400, 350),
+                Rect::new(400, 0, 400, 350),
+                WindowPlacement::NewColumnAfterFocus {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(400),
+                },
+                FocusBehavior::FollowNewWindow,
+            ))
+            .expect("third window discovery should succeed");
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(4),
+                monitor_id,
+                103,
+                Size::new(400, 350),
+                Rect::new(400, 350, 400, 350),
+                WindowPlacement::AppendToFocusedColumn,
+                FocusBehavior::FollowNewWindow,
+            ))
+            .expect("fourth window discovery should succeed");
+
+        let prev_result = store
+            .dispatch(DomainEvent::focus_prev(
+                CorrelationId::new(5),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus prev should succeed");
+        assert_eq!(
+            store.state().focus.focused_window_id.map(|id| id.get()),
+            Some(2)
+        );
+        assert_eq!(
+            prev_result
+                .layout_projection
+                .as_ref()
+                .expect("layout should exist")
+                .scroll_offset,
+            0
+        );
+
+        let next_result = store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(6),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus next should succeed");
+        assert_eq!(
+            store.state().focus.focused_window_id.map(|id| id.get()),
+            Some(4)
+        );
+        assert_eq!(
+            next_result
+                .layout_projection
+                .as_ref()
+                .expect("layout should exist")
+                .scroll_offset,
+            200
+        );
+    }
+
+    #[test]
+    fn overflow_focus_navigation_centers_target_column_when_possible() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 800, 700), 96, true);
+
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(1),
+                monitor_id,
+                100,
+                Size::new(500, 700),
+                Rect::new(0, 0, 500, 700),
+                WindowPlacement::AppendToWorkspaceEnd {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(500),
+                },
+                FocusBehavior::FollowNewWindow,
+            ))
+            .expect("first window discovery should succeed");
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(2),
+                monitor_id,
+                101,
+                Size::new(500, 700),
+                Rect::new(500, 0, 500, 700),
+                WindowPlacement::NewColumnAfterFocus {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(500),
+                },
+                FocusBehavior::PreserveCurrentFocus,
+            ))
+            .expect("second window discovery should succeed");
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(3),
+                monitor_id,
+                102,
+                Size::new(500, 700),
+                Rect::new(1000, 0, 500, 700),
+                WindowPlacement::AppendToWorkspaceEnd {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(500),
+                },
+                FocusBehavior::PreserveCurrentFocus,
+            ))
+            .expect("third window discovery should succeed");
+
+        let result = store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(4),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus next should succeed");
+        let projection = result
+            .layout_projection
+            .as_ref()
+            .expect("layout should exist");
+
+        assert_eq!(
+            store
+                .state()
+                .focus
+                .focused_window_id
+                .map(|window_id| window_id.get()),
+            Some(2)
+        );
+        assert_eq!(projection.scroll_offset, 350);
+    }
+
+    #[test]
     fn scroll_command_is_clamped_to_content_width() {
         let mut store = StateStore::new(RuntimeMode::WmOnly);
         let monitor_id = store
@@ -2783,9 +3060,23 @@ mod tests {
         assert_eq!(
             planned_operations
                 .iter()
+                .find(|operation| operation.hwnd == 100)
+                .map(|operation| operation.activate),
+            Some(false)
+        );
+        assert_eq!(
+            planned_operations
+                .iter()
                 .find(|operation| operation.hwnd == 101)
                 .map(|operation| operation.rect.x),
             Some(60)
+        );
+        assert_eq!(
+            planned_operations
+                .iter()
+                .find(|operation| operation.hwnd == 101)
+                .map(|operation| operation.activate),
+            Some(false)
         );
         assert_eq!(
             planned_operations
@@ -2794,6 +3085,29 @@ mod tests {
                 .map(|operation| operation.rect.x),
             Some(360)
         );
+        assert_eq!(
+            planned_operations
+                .iter()
+                .find(|operation| operation.hwnd == 102)
+                .map(|operation| operation.activate),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn focus_mismatch_plans_activation_even_without_geometry_change() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(sample_snapshot(100, Rect::new(0, 0, 420, 900), false), true)
+            .expect("initial sync should succeed");
+
+        let planned_operations = runtime
+            .plan_apply_operations(&sample_snapshot(100, Rect::new(0, 0, 420, 900), false))
+            .expect("apply plan should be computed");
+
+        assert_eq!(planned_operations.len(), 1);
+        assert_eq!(planned_operations[0].hwnd, 100);
+        assert!(planned_operations[0].activate);
     }
 
     #[test]

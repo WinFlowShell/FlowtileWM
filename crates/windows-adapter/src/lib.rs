@@ -187,6 +187,8 @@ pub fn diff_snapshots(previous: &PlatformSnapshot, current: &PlatformSnapshot) -
 pub struct ApplyOperation {
     pub hwnd: u64,
     pub rect: Rect,
+    #[serde(default)]
+    pub activate: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -672,6 +674,10 @@ pub fn needs_geometry_apply(actual: Rect, desired: Rect) -> bool {
     actual != desired
 }
 
+pub fn needs_activation_apply(actual_focused_hwnd: Option<u64>, desired_focused_hwnd: u64) -> bool {
+    actual_focused_hwnd != Some(desired_focused_hwnd)
+}
+
 pub fn missing_monitor_bindings(
     snapshot: &PlatformSnapshot,
     known_bindings: &[String],
@@ -696,7 +702,7 @@ mod tests {
     use super::{
         ObservationEnvelope, ObservationKind, PRIMARY_DISCOVERY_API, PlatformMonitorSnapshot,
         PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff, bootstrap, diff_snapshots,
-        missing_monitor_bindings, needs_geometry_apply,
+        missing_monitor_bindings, needs_activation_apply, needs_geometry_apply,
     };
 
     #[test]
@@ -766,6 +772,13 @@ mod tests {
             Rect::new(0, 0, 400, 300),
             Rect::new(10, 0, 400, 300)
         ));
+    }
+
+    #[test]
+    fn activation_apply_only_for_mismatched_foreground() {
+        assert!(!needs_activation_apply(Some(20), 20));
+        assert!(needs_activation_apply(Some(10), 20));
+        assert!(needs_activation_apply(None, 20));
     }
 
     #[test]

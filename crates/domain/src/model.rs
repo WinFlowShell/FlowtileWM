@@ -247,6 +247,7 @@ pub struct Column {
     pub id: ColumnId,
     pub mode: ColumnMode,
     pub ordered_window_ids: Vec<WindowId>,
+    pub active_window_id: Option<WindowId>,
     pub width_semantics: WidthSemantics,
     pub maximized_state: MaximizedState,
     pub tab_selection: Option<WindowId>,
@@ -259,12 +260,14 @@ impl Column {
         width_semantics: WidthSemantics,
         ordered_window_ids: Vec<WindowId>,
     ) -> Self {
+        let active_window_id = ordered_window_ids.first().copied();
         let tab_selection = ordered_window_ids.first().copied();
 
         Self {
             id,
             mode,
             ordered_window_ids,
+            active_window_id,
             width_semantics,
             maximized_state: MaximizedState::Normal,
             tab_selection,

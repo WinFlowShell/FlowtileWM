@@ -3,9 +3,15 @@ use std::ptr::null_mut;
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND},
-    UI::WindowsAndMessaging::{
-        BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
-        SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
+    System::Threading::{AttachThreadInput, GetCurrentThreadId},
+    UI::{
+        Input::KeyboardAndMouse::{SetActiveWindow, SetFocus},
+        WindowsAndMessaging::{
+            BeginDeferWindowPos, BringWindowToTop, DeferWindowPos, EndDeferWindowPos,
+            GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SW_RESTORE, SW_SHOW,
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+            SetWindowPos, ShowWindow,
+        },
     },
 };
 
@@ -16,10 +22,23 @@ const GEOMETRY_APPLY_FLAGS: u32 =
 
 pub(crate) fn apply_operations(operations: &[ApplyOperation]) -> ApplyBatchResult {
     if operations.len() > 1 && try_apply_operations_batched(operations).is_ok() {
+        let mut applied = operations.len();
+        let mut failures = Vec::new();
+
+        for operation in operations.iter().filter(|operation| operation.activate) {
+            if let Err(message) = activate_window(operation.hwnd) {
+                applied = applied.saturating_sub(1);
+                failures.push(ApplyFailure {
+                    hwnd: operation.hwnd,
+                    message,
+                });
+            }
+        }
+
         return ApplyBatchResult {
             attempted: operations.len(),
-            applied: operations.len(),
-            failures: Vec::new(),
+            applied,
+            failures,
         };
     }
 
@@ -108,6 +127,15 @@ fn try_apply_operations_batched(operations: &[ApplyOperation]) -> Result<(), Str
 }
 
 fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
+    apply_geometry(operation)?;
+    if operation.activate {
+        activate_window(operation.hwnd)?;
+    }
+
+    Ok(())
+}
+
+fn apply_geometry(operation: &ApplyOperation) -> Result<(), String> {
     let hwnd = hwnd_from_raw(operation.hwnd)?;
     let (width, height) = rect_size(operation)?;
     let applied = {
@@ -131,6 +159,116 @@ fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn activate_window(raw_hwnd: u64) -> Result<(), String> {
+    let hwnd = hwnd_from_raw(raw_hwnd)?;
+    let current_thread_id = {
+        // SAFETY: `GetCurrentThreadId` reads the current thread identifier without side effects.
+        unsafe { GetCurrentThreadId() }
+    };
+    let foreground_hwnd = {
+        // SAFETY: `GetForegroundWindow` is a read-only query for the current desktop.
+        unsafe { GetForegroundWindow() }
+    };
+    let target_thread_id = window_thread_id(hwnd);
+    let foreground_thread_id = if foreground_hwnd.is_null() {
+        0
+    } else {
+        window_thread_id(foreground_hwnd)
+    };
+    let mut attached_pairs = Vec::new();
+
+    attach_thread_pair(current_thread_id, target_thread_id, &mut attached_pairs);
+    attach_thread_pair(current_thread_id, foreground_thread_id, &mut attached_pairs);
+    attach_thread_pair(target_thread_id, foreground_thread_id, &mut attached_pairs);
+
+    if is_iconic(hwnd) {
+        let _ = {
+            // SAFETY: best-effort restore for the validated top-level HWND.
+            unsafe { ShowWindow(hwnd, SW_RESTORE) }
+        };
+    } else {
+        let _ = {
+            // SAFETY: best-effort visibility hint for the validated top-level HWND.
+            unsafe { ShowWindow(hwnd, SW_SHOW) }
+        };
+    }
+
+    let _ = {
+        // SAFETY: best-effort topmost z-order raise for the validated top-level HWND.
+        unsafe { BringWindowToTop(hwnd) }
+    };
+    let _ = {
+        // SAFETY: best-effort active-window hint while thread input may be bridged.
+        unsafe { SetActiveWindow(hwnd) }
+    };
+    let _ = {
+        // SAFETY: best-effort keyboard focus assignment while thread input may be bridged.
+        unsafe { SetFocus(hwnd) }
+    };
+    let _ = {
+        // SAFETY: best-effort foreground activation for the validated top-level HWND.
+        unsafe { SetForegroundWindow(hwnd) }
+    };
+    let _ = {
+        // SAFETY: a second topmost raise improves activation reliability on some shells.
+        unsafe { BringWindowToTop(hwnd) }
+    };
+    let _ = {
+        // SAFETY: a second foreground attempt is still for the same validated HWND.
+        unsafe { SetForegroundWindow(hwnd) }
+    };
+
+    let activation_succeeded = {
+        // SAFETY: `GetForegroundWindow` is a read-only query for the current desktop.
+        unsafe { GetForegroundWindow() == hwnd }
+    };
+
+    for (left, right) in attached_pairs.into_iter().rev() {
+        let _ = {
+            // SAFETY: detaching mirrors successful `AttachThreadInput` calls made above.
+            unsafe { AttachThreadInput(left, right, 0) }
+        };
+    }
+
+    if activation_succeeded {
+        Ok(())
+    } else {
+        Err(format!(
+            "platform activation path failed to foreground hwnd {raw_hwnd}"
+        ))
+    }
+}
+
+fn attach_thread_pair(left: u32, right: u32, attached_pairs: &mut Vec<(u32, u32)>) {
+    if left == 0 || right == 0 || left == right {
+        return;
+    }
+
+    let attached = {
+        // SAFETY: both thread ids come from Win32 and are only bridged temporarily.
+        unsafe { AttachThreadInput(left, right, 1) }
+    };
+    if attached != 0 {
+        attached_pairs.push((left, right));
+    }
+}
+
+fn window_thread_id(hwnd: HWND) -> u32 {
+    let mut process_id = 0_u32;
+    {
+        // SAFETY: querying thread ownership for a HWND is a read-only Win32 operation.
+        unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) }
+    }
+}
+
+fn is_iconic(hwnd: HWND) -> bool {
+    let iconic = {
+        // SAFETY: querying whether a window is minimized is a read-only Win32 operation.
+        unsafe { IsIconic(hwnd) }
+    };
+    iconic != 0
 }
 
 fn hwnd_from_raw(hwnd: u64) -> Result<HWND, String> {
