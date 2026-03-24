@@ -178,6 +178,11 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
         config: ConfigProjection {
             config_version: state.config_projection.config_version,
             source_path: state.config_projection.source_path.clone(),
+            bind_control_mode: state
+                .config_projection
+                .bind_control_mode
+                .as_str()
+                .to_string(),
             active_rule_count: state.config_projection.active_rule_count,
             strip_scroll_step: state.config_projection.strip_scroll_step,
             default_column_mode: state

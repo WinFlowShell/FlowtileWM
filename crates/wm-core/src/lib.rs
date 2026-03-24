@@ -8,10 +8,10 @@ use flowtile_diagnostics::{
     DiagnosticRecord, bootstrap as diagnostics_bootstrap, layout_recomputed, transition_applied,
 };
 use flowtile_domain::{
-    BootstrapProfile, Column, ColumnId, ColumnMode, CorrelationId, DomainEvent, DomainEventPayload,
-    FocusBehavior, FocusOrigin, MaximizedState, MonitorId, NavigationScope, RestoreTarget,
-    RuntimeMode, StateVersion, TopologyRole, WidthSemantics, WindowId, WindowLayer, WindowNode,
-    WindowPlacement, WmState, WorkspaceId,
+    BindControlMode, BootstrapProfile, Column, ColumnId, ColumnMode, CorrelationId, DomainEvent,
+    DomainEventPayload, FocusBehavior, FocusOrigin, MaximizedState, MonitorId, NavigationScope,
+    RestoreTarget, RuntimeMode, StateVersion, TopologyRole, WidthSemantics, WindowId, WindowLayer,
+    WindowNode, WindowPlacement, WmState, WorkspaceId,
 };
 use flowtile_ipc::bootstrap as ipc_bootstrap;
 use flowtile_layout_engine::{
@@ -1466,6 +1466,10 @@ impl CoreDaemonRuntime {
         &self.active_config.hotkeys
     }
 
+    pub const fn bind_control_mode(&self) -> BindControlMode {
+        self.active_config.projection.bind_control_mode
+    }
+
     pub fn last_snapshot(&self) -> Option<&PlatformSnapshot> {
         self.last_snapshot.as_ref()
     }
@@ -1538,6 +1542,7 @@ impl CoreDaemonRuntime {
 
         match load_from_path(&config_path, self.next_config_generation) {
             Ok(loaded_config) => {
+                ensure_supported_bind_control_mode(loaded_config.projection.bind_control_mode)?;
                 let changed_sections = diff_config_sections(&self.active_config, &loaded_config);
                 let rule_ids = loaded_config
                     .rules
@@ -2092,10 +2097,15 @@ impl CoreDaemonRuntime {
 fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<String> {
     let mut changed_sections = Vec::new();
 
-    if previous.projection != current.projection {
+    if previous.projection.strip_scroll_step != current.projection.strip_scroll_step
+        || previous.projection.default_column_mode != current.projection.default_column_mode
+        || previous.projection.default_column_width != current.projection.default_column_width
+    {
         changed_sections.push("layout".to_string());
     }
-    if previous.hotkeys != current.hotkeys {
+    if previous.projection.bind_control_mode != current.projection.bind_control_mode
+        || previous.hotkeys != current.hotkeys
+    {
         changed_sections.push("input".to_string());
     }
     if previous.rules != current.rules {
@@ -2106,6 +2116,18 @@ fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<
     }
 
     changed_sections
+}
+
+fn ensure_supported_bind_control_mode(
+    bind_control_mode: BindControlMode,
+) -> Result<(), RuntimeError> {
+    match bind_control_mode {
+        BindControlMode::Coexistence => Ok(()),
+        _ => Err(RuntimeError::Config(format!(
+            "bind control mode '{}' is not supported by the current runtime slice; only 'coexistence' is available",
+            bind_control_mode.as_str()
+        ))),
+    }
 }
 
 fn workspace_path(relative_path: &str) -> PathBuf {
@@ -2137,16 +2159,21 @@ fn normalize_reason_token(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use flowtile_domain::{
-        ColumnMode, CorrelationId, DomainEvent, FocusBehavior, NavigationScope, Rect, RuntimeMode,
-        Size, WidthSemantics, WindowPlacement,
+        BindControlMode, ColumnMode, CorrelationId, DomainEvent, FocusBehavior, NavigationScope,
+        Rect, RuntimeMode, Size, WidthSemantics, WindowPlacement,
     };
     use flowtile_windows_adapter::{
         ObservationEnvelope, ObservationKind, PlatformMonitorSnapshot, PlatformSnapshot,
         PlatformWindowSnapshot,
     };
 
-    use super::{CoreDaemonBootstrap, CoreDaemonRuntime, StateStore};
+    use super::{CoreDaemonBootstrap, CoreDaemonRuntime, RuntimeError, StateStore};
 
     #[test]
     fn builds_summary_without_product_logic() {
@@ -2828,6 +2855,36 @@ mod tests {
         assert!(restored_window.column_id.is_some());
     }
 
+    #[test]
+    fn reload_config_rejects_unsupported_bind_control_mode() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let config_path = unique_config_test_path("bind-control-mode");
+        std::fs::create_dir_all(config_path.parent().expect("temp dir should exist"))
+            .expect("temp dir should be created");
+        std::fs::write(
+            &config_path,
+            "input {\n  bind-control-mode \"managed-shell\"\n}\n",
+        )
+        .expect("config should be written");
+
+        let config_path_string = config_path.display().to_string();
+        runtime.active_config.projection.source_path = config_path_string.clone();
+        runtime.last_valid_config.projection.source_path = config_path_string.clone();
+        runtime.store.state_mut().config_projection.source_path = config_path_string;
+
+        let error = runtime
+            .reload_config(true)
+            .expect_err("unsupported bind control mode should fail reload");
+
+        match error {
+            RuntimeError::Config(message) => assert!(message.contains("managed-shell")),
+            other => panic!("unexpected reload error: {other:?}"),
+        }
+        assert_eq!(runtime.bind_control_mode(), BindControlMode::Coexistence);
+
+        let _ = std::fs::remove_file(config_path);
+    }
+
     fn geometry_x_width(
         projection: &WorkspaceLayoutProjection,
         window_id: flowtile_domain::WindowId,
@@ -2860,6 +2917,16 @@ mod tests {
                 is_focused: focused,
             }],
         }
+    }
+
+    fn unique_config_test_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir()
+            .join("flowtilewm-wm-core-tests")
+            .join(format!("{label}-{nonce}.kdl"))
     }
 
     use flowtile_layout_engine::WorkspaceLayoutProjection;

@@ -17,11 +17,11 @@ pub use events::{
 pub use geometry::{Point, Rect, Size};
 pub use ids::{ColumnId, CorrelationId, MonitorId, WindowId, WorkspaceId, WorkspaceSetId};
 pub use model::{
-    CapturePolicy, Column, ColumnMode, ConfigProjection, DiagnosticsSummary, FloatingLayer,
-    FocusOrigin, FocusState, LayoutState, MaximizedState, Monitor, OverviewState, RestoreTarget,
-    RuntimeMode, RuntimeState, ScrollingStrip, StripLayoutMode, TopologyRole, WidthSemantics,
-    WindowClassification, WindowLayer, WindowNode, WmState, Workspace, WorkspaceSet,
-    all_column_modes,
+    BindControlMode, CapturePolicy, Column, ColumnMode, ConfigProjection, DiagnosticsSummary,
+    FloatingLayer, FocusOrigin, FocusState, LayoutState, MaximizedState, Monitor, OverviewState,
+    RestoreTarget, RuntimeMode, RuntimeState, ScrollingStrip, StripLayoutMode, TopologyRole,
+    WidthSemantics, WindowClassification, WindowLayer, WindowNode, WmState, Workspace,
+    WorkspaceSet, all_column_modes,
 };
 
 pub const VERSION_LINE: &str = "v.1.0.0";
@@ -77,8 +77,8 @@ impl fmt::Display for StateVersion {
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapProfile, Rect, RuntimeMode, Size, StateVersion, VERSION_LINE, WindowLayer,
-        WindowNode, WmState,
+        BindControlMode, BootstrapProfile, Rect, RuntimeMode, Size, StateVersion, VERSION_LINE,
+        WindowLayer, WindowNode, WmState,
     };
 
     #[test]
@@ -86,6 +86,14 @@ mod tests {
         assert_eq!(
             RuntimeMode::parse("extended-shell"),
             Some(RuntimeMode::ExtendedShell)
+        );
+    }
+
+    #[test]
+    fn parses_known_bind_control_mode() {
+        assert_eq!(
+            BindControlMode::parse("coexistence"),
+            Some(BindControlMode::Coexistence)
         );
     }
 

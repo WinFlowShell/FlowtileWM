@@ -37,6 +37,39 @@ impl core::fmt::Display for RuntimeMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BindControlMode {
+    #[default]
+    Coexistence,
+    ManagedShell,
+    DeepOverride,
+}
+
+impl BindControlMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coexistence => "coexistence",
+            Self::ManagedShell => "managed-shell",
+            Self::DeepOverride => "deep-override",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "coexistence" => Some(Self::Coexistence),
+            "managed-shell" => Some(Self::ManagedShell),
+            "deep-override" => Some(Self::DeepOverride),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Display for BindControlMode {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopologyRole {
     Primary,
@@ -327,6 +360,7 @@ pub struct ConfigProjection {
     pub live_reload_enabled: bool,
     pub rollback_supported: bool,
     pub source_path: String,
+    pub bind_control_mode: BindControlMode,
     pub strip_scroll_step: u32,
     pub default_column_mode: ColumnMode,
     pub default_column_width: WidthSemantics,
@@ -340,6 +374,7 @@ impl Default for ConfigProjection {
             live_reload_enabled: true,
             rollback_supported: true,
             source_path: "config/flowtile.kdl".to_string(),
+            bind_control_mode: BindControlMode::Coexistence,
             strip_scroll_step: 240,
             default_column_mode: ColumnMode::Normal,
             default_column_width: WidthSemantics::default(),

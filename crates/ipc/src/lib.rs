@@ -191,6 +191,7 @@ pub struct DiagnosticsProjection {
 pub struct ConfigProjection {
     pub config_version: u64,
     pub source_path: String,
+    pub bind_control_mode: String,
     pub active_rule_count: usize,
     pub strip_scroll_step: u32,
     pub default_column_mode: String,

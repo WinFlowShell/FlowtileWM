@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use flowtile_domain::{ColumnMode, ConfigProjection, WidthSemantics, WindowLayer};
+use flowtile_domain::{BindControlMode, ColumnMode, ConfigProjection, WidthSemantics, WindowLayer};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
 pub const PREFERRED_CONFIG_FORMAT: &str = "KDL";
@@ -211,7 +211,7 @@ fn parse_kdl_document(
                 }
             }
             "layout" => parse_layout(node, &mut projection)?,
-            "input" => parse_input(node, &mut hotkeys)?,
+            "input" => parse_input(node, &mut projection, &mut hotkeys)?,
             "rules" => parse_rules(node, &mut rules)?,
             _ => {}
         }
@@ -351,8 +351,16 @@ fn parse_kdl_like_source(
                 }
                 _ => {}
             },
-            Some("input") => {
-                if tokens[0] == "hotkey" {
+            Some("input") => match tokens[0].as_str() {
+                "bind-control-mode" => {
+                    let Some(mode) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "input bind-control-mode is missing value".to_string(),
+                        ));
+                    };
+                    projection.bind_control_mode = parse_bind_control_mode(mode)?;
+                }
+                "hotkey" => {
                     let Some(trigger) = tokens.get(1).cloned() else {
                         return Err(ConfigError::Validation(
                             "input hotkey is missing trigger".to_string(),
@@ -365,7 +373,8 @@ fn parse_kdl_like_source(
                     };
                     hotkeys.push(HotkeyBinding { trigger, command });
                 }
-            }
+                _ => {}
+            },
             Some("rules") if current_rule.is_some() && !in_actions => {
                 let rule = current_rule.as_mut().expect("rule should exist");
                 match tokens[0].as_str() {
@@ -524,19 +533,29 @@ fn parse_layout(node: &KdlNode, projection: &mut ConfigProjection) -> Result<(),
     Ok(())
 }
 
-fn parse_input(node: &KdlNode, hotkeys: &mut Vec<HotkeyBinding>) -> Result<(), ConfigError> {
+fn parse_input(
+    node: &KdlNode,
+    projection: &mut ConfigProjection,
+    hotkeys: &mut Vec<HotkeyBinding>,
+) -> Result<(), ConfigError> {
     for child in child_nodes(node) {
-        if child.name().value() != "hotkey" {
-            continue;
+        match child.name().value() {
+            "bind-control-mode" => {
+                if let Some(value) = first_string(child)? {
+                    projection.bind_control_mode = parse_bind_control_mode(&value)?;
+                }
+            }
+            "hotkey" => {
+                let trigger = nth_string(child, 0)?.ok_or_else(|| {
+                    ConfigError::Validation("input hotkey is missing trigger".to_string())
+                })?;
+                let command = nth_string(child, 1)?.ok_or_else(|| {
+                    ConfigError::Validation("input hotkey is missing command".to_string())
+                })?;
+                hotkeys.push(HotkeyBinding { trigger, command });
+            }
+            _ => {}
         }
-
-        let trigger = nth_string(child, 0)?.ok_or_else(|| {
-            ConfigError::Validation("input hotkey is missing trigger".to_string())
-        })?;
-        let command = nth_string(child, 1)?.ok_or_else(|| {
-            ConfigError::Validation("input hotkey is missing command".to_string())
-        })?;
-        hotkeys.push(HotkeyBinding { trigger, command });
     }
 
     Ok(())
@@ -631,6 +650,11 @@ fn parse_column_mode(value: &str) -> Result<ColumnMode, ConfigError> {
             "unsupported column mode '{other}'"
         ))),
     }
+}
+
+fn parse_bind_control_mode(value: &str) -> Result<BindControlMode, ConfigError> {
+    BindControlMode::parse(value)
+        .ok_or_else(|| ConfigError::Validation(format!("unsupported bind control mode '{value}'")))
 }
 
 fn parse_layer(value: &str) -> Result<WindowLayer, ConfigError> {
@@ -897,6 +921,7 @@ pub fn default_config_source() -> String {
         "}".to_string(),
         String::new(),
         "input {".to_string(),
+        "  bind-control-mode \"coexistence\"".to_string(),
     ];
 
     lines.extend(
@@ -940,8 +965,9 @@ mod tests {
     use super::{
         DEFAULT_CONFIG_PATH, WindowRuleInput, bootstrap, classify_window, default_config_source,
         default_loaded_config, ensure_default_config, load_from_path, load_or_default,
+        parse_kdl_like_source,
     };
-    use flowtile_domain::{ColumnMode, WidthSemantics, WindowLayer};
+    use flowtile_domain::{BindControlMode, ColumnMode, WidthSemantics, WindowLayer};
 
     #[test]
     fn exposes_expected_bootstrap_contract() {
@@ -956,6 +982,10 @@ mod tests {
     fn returns_default_projection_when_config_is_missing() {
         let config = load_or_default(unique_test_path("missing"), 5).expect("config should load");
         assert_eq!(config.projection.config_version, 5);
+        assert_eq!(
+            config.projection.bind_control_mode,
+            BindControlMode::Coexistence
+        );
         assert_eq!(config.projection.strip_scroll_step, 240);
         assert_eq!(config.projection.default_column_mode, ColumnMode::Normal);
         assert_eq!(config.hotkeys.len(), 7);
@@ -971,6 +1001,10 @@ mod tests {
 
         let config = load_from_path(&path, 7).expect("kdl config should parse");
         assert_eq!(config.projection.config_version, 7);
+        assert_eq!(
+            config.projection.bind_control_mode,
+            BindControlMode::Coexistence
+        );
         assert_eq!(config.projection.strip_scroll_step, 240);
         assert_eq!(
             config.projection.default_column_width,
@@ -1027,10 +1061,30 @@ mod tests {
         let source = std::fs::read_to_string(&created_path).expect("config should be readable");
 
         assert_eq!(created_path, path);
+        assert!(source.contains("bind-control-mode \"coexistence\""));
         assert!(source.contains("strip-scroll-step 240"));
         assert!(source.contains("hotkey \"Win+Ctrl+J\" \"focus-next\""));
+        assert!(source.contains("hotkey \"Win+Ctrl+H\" \"scroll-strip-left\""));
+        assert!(source.contains("hotkey \"Win+Ctrl+L\" \"scroll-strip-right\""));
         assert!(!source.contains("hotkey \"Alt+J\" \"focus-next\""));
         assert!(source.contains("rule \"float-dialogs\""));
+    }
+
+    #[test]
+    fn parses_bind_control_mode_from_kdl_like_fallback() {
+        let source = r#"
+input {
+  bind-control-mode "managed-shell"
+}
+"#;
+
+        let config = parse_kdl_like_source(source, std::path::Path::new(DEFAULT_CONFIG_PATH), 9)
+            .expect("kdl-like fallback should parse bind control mode");
+
+        assert_eq!(
+            config.projection.bind_control_mode,
+            BindControlMode::ManagedShell
+        );
     }
 
     fn unique_test_path(label: &str) -> std::path::PathBuf {

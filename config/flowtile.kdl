@@ -9,10 +9,11 @@ layout {
 }
 
 input {
-  hotkey "Win+Ctrl+J" "focus-next"
-  hotkey "Win+Ctrl+K" "focus-prev"
-  hotkey "Win+Ctrl+H" "scroll-strip-left"
-  hotkey "Win+Ctrl+L" "scroll-strip-right"
+  bind-control-mode "coexistence"
+  hotkey "Win+Y" "focus-next"
+  hotkey "Win+U" "focus-prev"
+  hotkey "Win+H" "scroll-strip-left"
+  hotkey "Win+J" "scroll-strip-right"
   hotkey "Win+Ctrl+Shift+F" "toggle-floating"
   hotkey "Win+Ctrl+Shift+Space" "toggle-fullscreen"
   hotkey "Win+Ctrl+Shift+Backspace" "disable-management-and-unwind"

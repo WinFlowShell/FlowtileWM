@@ -15,7 +15,7 @@ use flowtile_domain::{CorrelationId, DomainEvent, NavigationScope, RuntimeMode};
 use flowtile_ipc::{IpcRequest, IpcResponse, bootstrap as ipc_bootstrap};
 use flowtile_windows_adapter::{LiveObservationOptions, ObservationStreamError, WindowsAdapter};
 use flowtile_wm_core::{CoreDaemonBootstrap, CoreDaemonRuntime, RuntimeCycleReport};
-use hotkeys::HotkeyListener;
+use hotkeys::{HotkeyListener, HotkeyListenerError, ensure_bind_control_mode_supported};
 
 fn main() -> ExitCode {
     match parse_command(env::args().skip(1).collect()) {
@@ -43,6 +43,10 @@ fn run(command: DaemonCommand) -> ExitCode {
             dry_run,
         } => {
             let mut runtime = CoreDaemonRuntime::new(runtime_mode);
+            if let Err(error) = validate_runtime_bind_control_mode(&runtime) {
+                eprintln!("bind control mode startup failed: {error}");
+                return ExitCode::from(1);
+            }
             match runtime.scan_and_sync(dry_run) {
                 Ok(report) => {
                     println!("flowtile-core-daemon run-once");
@@ -74,6 +78,10 @@ fn run_watch(
 ) -> ExitCode {
     let adapter = WindowsAdapter::new();
     let mut runtime = CoreDaemonRuntime::with_adapter(runtime_mode, adapter.clone());
+    if let Err(error) = validate_runtime_bind_control_mode(&runtime) {
+        eprintln!("bind control mode startup failed: {error}");
+        return ExitCode::from(1);
+    }
     let mut observer = if poll_only {
         None
     } else {
@@ -91,7 +99,13 @@ fn run_watch(
 
     let (control_sender, control_receiver) = mpsc::channel::<ControlMessage>();
     ipc::spawn_ipc_servers(control_sender.clone());
-    let mut hotkey_listener = start_hotkey_listener(&runtime, &control_sender);
+    let mut hotkey_listener = match start_hotkey_listener(&runtime, &control_sender) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("global hotkeys failed to start: {error}");
+            return ExitCode::from(1);
+        }
+    };
     spawn_stdin_listener(control_sender.clone());
 
     let ipc = ipc_bootstrap();
@@ -103,6 +117,10 @@ fn run_watch(
         } else {
             "polling-fallback"
         }
+    );
+    println!(
+        "bind control mode: {}",
+        runtime.bind_control_mode().as_str()
     );
     println!(
         "global hotkeys: {}",
@@ -387,7 +405,14 @@ fn run_watch(
                     },
                     WatchCommand::ReloadConfig => match runtime.reload_config(dry_run) {
                         Ok(report) => {
-                            hotkey_listener = start_hotkey_listener(&runtime, &control_sender);
+                            hotkey_listener = match start_hotkey_listener(&runtime, &control_sender)
+                            {
+                                Ok(listener) => listener,
+                                Err(error) => {
+                                    eprintln!("global hotkeys failed to restart: {error}");
+                                    return ExitCode::from(1);
+                                }
+                            };
                             println!(
                                 "global hotkeys reloaded: {}",
                                 if hotkey_listener.is_some() {
@@ -449,7 +474,13 @@ fn run_watch(
                         &mut manual_correlation_id,
                     );
                     if command_name == "reload_config" && response.ok {
-                        hotkey_listener = start_hotkey_listener(&runtime, &control_sender);
+                        hotkey_listener = match start_hotkey_listener(&runtime, &control_sender) {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                eprintln!("global hotkeys failed to restart via IPC: {error}");
+                                return ExitCode::from(1);
+                            }
+                        };
                         println!(
                             "global hotkeys reloaded via IPC: {}",
                             if hotkey_listener.is_some() {
@@ -688,14 +719,18 @@ pub(crate) enum WatchCommand {
 fn start_hotkey_listener(
     runtime: &CoreDaemonRuntime,
     command_sender: &mpsc::Sender<ControlMessage>,
-) -> Option<HotkeyListener> {
-    match HotkeyListener::spawn(runtime.hotkeys(), command_sender.clone()) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("global hotkeys failed to start: {error}");
-            None
-        }
-    }
+) -> Result<Option<HotkeyListener>, HotkeyListenerError> {
+    HotkeyListener::spawn(
+        runtime.hotkeys(),
+        runtime.bind_control_mode(),
+        command_sender.clone(),
+    )
+}
+
+fn validate_runtime_bind_control_mode(
+    runtime: &CoreDaemonRuntime,
+) -> Result<(), HotkeyListenerError> {
+    ensure_bind_control_mode_supported(runtime.bind_control_mode())
 }
 
 fn parse_command(arguments: Vec<String>) -> Result<DaemonCommand, String> {
