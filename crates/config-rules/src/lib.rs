@@ -11,6 +11,15 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 pub const PREFERRED_CONFIG_FORMAT: &str = "KDL";
 pub const FALLBACK_CONFIG_FORMAT: &str = "TOML";
 pub const DEFAULT_CONFIG_PATH: &str = "config/flowtile.kdl";
+const DEFAULT_HOTKEY_BINDINGS: [(&str, &str); 7] = [
+    ("Win+Ctrl+J", "focus-next"),
+    ("Win+Ctrl+K", "focus-prev"),
+    ("Win+Ctrl+H", "scroll-strip-left"),
+    ("Win+Ctrl+L", "scroll-strip-right"),
+    ("Win+Ctrl+Shift+F", "toggle-floating"),
+    ("Win+Ctrl+Shift+Space", "toggle-fullscreen"),
+    ("Win+Ctrl+Shift+Backspace", "disable-management-and-unwind"),
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigBootstrap {
@@ -131,38 +140,19 @@ pub fn default_loaded_config(
             source_path: source_path.into(),
             ..ConfigProjection::default()
         },
-        hotkeys: vec![
-            HotkeyBinding {
-                trigger: "Alt+J".to_string(),
-                command: "focus-next".to_string(),
-            },
-            HotkeyBinding {
-                trigger: "Alt+K".to_string(),
-                command: "focus-prev".to_string(),
-            },
-            HotkeyBinding {
-                trigger: "Alt+H".to_string(),
-                command: "scroll-strip-left".to_string(),
-            },
-            HotkeyBinding {
-                trigger: "Alt+L".to_string(),
-                command: "scroll-strip-right".to_string(),
-            },
-            HotkeyBinding {
-                trigger: "Alt+Shift+F".to_string(),
-                command: "toggle-floating".to_string(),
-            },
-            HotkeyBinding {
-                trigger: "Alt+Shift+Space".to_string(),
-                command: "toggle-fullscreen".to_string(),
-            },
-            HotkeyBinding {
-                trigger: "Alt+Shift+Backspace".to_string(),
-                command: "disable-management-and-unwind".to_string(),
-            },
-        ],
+        hotkeys: default_hotkeys(),
         rules: Vec::new(),
     }
+}
+
+fn default_hotkeys() -> Vec<HotkeyBinding> {
+    DEFAULT_HOTKEY_BINDINGS
+        .iter()
+        .map(|(trigger, command)| HotkeyBinding {
+            trigger: (*trigger).to_string(),
+            command: (*command).to_string(),
+        })
+        .collect()
 }
 
 pub fn load_or_default(
@@ -895,49 +885,52 @@ pub fn ensure_default_config(path: impl AsRef<Path>) -> Result<PathBuf, ConfigEr
 }
 
 pub fn default_config_source() -> String {
-    [
-        "general {",
-        "  mode \"wm-only\"",
-        "}",
-        "",
-        "layout {",
-        "  strip-scroll-step 240",
-        "  default-column-mode \"normal\"",
-        "  default-column-width \"fraction\" 1 2",
-        "}",
-        "",
-        "input {",
-        "  hotkey \"Alt+J\" \"focus-next\"",
-        "  hotkey \"Alt+K\" \"focus-prev\"",
-        "  hotkey \"Alt+H\" \"scroll-strip-left\"",
-        "  hotkey \"Alt+L\" \"scroll-strip-right\"",
-        "  hotkey \"Alt+Shift+F\" \"toggle-floating\"",
-        "  hotkey \"Alt+Shift+Space\" \"toggle-fullscreen\"",
-        "  hotkey \"Alt+Shift+Backspace\" \"disable-management-and-unwind\"",
-        "}",
-        "",
-        "rules {",
-        "  rule \"float-dialogs\" {",
-        "    priority 100",
-        "    enabled true",
-        "    match-class-substring \"Dialog\"",
-        "    actions {",
-        "      layer \"floating\"",
-        "    }",
-        "  }",
-        "",
-        "  rule \"float-settings\" {",
-        "    priority 110",
-        "    enabled true",
-        "    match-title-substring \"Settings\"",
-        "    actions {",
-        "      layer \"floating\"",
-        "    }",
-        "  }",
-        "}",
-        "",
-    ]
-    .join("\n")
+    let mut lines = vec![
+        "general {".to_string(),
+        "  mode \"wm-only\"".to_string(),
+        "}".to_string(),
+        String::new(),
+        "layout {".to_string(),
+        "  strip-scroll-step 240".to_string(),
+        "  default-column-mode \"normal\"".to_string(),
+        "  default-column-width \"fraction\" 1 2".to_string(),
+        "}".to_string(),
+        String::new(),
+        "input {".to_string(),
+    ];
+
+    lines.extend(
+        DEFAULT_HOTKEY_BINDINGS
+            .iter()
+            .map(|(trigger, command)| format!("  hotkey \"{trigger}\" \"{command}\"")),
+    );
+
+    lines.extend([
+        "}".to_string(),
+        String::new(),
+        "rules {".to_string(),
+        "  rule \"float-dialogs\" {".to_string(),
+        "    priority 100".to_string(),
+        "    enabled true".to_string(),
+        "    match-class-substring \"Dialog\"".to_string(),
+        "    actions {".to_string(),
+        "      layer \"floating\"".to_string(),
+        "    }".to_string(),
+        "  }".to_string(),
+        String::new(),
+        "  rule \"float-settings\" {".to_string(),
+        "    priority 110".to_string(),
+        "    enabled true".to_string(),
+        "    match-title-substring \"Settings\"".to_string(),
+        "    actions {".to_string(),
+        "      layer \"floating\"".to_string(),
+        "    }".to_string(),
+        "  }".to_string(),
+        "}".to_string(),
+        String::new(),
+    ]);
+
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -966,6 +959,7 @@ mod tests {
         assert_eq!(config.projection.strip_scroll_step, 240);
         assert_eq!(config.projection.default_column_mode, ColumnMode::Normal);
         assert_eq!(config.hotkeys.len(), 7);
+        assert_eq!(config.hotkeys, super::default_hotkeys());
     }
 
     #[test]
@@ -1034,6 +1028,8 @@ mod tests {
 
         assert_eq!(created_path, path);
         assert!(source.contains("strip-scroll-step 240"));
+        assert!(source.contains("hotkey \"Win+Ctrl+J\" \"focus-next\""));
+        assert!(!source.contains("hotkey \"Alt+J\" \"focus-next\""));
         assert!(source.contains("rule \"float-dialogs\""));
     }
 

@@ -14,3 +14,9 @@ flowtile-windows-adapter.workspace = true
 flowtile-wm-core.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }

@@ -485,7 +485,7 @@ fn run_watch(
         let cycle_result = if let Some(live_observer) = observer.as_mut() {
             match live_observer.recv_timeout(Duration::from_millis(interval_ms)) {
                 Ok(observation) => runtime.apply_observation(observation, dry_run),
-                Err(ObservationStreamError::Timeout) => runtime.scan_and_sync(dry_run).map(Some),
+                Err(ObservationStreamError::Timeout) => continue,
                 Err(error) => {
                     eprintln!("live observation became unavailable: {error}; switching to polling");
                     fallback_to_polling = true;

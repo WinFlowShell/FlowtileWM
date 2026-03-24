@@ -2434,6 +2434,34 @@ mod tests {
     }
 
     #[test]
+    fn location_change_observation_plans_prompt_reassert() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+
+        runtime
+            .sync_snapshot(sample_snapshot(100, Rect::new(0, 0, 420, 900), true), true)
+            .expect("initial sync should succeed");
+
+        let report = runtime
+            .apply_observation(
+                ObservationEnvelope {
+                    kind: ObservationKind::Snapshot,
+                    reason: "win-event-location-change".to_string(),
+                    snapshot: Some(sample_snapshot(100, Rect::new(760, 120, 420, 900), true)),
+                    message: None,
+                },
+                true,
+            )
+            .expect("observation should succeed")
+            .expect("snapshot observation should produce a cycle report");
+
+        assert_eq!(report.planned_operations, 1);
+        assert_eq!(
+            report.observation_reason.as_deref(),
+            Some("win-event-location-change")
+        );
+    }
+
+    #[test]
     fn emergency_unwind_disables_management_before_next_sync() {
         let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
 
@@ -2614,6 +2642,130 @@ mod tests {
                 .expect("layout should exist")
                 .scroll_offset,
             200
+        );
+    }
+
+    #[test]
+    fn scroll_command_changes_projected_geometry_and_apply_plan() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 300, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(300, 0, 300, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 102,
+                    title: "Window 102".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(600, 0, 300, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                },
+            ],
+        };
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+
+        let first_window_id = runtime
+            .state()
+            .windows
+            .values()
+            .find(|window| window.current_hwnd_binding == Some(100))
+            .map(|window| window.id)
+            .expect("first window should exist");
+        let second_window_id = runtime
+            .state()
+            .windows
+            .values()
+            .find(|window| window.current_hwnd_binding == Some(101))
+            .map(|window| window.id)
+            .expect("second window should exist");
+        let third_window_id = runtime
+            .state()
+            .windows
+            .values()
+            .find(|window| window.current_hwnd_binding == Some(102))
+            .map(|window| window.id)
+            .expect("third window should exist");
+        let workspace_id = runtime
+            .state()
+            .windows
+            .get(&first_window_id)
+            .map(|window| window.workspace_id)
+            .expect("workspace should exist");
+
+        let result = runtime
+            .store
+            .dispatch(DomainEvent::scroll_strip_right(
+                CorrelationId::new(2),
+                NavigationScope::WorkspaceStrip,
+                0,
+            ))
+            .expect("scroll command should succeed");
+        let projection = result
+            .layout_projection
+            .as_ref()
+            .expect("layout projection should exist");
+        let planned_operations = runtime
+            .plan_apply_operations(&snapshot)
+            .expect("apply plan should be computed");
+
+        assert_eq!(projection.workspace_id, workspace_id);
+        assert_eq!(projection.scroll_offset, 240);
+        assert_eq!(geometry_x_width(projection, first_window_id).0, -240);
+        assert_eq!(geometry_x_width(projection, second_window_id).0, 60);
+        assert_eq!(geometry_x_width(projection, third_window_id).0, 360);
+        assert_eq!(planned_operations.len(), 3);
+        assert_eq!(
+            planned_operations
+                .iter()
+                .find(|operation| operation.hwnd == 100)
+                .map(|operation| operation.rect.x),
+            Some(-240)
+        );
+        assert_eq!(
+            planned_operations
+                .iter()
+                .find(|operation| operation.hwnd == 101)
+                .map(|operation| operation.rect.x),
+            Some(60)
+        );
+        assert_eq!(
+            planned_operations
+                .iter()
+                .find(|operation| operation.hwnd == 102)
+                .map(|operation| operation.rect.x),
+            Some(360)
         );
     }
 

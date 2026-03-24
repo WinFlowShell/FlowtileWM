@@ -9,13 +9,13 @@ layout {
 }
 
 input {
-  hotkey "Alt+J" "focus-next"
-  hotkey "Alt+K" "focus-prev"
-  hotkey "Alt+H" "scroll-strip-left"
-  hotkey "Alt+L" "scroll-strip-right"
-  hotkey "Alt+Shift+F" "toggle-floating"
-  hotkey "Alt+Shift+Space" "toggle-fullscreen"
-  hotkey "Alt+Shift+Backspace" "disable-management-and-unwind"
+  hotkey "Win+Ctrl+J" "focus-next"
+  hotkey "Win+Ctrl+K" "focus-prev"
+  hotkey "Win+Ctrl+H" "scroll-strip-left"
+  hotkey "Win+Ctrl+L" "scroll-strip-right"
+  hotkey "Win+Ctrl+Shift+F" "toggle-floating"
+  hotkey "Win+Ctrl+Shift+Space" "toggle-fullscreen"
+  hotkey "Win+Ctrl+Shift+Backspace" "disable-management-and-unwind"
 }
 
 rules {
