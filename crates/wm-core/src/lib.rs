@@ -538,8 +538,8 @@ mod tests {
         let initial_snapshot = snapshot_with_windows(
             Rect::new(0, 0, 600, 900),
             vec![
-                (100, Rect::new(0, 0, 300, 900), false),
-                (101, Rect::new(300, 0, 300, 900), true),
+                (100, Rect::new(0, 0, 300, 900), false, true),
+                (101, Rect::new(300, 0, 300, 900), true, true),
             ],
         );
 
@@ -554,7 +554,7 @@ mod tests {
                     reason: "win-event-hide".to_string(),
                     snapshot: Some(snapshot_with_windows(
                         Rect::new(0, 0, 600, 900),
-                        vec![(100, Rect::new(0, 0, 300, 900), true)],
+                        vec![(100, Rect::new(0, 0, 300, 900), true, true)],
                     )),
                     message: None,
                 },
@@ -583,7 +583,7 @@ mod tests {
             .sync_snapshot(
                 snapshot_with_windows(
                     Rect::new(0, 0, 600, 900),
-                    vec![(100, Rect::new(0, 0, 400, 900), true)],
+                    vec![(100, Rect::new(0, 0, 400, 900), true, true)],
                 ),
                 true,
             )
@@ -597,8 +597,8 @@ mod tests {
                     snapshot: Some(snapshot_with_windows(
                         Rect::new(0, 0, 600, 900),
                         vec![
-                            (100, Rect::new(0, 0, 400, 900), false),
-                            (101, Rect::new(400, 0, 400, 900), true),
+                            (100, Rect::new(0, 0, 400, 900), false, true),
+                            (101, Rect::new(400, 0, 400, 900), true, true),
                         ],
                     )),
                     message: None,
@@ -648,8 +648,8 @@ mod tests {
                 snapshot_with_windows(
                     Rect::new(0, 0, 800, 900),
                     vec![
-                        (100, Rect::new(0, 0, 400, 900), true),
-                        (101, Rect::new(400, 0, 400, 900), false),
+                        (100, Rect::new(0, 0, 400, 900), true, true),
+                        (101, Rect::new(400, 0, 400, 900), false, true),
                     ],
                 ),
                 true,
@@ -686,8 +686,8 @@ mod tests {
                     snapshot: Some(snapshot_with_windows(
                         Rect::new(0, 0, 800, 900),
                         vec![
-                            (100, Rect::new(0, 0, 400, 900), false),
-                            (101, Rect::new(400, 0, 400, 900), true),
+                            (100, Rect::new(0, 0, 400, 900), false, true),
+                            (101, Rect::new(400, 0, 400, 900), true, true),
                         ],
                     )),
                     message: None,
@@ -705,8 +705,8 @@ mod tests {
                     snapshot: Some(snapshot_with_windows(
                         Rect::new(0, 0, 800, 900),
                         vec![
-                            (100, Rect::new(0, 0, 400, 900), true),
-                            (101, Rect::new(400, 0, 400, 900), false),
+                            (100, Rect::new(0, 0, 400, 900), true, true),
+                            (101, Rect::new(400, 0, 400, 900), false, true),
                         ],
                     )),
                     message: None,
@@ -735,8 +735,8 @@ mod tests {
                 snapshot_with_windows(
                     Rect::new(0, 0, 700, 900),
                     vec![
-                        (100, Rect::new(0, 0, 350, 900), true),
-                        (101, Rect::new(350, 0, 350, 900), false),
+                        (100, Rect::new(0, 0, 350, 900), true, true),
+                        (101, Rect::new(350, 0, 350, 900), false, true),
                     ],
                 ),
                 true,
@@ -750,7 +750,7 @@ mod tests {
                     reason: "win-event-hide".to_string(),
                     snapshot: Some(snapshot_with_windows(
                         Rect::new(0, 0, 700, 900),
-                        vec![(100, Rect::new(0, 0, 350, 900), true)],
+                        vec![(100, Rect::new(0, 0, 350, 900), true, true)],
                     )),
                     message: None,
                 },
@@ -767,8 +767,8 @@ mod tests {
                     snapshot: Some(snapshot_with_windows(
                         Rect::new(0, 0, 700, 900),
                         vec![
-                            (100, Rect::new(0, 0, 350, 900), false),
-                            (101, Rect::new(350, 0, 350, 900), true),
+                            (100, Rect::new(0, 0, 350, 900), false, true),
+                            (101, Rect::new(350, 0, 350, 900), true, true),
                         ],
                     )),
                     message: None,
@@ -788,6 +788,47 @@ mod tests {
                 .and_then(|window_id| runtime.state().windows.get(&window_id))
                 .and_then(|window| window.current_hwnd_binding),
             Some(101)
+        );
+    }
+
+    #[test]
+    fn authoritative_sync_prunes_state_windows_missing_from_current_snapshot() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let initial_snapshot = snapshot_with_windows(
+            Rect::new(0, 0, 900, 900),
+            vec![
+                (100, Rect::new(0, 0, 300, 900), true, true),
+                (101, Rect::new(300, 0, 300, 900), false, true),
+            ],
+        );
+
+        runtime
+            .sync_snapshot(initial_snapshot, true)
+            .expect("initial sync should succeed");
+
+        runtime.last_snapshot = Some(snapshot_with_windows(
+            Rect::new(0, 0, 900, 900),
+            vec![(100, Rect::new(0, 0, 300, 900), true, true)],
+        ));
+
+        let report = runtime
+            .sync_snapshot(
+                snapshot_with_windows(
+                    Rect::new(0, 0, 900, 900),
+                    vec![(100, Rect::new(0, 0, 300, 900), true, true)],
+                ),
+                true,
+            )
+            .expect("sync should prune stale state window");
+
+        assert_eq!(report.destroyed_windows, 1);
+        assert_eq!(runtime.state().windows.len(), 1);
+        assert!(
+            !runtime
+                .state()
+                .windows
+                .values()
+                .any(|window| window.current_hwnd_binding == Some(101))
         );
     }
 
@@ -958,6 +999,191 @@ mod tests {
                 .expect("layout should exist")
                 .scroll_offset,
             300
+        );
+    }
+
+    #[test]
+    fn focus_prev_at_strip_start_does_not_wrap_to_last_column() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 800, 700), 96, true);
+
+        for (correlation, hwnd, focus_behavior) in [
+            (1_u64, 100_u64, FocusBehavior::FollowNewWindow),
+            (2, 101, FocusBehavior::PreserveCurrentFocus),
+            (3, 102, FocusBehavior::PreserveCurrentFocus),
+        ] {
+            store
+                .dispatch(DomainEvent::window_discovered_with(
+                    CorrelationId::new(correlation),
+                    monitor_id,
+                    hwnd,
+                    Size::new(400, 700),
+                    Rect::new(0, 0, 400, 700),
+                    WindowPlacement::AppendToWorkspaceEnd {
+                        mode: ColumnMode::Normal,
+                        width: WidthSemantics::Fixed(400),
+                    },
+                    focus_behavior,
+                ))
+                .expect("window discovery should succeed");
+        }
+
+        let first_window_id = store
+            .state()
+            .focus
+            .focused_window_id
+            .expect("first window should be focused");
+        let result = store
+            .dispatch(DomainEvent::focus_prev(
+                CorrelationId::new(4),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus prev should succeed");
+
+        assert_eq!(store.state().focus.focused_window_id, Some(first_window_id));
+        assert_eq!(
+            result
+                .layout_projection
+                .as_ref()
+                .expect("layout should exist")
+                .scroll_offset,
+            0
+        );
+    }
+
+    #[test]
+    fn focus_next_at_strip_end_does_not_wrap_to_first_column() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 800, 700), 96, true);
+
+        for (correlation, hwnd, focus_behavior) in [
+            (1_u64, 100_u64, FocusBehavior::FollowNewWindow),
+            (2, 101, FocusBehavior::PreserveCurrentFocus),
+            (3, 102, FocusBehavior::PreserveCurrentFocus),
+        ] {
+            store
+                .dispatch(DomainEvent::window_discovered_with(
+                    CorrelationId::new(correlation),
+                    monitor_id,
+                    hwnd,
+                    Size::new(400, 700),
+                    Rect::new(0, 0, 400, 700),
+                    WindowPlacement::AppendToWorkspaceEnd {
+                        mode: ColumnMode::Normal,
+                        width: WidthSemantics::Fixed(400),
+                    },
+                    focus_behavior,
+                ))
+                .expect("window discovery should succeed");
+        }
+
+        store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(4),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("first focus next should succeed");
+        let edge_result = store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(5),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("second focus next should succeed");
+        let focused_window_id = store
+            .state()
+            .focus
+            .focused_window_id
+            .expect("last window should be focused");
+        let result = store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(6),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus next at strip end should succeed");
+
+        assert_eq!(
+            edge_result
+                .layout_projection
+                .as_ref()
+                .expect("layout should exist")
+                .scroll_offset,
+            400
+        );
+        assert_eq!(
+            store.state().focus.focused_window_id,
+            Some(focused_window_id)
+        );
+        assert_eq!(
+            result
+                .layout_projection
+                .as_ref()
+                .expect("layout should exist")
+                .scroll_offset,
+            400
+        );
+    }
+
+    #[test]
+    fn focus_next_to_last_underfilled_column_pins_strip_to_right_edge() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 1200, 700), 96, true);
+
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(1),
+                monitor_id,
+                100,
+                Size::new(220, 700),
+                Rect::new(0, 0, 220, 700),
+                WindowPlacement::AppendToWorkspaceEnd {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(220),
+                },
+                FocusBehavior::FollowNewWindow,
+            ))
+            .expect("first window discovery should succeed");
+        store
+            .dispatch(DomainEvent::window_discovered_with(
+                CorrelationId::new(2),
+                monitor_id,
+                101,
+                Size::new(420, 700),
+                Rect::new(220, 0, 420, 700),
+                WindowPlacement::AppendToWorkspaceEnd {
+                    mode: ColumnMode::Normal,
+                    width: WidthSemantics::Fixed(420),
+                },
+                FocusBehavior::PreserveCurrentFocus,
+            ))
+            .expect("second window discovery should succeed");
+
+        let result = store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(3),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus next should succeed");
+        let projection = result
+            .layout_projection
+            .as_ref()
+            .expect("layout should exist");
+
+        assert_eq!(projection.scroll_offset, 0);
+        assert_eq!(
+            geometry_x_width(projection, flowtile_domain::WindowId::new(1)).0,
+            560
+        );
+        let second_geometry = geometry_x_width(projection, flowtile_domain::WindowId::new(2));
+        assert_eq!(second_geometry.0, 780);
+        assert_eq!(
+            second_geometry.0 + second_geometry.1 as i32,
+            projection.viewport.x + projection.viewport.width as i32
         );
     }
 
@@ -1293,6 +1519,7 @@ mod tests {
     fn scroll_command_changes_projected_geometry_and_apply_plan() {
         let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
         let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
             monitors: vec![PlatformMonitorSnapshot {
                 binding: "\\\\.\\DISPLAY1".to_string(),
                 work_area_rect: Rect::new(0, 0, 600, 900),
@@ -1310,6 +1537,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: true,
+                    management_candidate: true,
                 },
                 PlatformWindowSnapshot {
                     hwnd: 101,
@@ -1321,6 +1549,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: false,
+                    management_candidate: true,
                 },
                 PlatformWindowSnapshot {
                     hwnd: 102,
@@ -1332,6 +1561,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: false,
+                    management_candidate: true,
                 },
             ],
         };
@@ -1451,6 +1681,136 @@ mod tests {
     }
 
     #[test]
+    fn external_transient_foreground_does_not_trigger_activation_reassert() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(sample_snapshot(100, Rect::new(0, 0, 420, 900), true), true)
+            .expect("initial sync should succeed");
+
+        let overlay_snapshot = snapshot_with_windows(
+            Rect::new(0, 0, 1600, 900),
+            vec![
+                (100, Rect::new(0, 0, 420, 900), false, true),
+                (900, Rect::new(200, 100, 700, 500), true, false),
+            ],
+        );
+
+        let planned_operations = runtime
+            .plan_apply_operations(&overlay_snapshot)
+            .expect("apply plan should be computed");
+
+        assert!(
+            !planned_operations
+                .iter()
+                .any(|operation| operation.hwnd == 100 && operation.activate)
+        );
+    }
+
+    #[test]
+    fn filtered_transient_foreground_fact_does_not_trigger_activation_reassert() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(sample_snapshot(100, Rect::new(0, 0, 420, 900), true), true)
+            .expect("initial sync should succeed");
+
+        let overlay_snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(900),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(0, 0, 420, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            }],
+        };
+
+        let planned_operations = runtime
+            .plan_apply_operations(&overlay_snapshot)
+            .expect("apply plan should be computed");
+
+        assert!(
+            !planned_operations
+                .iter()
+                .any(|operation| operation.hwnd == 100 && operation.activate)
+        );
+    }
+
+    #[test]
+    fn transient_snapshot_window_is_not_ingested_into_wm_state() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = snapshot_with_windows(
+            Rect::new(0, 0, 1600, 900),
+            vec![
+                (100, Rect::new(0, 0, 420, 900), true, true),
+                (900, Rect::new(200, 100, 700, 500), false, false),
+            ],
+        );
+
+        runtime
+            .sync_snapshot(snapshot, true)
+            .expect("sync should succeed");
+
+        assert!(
+            runtime
+                .state()
+                .windows
+                .values()
+                .any(|window| window.current_hwnd_binding == Some(100))
+        );
+        assert!(
+            !runtime
+                .state()
+                .windows
+                .values()
+                .any(|window| window.current_hwnd_binding == Some(900))
+        );
+    }
+
+    #[test]
+    fn competing_managed_foreground_still_triggers_activation_reassert() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(
+                snapshot_with_windows(
+                    Rect::new(0, 0, 1600, 900),
+                    vec![
+                        (100, Rect::new(0, 0, 420, 900), true, true),
+                        (101, Rect::new(420, 0, 420, 900), false, true),
+                    ],
+                ),
+                true,
+            )
+            .expect("initial sync should succeed");
+
+        let planned_operations = runtime
+            .plan_apply_operations(&snapshot_with_windows(
+                Rect::new(0, 0, 1600, 900),
+                vec![
+                    (100, Rect::new(0, 0, 420, 900), false, true),
+                    (101, Rect::new(420, 0, 420, 900), true, true),
+                ],
+            ))
+            .expect("apply plan should be computed");
+
+        assert!(
+            planned_operations
+                .iter()
+                .any(|operation| operation.hwnd == 100 && operation.activate)
+        );
+    }
+
+    #[test]
     fn floating_toggle_roundtrip_restores_tiled_membership() {
         let mut store = StateStore::new(RuntimeMode::WmOnly);
         let monitor_id = store
@@ -1552,14 +1912,21 @@ mod tests {
     }
 
     fn sample_snapshot(hwnd: u64, rect: Rect, focused: bool) -> PlatformSnapshot {
-        snapshot_with_windows(Rect::new(0, 0, 1600, 900), vec![(hwnd, rect, focused)])
+        snapshot_with_windows(
+            Rect::new(0, 0, 1600, 900),
+            vec![(hwnd, rect, focused, true)],
+        )
     }
 
     fn snapshot_with_windows(
         monitor_rect: Rect,
-        windows: Vec<(u64, Rect, bool)>,
+        windows: Vec<(u64, Rect, bool, bool)>,
     ) -> PlatformSnapshot {
+        let foreground_hwnd = windows
+            .iter()
+            .find_map(|(hwnd, _, focused, _)| (*focused).then_some(*hwnd));
         PlatformSnapshot {
+            foreground_hwnd,
             monitors: vec![PlatformMonitorSnapshot {
                 binding: "\\\\.\\DISPLAY1".to_string(),
                 work_area_rect: monitor_rect,
@@ -1568,17 +1935,20 @@ mod tests {
             }],
             windows: windows
                 .into_iter()
-                .map(|(hwnd, rect, focused)| PlatformWindowSnapshot {
-                    hwnd,
-                    title: format!("Window {hwnd}"),
-                    class_name: "Notepad".to_string(),
-                    process_id: 4242,
-                    process_name: Some("notepad".to_string()),
-                    rect,
-                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
-                    is_visible: true,
-                    is_focused: focused,
-                })
+                .map(
+                    |(hwnd, rect, focused, management_candidate)| PlatformWindowSnapshot {
+                        hwnd,
+                        title: format!("Window {hwnd}"),
+                        class_name: "Notepad".to_string(),
+                        process_id: 4242,
+                        process_name: Some("notepad".to_string()),
+                        rect,
+                        monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                        is_visible: true,
+                        is_focused: focused,
+                        management_candidate,
+                    },
+                )
                 .collect(),
         }
     }

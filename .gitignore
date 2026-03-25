@@ -4,6 +4,7 @@ docs/dev/
 docs/meta/
 docs/versions/
 target/
+tmp/
 artifacts/
 bin/
 obj/

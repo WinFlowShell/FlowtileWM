@@ -350,12 +350,11 @@ impl StateStore {
                     .iter()
                     .position(|(candidate_window_id, _)| *candidate_window_id == window_id)
                     .unwrap_or(0);
+                let last_index = sequence.len().saturating_sub(1);
                 if forward {
-                    (current_index + 1) % sequence.len()
-                } else if current_index == 0 {
-                    sequence.len() - 1
+                    current_index.saturating_add(1).min(last_index)
                 } else {
-                    current_index - 1
+                    current_index.saturating_sub(1)
                 }
             }
             None if forward => 0,

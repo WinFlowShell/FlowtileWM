@@ -13,7 +13,14 @@ use hotkeys::ensure_bind_control_mode_supported;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_ACCESS_DENIED, GetLastError},
-    UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+    System::Threading::GetCurrentProcess,
+    UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
+        DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED, GetDpiAwarenessContextForProcess,
+        GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext, SetThreadDpiAwarenessContext,
+    },
 };
 
 fn main() -> ExitCode {
@@ -83,7 +90,7 @@ fn ensure_process_dpi_awareness() -> Result<(), String> {
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
     };
     if applied != 0 {
-        return Ok(());
+        return ensure_current_dpi_awareness();
     }
 
     let error = {
@@ -91,12 +98,71 @@ fn ensure_process_dpi_awareness() -> Result<(), String> {
         unsafe { GetLastError() }
     };
     if error == ERROR_ACCESS_DENIED {
-        return Ok(());
+        return ensure_current_dpi_awareness();
     }
 
     Err(format!(
         "SetProcessDpiAwarenessContext failed with Win32 error {error}"
     ))
+}
+
+#[cfg(windows)]
+fn ensure_current_dpi_awareness() -> Result<(), String> {
+    let process_context = {
+        // SAFETY: This is a read-only query for the current process DPI awareness context.
+        unsafe { GetDpiAwarenessContextForProcess(GetCurrentProcess()) }
+    };
+    if awareness_context_equals(process_context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+        return Ok(());
+    }
+
+    let _ = {
+        // SAFETY: This sets the current startup thread to PMv2 so early adapter calls use the
+        // correct coordinate space even before any worker threads are spawned.
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    };
+    let thread_context = {
+        // SAFETY: This is a read-only query for the current thread DPI awareness context.
+        unsafe { GetThreadDpiAwarenessContext() }
+    };
+
+    if awareness_context_equals(process_context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        && awareness_context_equals(thread_context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "flowtile-core-daemon must run in Per Monitor DPI Aware v2; process awareness is {}, thread awareness is {}",
+            awareness_context_label(process_context),
+            awareness_context_label(thread_context),
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn awareness_context_label(context: DPI_AWARENESS_CONTEXT) -> &'static str {
+    if awareness_context_equals(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+        "per-monitor-v2"
+    } else if awareness_context_equals(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE) {
+        "per-monitor-v1"
+    } else if awareness_context_equals(context, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) {
+        "system-aware"
+    } else if awareness_context_equals(context, DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED) {
+        "unaware-gdi-scaled"
+    } else if awareness_context_equals(context, DPI_AWARENESS_CONTEXT_UNAWARE) {
+        "unaware"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(windows)]
+fn awareness_context_equals(left: DPI_AWARENESS_CONTEXT, right: DPI_AWARENESS_CONTEXT) -> bool {
+    let equal = {
+        // SAFETY: Both values are DPI awareness context handles returned by or defined for Win32.
+        unsafe { AreDpiAwarenessContextsEqual(left, right) }
+    };
+    equal != 0
 }
 
 #[cfg(not(windows))]

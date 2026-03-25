@@ -18,6 +18,8 @@ use flowtile_domain::Rect;
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
+mod dpi;
+#[cfg(windows)]
 mod native_apply;
 #[cfg(windows)]
 mod native_observer;
@@ -26,6 +28,9 @@ mod native_snapshot;
 
 pub const PRIMARY_DISCOVERY_API: &str = "SetWinEventHook";
 pub const FALLBACK_DISCOVERY_PATH: &str = "full-window-scan";
+pub const TILED_VISUAL_OVERLAP_X_PX: i32 = 1;
+pub const WINDOW_SWITCH_ANIMATION_DURATION_MS: u16 = 90;
+pub const WINDOW_SWITCH_ANIMATION_FRAME_COUNT: u8 = 6;
 #[cfg(not(windows))]
 const APPLY_SCRIPT_NAME: &str = "apply-geometry.ps1";
 #[cfg(not(windows))]
@@ -54,6 +59,8 @@ pub const fn bootstrap() -> WindowsAdapterBootstrap {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlatformSnapshot {
+    #[serde(default)]
+    pub foreground_hwnd: Option<u64>,
     pub monitors: Vec<PlatformMonitorSnapshot>,
     pub windows: Vec<PlatformWindowSnapshot>,
 }
@@ -80,6 +87,11 @@ impl PlatformSnapshot {
     pub fn focused_window(&self) -> Option<&PlatformWindowSnapshot> {
         self.windows.iter().find(|window| window.is_focused)
     }
+
+    pub fn actual_foreground_hwnd(&self) -> Option<u64> {
+        self.foreground_hwnd
+            .or_else(|| self.focused_window().map(|window| window.hwnd))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -102,6 +114,12 @@ pub struct PlatformWindowSnapshot {
     pub monitor_binding: String,
     pub is_visible: bool,
     pub is_focused: bool,
+    #[serde(default = "default_management_candidate")]
+    pub management_candidate: bool,
+}
+
+const fn default_management_candidate() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -137,7 +155,7 @@ impl SnapshotDiff {
         Self {
             created_windows: snapshot.windows.clone(),
             destroyed_hwnds: Vec::new(),
-            focused_hwnd: snapshot.focused_window().map(|window| window.hwnd),
+            focused_hwnd: snapshot.actual_foreground_hwnd(),
             monitor_topology_changed: !snapshot.monitors.is_empty(),
         }
     }
@@ -168,8 +186,8 @@ pub fn diff_snapshots(previous: &PlatformSnapshot, current: &PlatformSnapshot) -
         .map(|window| window.hwnd)
         .collect::<Vec<_>>();
     let focused_hwnd = match (
-        previous.focused_window().map(|window| window.hwnd),
-        current.focused_window().map(|window| window.hwnd),
+        previous.actual_foreground_hwnd(),
+        current.actual_foreground_hwnd(),
     ) {
         (previous_hwnd, current_hwnd) if previous_hwnd != current_hwnd => current_hwnd,
         _ => None,
@@ -183,12 +201,23 @@ pub fn diff_snapshots(previous: &PlatformSnapshot, current: &PlatformSnapshot) -
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WindowSwitchAnimation {
+    pub from_rect: Rect,
+    pub duration_ms: u16,
+    pub frame_count: u8,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApplyOperation {
     pub hwnd: u64,
     pub rect: Rect,
     #[serde(default)]
     pub activate: bool,
+    #[serde(default)]
+    pub suppress_visual_gap: bool,
+    #[serde(default)]
+    pub window_switch_animation: Option<WindowSwitchAnimation>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -674,6 +703,20 @@ pub fn needs_geometry_apply(actual: Rect, desired: Rect) -> bool {
     actual != desired
 }
 
+pub fn needs_tiled_gapless_geometry_apply(actual: Rect, desired: Rect) -> bool {
+    let overlap = TILED_VISUAL_OVERLAP_X_PX.max(0);
+    let desired_right = desired.x.saturating_add(desired.width as i32);
+    let actual_right = actual.x.saturating_add(actual.width as i32);
+    let desired_left_shift = if desired.x > 0 { overlap } else { 0 };
+    let actual_left_shift = desired.x.saturating_sub(actual.x);
+    let right_delta = actual_right.saturating_sub(desired_right);
+
+    actual.y != desired.y
+        || actual.height != desired.height
+        || actual_left_shift != desired_left_shift
+        || right_delta.abs() > overlap
+}
+
 pub fn needs_activation_apply(actual_focused_hwnd: Option<u64>, desired_focused_hwnd: u64) -> bool {
     actual_focused_hwnd != Some(desired_focused_hwnd)
 }
@@ -703,6 +746,7 @@ mod tests {
         ObservationEnvelope, ObservationKind, PRIMARY_DISCOVERY_API, PlatformMonitorSnapshot,
         PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff, bootstrap, diff_snapshots,
         missing_monitor_bindings, needs_activation_apply, needs_geometry_apply,
+        needs_tiled_gapless_geometry_apply,
     };
 
     #[test]
@@ -738,6 +782,7 @@ mod tests {
             monitor_binding: "\\\\.\\DISPLAY1".to_string(),
             is_visible: true,
             is_focused: false,
+            management_candidate: true,
         });
         current.windows[0].is_focused = false;
 
@@ -746,6 +791,27 @@ mod tests {
         assert_eq!(diff.created_windows.len(), 1);
         assert_eq!(diff.created_windows[0].hwnd, 30);
         assert_eq!(diff.focused_hwnd, None);
+    }
+
+    #[test]
+    fn diff_tracks_explicit_foreground_even_when_window_is_filtered_out() {
+        let previous = sample_snapshot();
+        let current = PlatformSnapshot {
+            foreground_hwnd: Some(900),
+            monitors: previous.monitors.clone(),
+            windows: previous
+                .windows
+                .iter()
+                .cloned()
+                .map(|mut window| {
+                    window.is_focused = false;
+                    window
+                })
+                .collect(),
+        };
+
+        let diff = diff_snapshots(&previous, &current);
+        assert_eq!(diff.focused_hwnd, Some(900));
     }
 
     #[test]
@@ -771,6 +837,30 @@ mod tests {
         assert!(needs_geometry_apply(
             Rect::new(0, 0, 400, 300),
             Rect::new(10, 0, 400, 300)
+        ));
+    }
+
+    #[test]
+    fn tiled_overlap_tolerance_accepts_gapless_compensation() {
+        assert!(!needs_tiled_gapless_geometry_apply(
+            Rect::new(99, 0, 400, 600),
+            Rect::new(100, 0, 400, 600),
+        ));
+    }
+
+    #[test]
+    fn tiled_overlap_tolerance_accepts_right_side_slack_after_shift() {
+        assert!(!needs_tiled_gapless_geometry_apply(
+            Rect::new(99, 0, 402, 600),
+            Rect::new(100, 0, 400, 600),
+        ));
+    }
+
+    #[test]
+    fn tiled_overlap_tolerance_rejects_missing_left_shift() {
+        assert!(needs_tiled_gapless_geometry_apply(
+            Rect::new(100, 0, 400, 600),
+            Rect::new(100, 0, 400, 600),
         ));
     }
 
@@ -809,6 +899,7 @@ mod tests {
 
     fn sample_snapshot() -> PlatformSnapshot {
         PlatformSnapshot {
+            foreground_hwnd: Some(20),
             monitors: vec![PlatformMonitorSnapshot {
                 binding: "\\\\.\\DISPLAY1".to_string(),
                 work_area_rect: Rect::new(0, 0, 1920, 1080),
@@ -826,6 +917,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: false,
+                    management_candidate: true,
                 },
                 PlatformWindowSnapshot {
                     hwnd: 20,
@@ -837,6 +929,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: true,
+                    management_candidate: true,
                 },
             ],
         }

@@ -29,13 +29,27 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, WindowsAdapterError,
+    PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, WindowsAdapterError, dpi,
 };
 use flowtile_domain::Rect as DomainRect;
 
 const CLASS_FILTER_CORE_WINDOW: &str = "Windows.UI.Core.CoreWindow";
 const DEFAULT_DPI: u32 = 96;
+const SHELL_OVERLAY_PROCESS_SCREEN_CLIPPING_HOST: &str = "screenclippinghost";
+const SHELL_OVERLAY_PROCESS_SHELL_EXPERIENCE_HOST: &str = "shellexperiencehost";
+const SHELL_OVERLAY_PROCESS_START_MENU_EXPERIENCE_HOST: &str = "startmenuexperiencehost";
+const SHELL_OVERLAY_PROCESS_SEARCH_HOST: &str = "searchhost";
+const SHELL_OVERLAY_PROCESS_SEARCH_APP: &str = "searchapp";
+const SHELL_OVERLAY_PROCESS_TEXT_INPUT_HOST: &str = "textinputhost";
+const SHELL_OVERLAY_PROCESS_LOCK_APP: &str = "lockapp";
 pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
+    dpi::ensure_current_thread_per_monitor_v2("native-scan").map_err(|message| {
+        WindowsAdapterError::RuntimeFailed {
+            component: "native-scan",
+            message,
+        }
+    })?;
+
     let mut monitor_context = MonitorEnumContext::default();
     let enumerated_monitors = {
         // SAFETY: The callback pointer is a valid static function and `monitor_context` stays
@@ -84,6 +98,7 @@ pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
     }
 
     let mut snapshot = PlatformSnapshot {
+        foreground_hwnd: hwnd_to_raw(foreground_hwnd),
         monitors: monitor_context.monitors,
         windows: window_context.windows,
     };
@@ -92,6 +107,7 @@ pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
 }
 
 pub(crate) fn refresh_window(snapshot: &mut PlatformSnapshot, hwnd_raw: u64) -> Result<(), String> {
+    dpi::ensure_current_thread_per_monitor_v2("native-refresh-window")?;
     let hwnd = hwnd_from_raw(hwnd_raw).map_err(|message| message.to_string())?;
     let foreground_hwnd = {
         // SAFETY: `GetForegroundWindow` is a parameterless Win32 query.
@@ -115,11 +131,13 @@ pub(crate) fn remove_window(snapshot: &mut PlatformSnapshot, hwnd: u64) {
 }
 
 pub(crate) fn refresh_focus(snapshot: &mut PlatformSnapshot) -> Result<(), String> {
+    dpi::ensure_current_thread_per_monitor_v2("native-refresh-focus")?;
     let foreground_hwnd = {
         // SAFETY: `GetForegroundWindow` is a parameterless Win32 query.
         unsafe { GetForegroundWindow() }
     };
     let focused_raw = hwnd_to_raw(foreground_hwnd).unwrap_or_default();
+    snapshot.foreground_hwnd = hwnd_to_raw(foreground_hwnd);
 
     for window in &mut snapshot.windows {
         window.is_focused = window.hwnd == focused_raw;
@@ -241,23 +259,55 @@ fn capture_window_snapshot(
     }
 
     let (_, monitor) = describe_monitor_for_window(window_handle)?;
+    let title = query_window_title(window_handle);
     let class_name = query_window_class(window_handle);
     if class_name == CLASS_FILTER_CORE_WINDOW {
         return None;
     }
 
     let process_id = query_process_id(window_handle);
+    let process_name = query_process_name(process_id);
+    let management_candidate =
+        !is_transient_shell_overlay(&class_name, &title, process_name.as_deref());
     Some(PlatformWindowSnapshot {
         hwnd: hwnd_to_raw(window_handle)?,
-        title: query_window_title(window_handle),
+        title,
         class_name,
         process_id,
-        process_name: query_process_name(process_id),
+        process_name,
         rect,
         monitor_binding: monitor.binding,
         is_visible: true,
         is_focused: window_handle == foreground_hwnd,
+        management_candidate,
     })
+}
+
+fn is_transient_shell_overlay(class_name: &str, title: &str, process_name: Option<&str>) -> bool {
+    let class_name = class_name.to_ascii_lowercase();
+    if matches!(
+        class_name.as_str(),
+        "multitaskingviewframe" | "taskswitcherwnd"
+    ) {
+        return true;
+    }
+
+    let process_name = process_name.unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        process_name.as_str(),
+        SHELL_OVERLAY_PROCESS_SCREEN_CLIPPING_HOST
+            | SHELL_OVERLAY_PROCESS_SHELL_EXPERIENCE_HOST
+            | SHELL_OVERLAY_PROCESS_START_MENU_EXPERIENCE_HOST
+            | SHELL_OVERLAY_PROCESS_SEARCH_HOST
+            | SHELL_OVERLAY_PROCESS_SEARCH_APP
+            | SHELL_OVERLAY_PROCESS_TEXT_INPUT_HOST
+            | SHELL_OVERLAY_PROCESS_LOCK_APP
+    ) {
+        return true;
+    }
+
+    let title = title.to_ascii_lowercase();
+    title.contains("task switching") || title.contains("task view")
 }
 
 fn is_real_user_window(window_handle: HWND) -> bool {
@@ -399,7 +449,7 @@ fn query_window_title(window_handle: HWND) -> String {
 mod tests {
     use windows_sys::Win32::Foundation::RECT;
 
-    use super::visible_frame_is_compatible;
+    use super::{is_transient_shell_overlay, visible_frame_is_compatible};
 
     #[test]
     fn visible_frame_is_rejected_when_it_escapes_outer_rect() {
@@ -417,6 +467,33 @@ mod tests {
         };
 
         assert!(!visible_frame_is_compatible(outer, incompatible));
+    }
+
+    #[test]
+    fn transient_shell_overlay_is_detected_by_multitasking_class() {
+        assert!(is_transient_shell_overlay(
+            "MultitaskingViewFrame",
+            "",
+            Some("explorer"),
+        ));
+    }
+
+    #[test]
+    fn transient_shell_overlay_is_detected_by_capture_process() {
+        assert!(is_transient_shell_overlay(
+            "ApplicationFrameWindow",
+            "Screen clip",
+            Some("ScreenClippingHost"),
+        ));
+    }
+
+    #[test]
+    fn ordinary_app_window_is_not_treated_as_transient_shell_overlay() {
+        assert!(!is_transient_shell_overlay(
+            "Notepad",
+            "notes.txt - Notepad",
+            Some("notepad"),
+        ));
     }
 }
 

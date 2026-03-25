@@ -5,23 +5,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$TargetDir = Join-Path $PSScriptRoot "..\tmp\target-script-check"
+
 Write-Host "Running cargo fmt --check..."
 cargo fmt --all --check
 
 Write-Host "Running cargo clippy..."
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --target-dir $TargetDir --workspace --all-targets -- -D warnings
 
 Write-Host "Running cargo test..."
-cargo test --workspace
+cargo test --target-dir $TargetDir --workspace
 
-$uiHostProject = Join-Path $PSScriptRoot "..\ui\ui-host\Flowtile.UiHost.csproj"
-if (Test-Path $uiHostProject) {
-    Write-Host "Running dotnet build for UI Host..."
-    dotnet build $uiHostProject -c Debug
-} elseif ($RequireUiHost) {
-    throw "UI Host project is required but has not been bootstrapped yet."
-} else {
-    Write-Warning "Skipping UI Host build because Flowtile.UiHost.csproj is not present yet."
+if ($RequireUiHost) {
+    throw "UI Host project was removed from the current working line."
 }
 
 Write-Host "Check completed."

@@ -1,10 +1,19 @@
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
+
 use std::convert::TryFrom;
 use std::mem::zeroed;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, RECT},
-    Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+    Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmGetWindowAttribute,
+        DwmSetWindowAttribute,
+    },
     System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
@@ -20,32 +29,52 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{ApplyBatchResult, ApplyFailure, ApplyOperation};
+use crate::{
+    ApplyBatchResult, ApplyFailure, ApplyOperation, TILED_VISUAL_OVERLAP_X_PX,
+    WindowSwitchAnimation, dpi,
+};
 
 const GEOMETRY_APPLY_FLAGS: u32 =
     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW;
 const ERROR_ACCESS_DENIED: u32 = 5;
 
 pub(crate) fn apply_operations(operations: &[ApplyOperation]) -> ApplyBatchResult {
-    if operations.len() > 1 && try_apply_operations_batched(operations).is_ok() {
-        let mut applied = operations.len();
-        let mut failures = Vec::new();
-
-        for operation in operations.iter().filter(|operation| operation.activate) {
-            if let Err(message) = activate_window(operation.hwnd) {
-                applied = applied.saturating_sub(1);
-                failures.push(ApplyFailure {
-                    hwnd: operation.hwnd,
-                    message,
-                });
-            }
-        }
-
+    if let Err(message) = dpi::ensure_current_thread_per_monitor_v2("native-apply") {
         return ApplyBatchResult {
             attempted: operations.len(),
-            applied,
-            failures,
+            applied: 0,
+            failures: operations
+                .iter()
+                .map(|operation| ApplyFailure {
+                    hwnd: operation.hwnd,
+                    message: message.clone(),
+                })
+                .collect(),
         };
+    }
+
+    let (animated_operations, direct_operations): (Vec<_>, Vec<_>) = operations
+        .iter()
+        .cloned()
+        .partition(uses_window_switch_animation);
+    let mut result = ApplyBatchResult::default();
+
+    merge_apply_result(&mut result, apply_operations_direct(&direct_operations));
+    merge_apply_result(
+        &mut result,
+        apply_window_switch_animations(&animated_operations),
+    );
+
+    result
+}
+
+fn apply_operations_direct(operations: &[ApplyOperation]) -> ApplyBatchResult {
+    if operations.is_empty() {
+        return ApplyBatchResult::default();
+    }
+
+    if operations.len() > 1 && try_apply_operations_batched(operations).is_ok() {
+        return finalize_apply_without_animation(operations);
     }
 
     apply_operations_individually(operations)
@@ -74,6 +103,18 @@ fn apply_operations_individually(operations: &[ApplyOperation]) -> ApplyBatchRes
     }
 }
 
+fn apply_window_switch_animations(operations: &[ApplyOperation]) -> ApplyBatchResult {
+    if operations.is_empty() {
+        return ApplyBatchResult::default();
+    }
+
+    if try_apply_window_switch_animations(operations).is_ok() {
+        return finalize_apply_without_animation(operations);
+    }
+
+    apply_operations_direct(operations)
+}
+
 fn try_apply_operations_batched(operations: &[ApplyOperation]) -> Result<(), String> {
     let Some(batch_capacity) = i32::try_from(operations.len()).ok() else {
         return Err("operation batch is larger than supported Win32 defer capacity".to_string());
@@ -90,6 +131,9 @@ fn try_apply_operations_batched(operations: &[ApplyOperation]) -> Result<(), Str
 
     for operation in operations {
         let hwnd = hwnd_from_raw(operation.hwnd)?;
+        if operation.suppress_visual_gap {
+            apply_gapless_visual_policy(hwnd);
+        }
         let translated = translated_window_rect(hwnd, operation)?;
         let next_batch = {
             // SAFETY: `batch` is a handle returned by `BeginDeferWindowPos` or a previous
@@ -132,6 +176,45 @@ fn try_apply_operations_batched(operations: &[ApplyOperation]) -> Result<(), Str
     Ok(())
 }
 
+fn try_apply_window_switch_animations(operations: &[ApplyOperation]) -> Result<(), String> {
+    let Some(animation) = operations
+        .iter()
+        .find_map(|operation| operation.window_switch_animation.clone())
+    else {
+        return Ok(());
+    };
+    if animation.frame_count <= 1 {
+        return Ok(());
+    }
+
+    let total_duration = Duration::from_millis(u64::from(animation.duration_ms.max(1)));
+    let frame_count = u64::from(animation.frame_count);
+    let animation_start = Instant::now();
+
+    for frame_index in 1..=frame_count {
+        let progress = frame_index as f32 / frame_count as f32;
+        let eased_progress = ease_out_cubic(progress);
+        let frame_operations = operations
+            .iter()
+            .map(|operation| animated_frame_operation(operation, eased_progress))
+            .collect::<Vec<_>>();
+        try_apply_operations_batched(&frame_operations)?;
+
+        if frame_index < frame_count {
+            let target_elapsed_ms = total_duration
+                .as_millis()
+                .saturating_mul(frame_index as u128)
+                / frame_count as u128;
+            let target_elapsed = Duration::from_millis(target_elapsed_ms as u64);
+            if let Some(remaining) = target_elapsed.checked_sub(animation_start.elapsed()) {
+                thread::sleep(remaining);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
     match apply_geometry(operation) {
         Ok(()) => {}
@@ -157,9 +240,92 @@ fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
     Ok(())
 }
 
+fn finalize_apply_without_animation(operations: &[ApplyOperation]) -> ApplyBatchResult {
+    let mut applied = operations.len();
+    let mut failures = Vec::new();
+
+    for operation in operations.iter().filter(|operation| operation.activate) {
+        if let Err(message) = activate_window(operation.hwnd) {
+            applied = applied.saturating_sub(1);
+            failures.push(ApplyFailure {
+                hwnd: operation.hwnd,
+                message,
+            });
+        }
+    }
+
+    ApplyBatchResult {
+        attempted: operations.len(),
+        applied,
+        failures,
+    }
+}
+
+fn merge_apply_result(target: &mut ApplyBatchResult, source: ApplyBatchResult) {
+    target.attempted += source.attempted;
+    target.applied += source.applied;
+    target.failures.extend(source.failures);
+}
+
+fn uses_window_switch_animation(operation: &ApplyOperation) -> bool {
+    operation
+        .window_switch_animation
+        .as_ref()
+        .is_some_and(|animation| animation.frame_count > 1 && animation.from_rect != operation.rect)
+}
+
+fn animated_frame_operation(operation: &ApplyOperation, progress: f32) -> ApplyOperation {
+    let animation = operation
+        .window_switch_animation
+        .as_ref()
+        .expect("animation operation should carry animation metadata");
+    ApplyOperation {
+        hwnd: operation.hwnd,
+        rect: interpolate_rect(animation, operation.rect, progress),
+        activate: false,
+        suppress_visual_gap: operation.suppress_visual_gap,
+        window_switch_animation: None,
+    }
+}
+
+fn interpolate_rect(
+    animation: &WindowSwitchAnimation,
+    target_rect: flowtile_domain::Rect,
+    progress: f32,
+) -> flowtile_domain::Rect {
+    if progress >= 1.0 {
+        return target_rect;
+    }
+
+    flowtile_domain::Rect::new(
+        interpolate_i32(animation.from_rect.x, target_rect.x, progress),
+        interpolate_i32(animation.from_rect.y, target_rect.y, progress),
+        interpolate_u32(animation.from_rect.width, target_rect.width, progress),
+        interpolate_u32(animation.from_rect.height, target_rect.height, progress),
+    )
+}
+
+fn interpolate_i32(from: i32, to: i32, progress: f32) -> i32 {
+    let delta = (to - from) as f32;
+    from.saturating_add((delta * progress).round() as i32)
+}
+
+fn interpolate_u32(from: u32, to: u32, progress: f32) -> u32 {
+    let delta = to as f32 - from as f32;
+    ((from as f32) + delta * progress).round().max(1.0) as u32
+}
+
+fn ease_out_cubic(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    1.0 - (1.0 - progress).powi(3)
+}
+
 fn apply_geometry(operation: &ApplyOperation) -> Result<(), Win32ApiError> {
     let hwnd =
         hwnd_from_raw(operation.hwnd).map_err(|message| Win32ApiError { code: 0, message })?;
+    if operation.suppress_visual_gap {
+        apply_gapless_visual_policy(hwnd);
+    }
     let translated = translated_window_rect(hwnd, operation)
         .map_err(|message| Win32ApiError { code: 0, message })?;
     let applied = {
@@ -183,6 +349,45 @@ fn apply_geometry(operation: &ApplyOperation) -> Result<(), Win32ApiError> {
     }
 
     Ok(())
+}
+
+fn apply_gapless_visual_policy(hwnd: HWND) {
+    set_dwm_i32_attribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+        DWMWCP_DONOTROUND,
+    );
+    set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, DWMWA_COLOR_NONE);
+}
+
+fn set_dwm_i32_attribute(hwnd: HWND, attribute: u32, value: i32) {
+    let _ = {
+        // SAFETY: We pass the documented attribute payload type and size for a validated top-level
+        // window handle. This visual policy is best-effort and failure is non-fatal.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute,
+                &value as *const _ as *const _,
+                std::mem::size_of::<i32>() as u32,
+            )
+        }
+    };
+}
+
+fn set_dwm_u32_attribute(hwnd: HWND, attribute: u32, value: u32) {
+    let _ = {
+        // SAFETY: We pass the documented attribute payload type and size for a validated top-level
+        // window handle. This visual policy is best-effort and failure is non-fatal.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute,
+                &value as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            )
+        }
+    };
 }
 
 fn activate_window(raw_hwnd: u64) -> Result<(), String> {
@@ -363,28 +568,15 @@ struct Win32ApiError {
     message: String,
 }
 
-fn rect_size(operation: &ApplyOperation) -> Result<(i32, i32), String> {
-    let width = i32::try_from(operation.rect.width).map_err(|_| {
-        format!(
-            "window {} width {} exceeds Win32 coordinate range",
-            operation.hwnd, operation.rect.width
-        )
-    })?;
-    let height = i32::try_from(operation.rect.height).map_err(|_| {
-        format!(
-            "window {} height {} exceeds Win32 coordinate range",
-            operation.hwnd, operation.rect.height
-        )
-    })?;
-
-    Ok((width, height))
-}
-
 fn translated_window_rect(
     hwnd: HWND,
     operation: &ApplyOperation,
 ) -> Result<TranslatedRect, String> {
-    let (visible_width, visible_height) = rect_size(operation)?;
+    let target_visible_rect = compensated_visible_rect(operation)?;
+    let visible_width = i32::try_from(target_visible_rect.width)
+        .map_err(|_| format!("window {} width exceeded Win32 limits", operation.hwnd))?;
+    let visible_height = i32::try_from(target_visible_rect.height)
+        .map_err(|_| format!("window {} height exceeded Win32 limits", operation.hwnd))?;
     let outer_rect = query_outer_window_rect(hwnd)?;
     let visible_rect = query_visible_frame_rect(hwnd)
         .filter(|visible_rect| visible_frame_is_compatible(outer_rect, *visible_rect))
@@ -401,11 +593,33 @@ fn translated_window_rect(
         .ok_or_else(|| format!("window {} translated height overflowed", operation.hwnd))?;
 
     Ok(TranslatedRect {
-        x: operation.rect.x.saturating_sub(insets.left),
-        y: operation.rect.y.saturating_sub(insets.top),
+        x: target_visible_rect.x.saturating_sub(insets.left),
+        y: target_visible_rect.y.saturating_sub(insets.top),
         width,
         height,
     })
+}
+
+fn compensated_visible_rect(operation: &ApplyOperation) -> Result<flowtile_domain::Rect, String> {
+    if !operation.suppress_visual_gap {
+        return Ok(operation.rect);
+    }
+
+    let x = if operation.rect.x > 0 {
+        operation
+            .rect
+            .x
+            .saturating_sub(TILED_VISUAL_OVERLAP_X_PX.max(0))
+    } else {
+        operation.rect.x
+    };
+
+    Ok(flowtile_domain::Rect::new(
+        x,
+        operation.rect.y,
+        operation.rect.width,
+        operation.rect.height,
+    ))
 }
 
 fn query_outer_window_rect(hwnd: HWND) -> Result<RECT, String> {
@@ -500,7 +714,14 @@ fn last_error(api: &str) -> Win32ApiError {
 mod tests {
     use windows_sys::Win32::Foundation::RECT;
 
-    use super::{FrameInsets, frame_insets, visible_frame_is_compatible};
+    use flowtile_domain::Rect;
+
+    use crate::WindowSwitchAnimation;
+
+    use super::{
+        FrameInsets, ease_out_cubic, frame_insets, interpolate_rect, uses_window_switch_animation,
+        visible_frame_is_compatible,
+    };
 
     #[test]
     fn frame_insets_follow_visible_dwm_bounds_inside_outer_window_rect() {
@@ -544,5 +765,44 @@ mod tests {
         };
 
         assert!(!visible_frame_is_compatible(outer, incompatible));
+    }
+
+    #[test]
+    fn window_switch_animation_detection_requires_real_geometry_change() {
+        let operation = crate::ApplyOperation {
+            hwnd: 100,
+            rect: Rect::new(120, 0, 420, 900),
+            activate: true,
+            suppress_visual_gap: true,
+            window_switch_animation: Some(WindowSwitchAnimation {
+                from_rect: Rect::new(0, 0, 420, 900),
+                duration_ms: 90,
+                frame_count: 6,
+            }),
+        };
+
+        assert!(uses_window_switch_animation(&operation));
+    }
+
+    #[test]
+    fn interpolated_window_switch_rect_reaches_exact_target() {
+        let animation = WindowSwitchAnimation {
+            from_rect: Rect::new(0, 0, 420, 900),
+            duration_ms: 90,
+            frame_count: 6,
+        };
+        let target = Rect::new(-240, 0, 420, 900);
+
+        assert_eq!(interpolate_rect(&animation, target, 1.0), target);
+    }
+
+    #[test]
+    fn easing_curve_advances_without_overshoot() {
+        let first = ease_out_cubic(0.2);
+        let second = ease_out_cubic(0.8);
+
+        assert!(first > 0.0);
+        assert!(second > first);
+        assert!(second < 1.0);
     }
 }

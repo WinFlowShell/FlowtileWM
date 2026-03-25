@@ -27,7 +27,7 @@ use windows_sys::Win32::{
 
 use crate::{
     LiveObservationOptions, ObservationEnvelope, ObservationKind, ObserverMessage,
-    WindowsAdapterError, native_snapshot,
+    WindowsAdapterError, dpi, native_snapshot,
 };
 
 const RESUME_REVALIDATION_MULTIPLIER: u32 = 3;
@@ -98,6 +98,10 @@ fn run_observer(
         // SAFETY: `GetCurrentThreadId` is a parameterless Win32 query for the current thread.
         unsafe { GetCurrentThreadId() }
     };
+    if let Err(message) = dpi::ensure_current_thread_per_monitor_v2("native-observer") {
+        let _ = startup_sender.send(Err(message));
+        return;
+    }
     ensure_message_queue();
 
     let shared = Arc::new(ObserverSignalState::default());
@@ -254,16 +258,13 @@ fn should_rescan_after_incremental_event(
     hwnd_known_before: bool,
     hwnd_known_after: bool,
 ) -> bool {
-    !hwnd_known_after
-        && !hwnd_known_before
-        && matches!(
-            event_type,
-            EVENT_OBJECT_CREATE
-                | EVENT_OBJECT_SHOW
-                | EVENT_OBJECT_HIDE
-                | EVENT_OBJECT_DESTROY
-                | EVENT_SYSTEM_FOREGROUND
-        )
+    match event_type {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_HIDE => !(hwnd_known_before && hwnd_known_after),
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_DESTROY | EVENT_SYSTEM_FOREGROUND => {
+            !hwnd_known_after && !hwnd_known_before
+        }
+        _ => false,
+    }
 }
 
 fn rescan_snapshot(
@@ -539,10 +540,28 @@ mod tests {
     }
 
     #[test]
-    fn known_hwnd_does_not_force_rescan() {
+    fn create_for_known_hwnd_does_not_force_rescan() {
         assert!(!should_rescan_after_incremental_event(
             EVENT_OBJECT_CREATE,
             true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn hide_for_known_hwnd_membership_change_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_OBJECT_HIDE,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn show_for_restored_hwnd_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_OBJECT_SHOW,
+            false,
             true,
         ));
     }

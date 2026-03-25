@@ -15,12 +15,20 @@ use flowtile_layout_engine::recompute_workspace;
 use flowtile_windows_adapter::{
     ApplyBatchResult, ApplyOperation, ObservationEnvelope, ObservationKind,
     PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff,
-    WindowsAdapter, diff_snapshots, needs_activation_apply, needs_geometry_apply,
+    WINDOW_SWITCH_ANIMATION_DURATION_MS, WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
+    WindowSwitchAnimation, WindowsAdapter, diff_snapshots, needs_activation_apply,
+    needs_geometry_apply, needs_tiled_gapless_geometry_apply,
 };
 
 use crate::{CoreDaemonRuntime, RuntimeCycleReport, RuntimeError, StateStore};
 
 const FOCUS_OBSERVATION_GRACE: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyPlanMode {
+    SteadyState,
+    WindowSwitchNavigation,
+}
 
 impl CoreDaemonRuntime {
     pub fn new(runtime_mode: RuntimeMode) -> Self {
@@ -91,10 +99,11 @@ impl CoreDaemonRuntime {
         let snapshot = self.adapter.scan_snapshot()?;
         let _ = self.sync_snapshot_with_reason(snapshot.clone(), true, "command-pre-sync")?;
         let previous_focused_hwnd = self.current_focused_hwnd();
+        let apply_plan_mode = apply_plan_mode_for_event(&event);
         let transition = self.store.dispatch(event)?;
         self.arm_pending_focus_claim(previous_focused_hwnd);
         let planned_operations = if self.management_enabled {
-            self.plan_apply_operations(&snapshot)?
+            self.plan_apply_operations_with_mode(&snapshot, apply_plan_mode)?
         } else {
             Vec::new()
         };
@@ -121,7 +130,7 @@ impl CoreDaemonRuntime {
             observed_window_count: snapshot.windows.len(),
             discovered_windows: 0,
             destroyed_windows: 0,
-            focused_hwnd: snapshot.focused_window().map(|window| window.hwnd),
+            focused_hwnd: snapshot.actual_foreground_hwnd(),
             observation_reason: Some(reason.to_string()),
             planned_operations: planned_operations.len(),
             applied_operations: apply_result.applied,
@@ -280,16 +289,17 @@ impl CoreDaemonRuntime {
 
         let discovered_windows = self.ingest_created_windows(
             &diff.created_windows,
-            snapshot.focused_window().map(|window| window.hwnd),
+            snapshot.actual_foreground_hwnd(),
             had_previous_snapshot,
         )?;
-        let destroyed_windows = self.ingest_destroyed_windows(&diff.destroyed_hwnds)?;
+        let destroyed_windows = self.ingest_destroyed_windows(&diff.destroyed_hwnds)?
+            + self.prune_state_windows_missing_from_snapshot(&snapshot)?;
 
         if had_previous_snapshot && diff.monitor_topology_changed {
             self.push_degraded_reason("monitor-topology-changed".to_string());
         }
 
-        self.refresh_pending_focus_claim(snapshot.focused_window().map(|window| window.hwnd));
+        self.refresh_pending_focus_claim(snapshot.actual_foreground_hwnd());
         if let Some(focused_hwnd) = diff.focused_hwnd
             && self.current_focused_hwnd() != Some(focused_hwnd)
             && !self.should_defer_platform_focus_observation(focused_hwnd)
@@ -325,7 +335,7 @@ impl CoreDaemonRuntime {
             observed_window_count: snapshot.windows.len(),
             discovered_windows,
             destroyed_windows,
-            focused_hwnd: snapshot.focused_window().map(|window| window.hwnd),
+            focused_hwnd: snapshot.actual_foreground_hwnd(),
             observation_reason: Some(observation_reason.to_string()),
             planned_operations: planned_operations.len(),
             applied_operations: apply_result.applied,
@@ -356,7 +366,6 @@ impl CoreDaemonRuntime {
 
         if remaining_operations.is_empty() {
             self.consecutive_desync_cycles = 0;
-            self.last_snapshot = Some(validation_snapshot);
             report
                 .recovery_actions
                 .push("post-apply-validation-clean".to_string());
@@ -366,7 +375,6 @@ impl CoreDaemonRuntime {
 
         if operations_are_activation_only(&validation_snapshot, &remaining_operations) {
             self.consecutive_desync_cycles = 0;
-            self.last_snapshot = Some(validation_snapshot);
             self.push_degraded_reason("activation:foreground-refused".to_string());
             report.recovery_actions.push(format!(
                 "activation-only-degraded:{}-ops-remain",
@@ -396,15 +404,11 @@ impl CoreDaemonRuntime {
         report.recovery_rescans += 1;
         let post_retry_remaining = self.plan_apply_operations(&post_retry_snapshot)?;
         report.validation_remaining_operations = post_retry_remaining.len();
-        self.last_snapshot = Some(post_retry_snapshot);
 
         if post_retry_remaining.is_empty() {
             self.consecutive_desync_cycles = 0;
             report.recovery_actions.push("retry-recovered".to_string());
-        } else if operations_are_activation_only(
-            self.last_snapshot.as_ref().expect("snapshot set"),
-            &post_retry_remaining,
-        ) {
+        } else if operations_are_activation_only(&post_retry_snapshot, &post_retry_remaining) {
             self.consecutive_desync_cycles = 0;
             self.push_degraded_reason("activation:foreground-refused".to_string());
             report.recovery_actions.push(format!(
@@ -445,6 +449,10 @@ impl CoreDaemonRuntime {
         let mut discovered_windows = 0;
 
         for window in windows {
+            if !window.management_candidate {
+                continue;
+            }
+
             if self.find_window_id_by_hwnd(window.hwnd).is_some() {
                 continue;
             }
@@ -530,6 +538,39 @@ impl CoreDaemonRuntime {
         Ok(destroyed_windows)
     }
 
+    fn prune_state_windows_missing_from_snapshot(
+        &mut self,
+        snapshot: &PlatformSnapshot,
+    ) -> Result<usize, RuntimeError> {
+        let actual_hwnds = snapshot
+            .windows
+            .iter()
+            .map(|window| window.hwnd)
+            .collect::<std::collections::HashSet<_>>();
+        let orphaned_window_ids = self
+            .store
+            .state()
+            .windows
+            .values()
+            .filter_map(|window| {
+                window
+                    .current_hwnd_binding
+                    .filter(|hwnd| !actual_hwnds.contains(hwnd))
+                    .map(|_| window.id)
+            })
+            .collect::<Vec<_>>();
+        let mut destroyed_windows = 0;
+
+        for window_id in orphaned_window_ids {
+            let correlation_id = self.next_correlation_id();
+            self.store
+                .dispatch(DomainEvent::window_destroyed(correlation_id, window_id))?;
+            destroyed_windows += 1;
+        }
+
+        Ok(destroyed_windows)
+    }
+
     fn observe_focus(&mut self, hwnd: u64) -> Result<(), RuntimeError> {
         let Some(window_id) = self.find_window_id_by_hwnd(hwnd) else {
             return Ok(());
@@ -556,6 +597,14 @@ impl CoreDaemonRuntime {
         &self,
         snapshot: &PlatformSnapshot,
     ) -> Result<Vec<ApplyOperation>, RuntimeError> {
+        self.plan_apply_operations_with_mode(snapshot, ApplyPlanMode::SteadyState)
+    }
+
+    fn plan_apply_operations_with_mode(
+        &self,
+        snapshot: &PlatformSnapshot,
+        apply_plan_mode: ApplyPlanMode,
+    ) -> Result<Vec<ApplyOperation>, RuntimeError> {
         let actual_windows = snapshot
             .windows
             .iter()
@@ -569,7 +618,9 @@ impl CoreDaemonRuntime {
             .and_then(|window_id| self.store.state().windows.get(&window_id))
             .filter(|window| window.is_managed)
             .and_then(|window| window.current_hwnd_binding);
-        let actual_focused_hwnd = snapshot.focused_window().map(|window| window.hwnd);
+        let actual_focused_hwnd = snapshot.actual_foreground_hwnd();
+        let allow_activation_reassert =
+            self.should_attempt_activation_reassert(actual_focused_hwnd);
         let mut operations = Vec::new();
 
         for workspace in self.store.state().workspaces.values() {
@@ -592,15 +643,32 @@ impl CoreDaemonRuntime {
                     continue;
                 };
                 let activate = desired_focused_hwnd
+                    .filter(|_| allow_activation_reassert)
                     .filter(|desired_hwnd| *desired_hwnd == hwnd)
                     .is_some_and(|desired_hwnd| {
                         needs_activation_apply(actual_focused_hwnd, desired_hwnd)
                     });
-                if needs_geometry_apply(actual_window.rect, geometry.rect) || activate {
+                let needs_geometry = if geometry.layer == WindowLayer::Tiled {
+                    needs_tiled_gapless_geometry_apply(actual_window.rect, geometry.rect)
+                } else {
+                    needs_geometry_apply(actual_window.rect, geometry.rect)
+                };
+                if needs_geometry || activate {
+                    let window_switch_animation = (apply_plan_mode
+                        == ApplyPlanMode::WindowSwitchNavigation
+                        && geometry.layer == WindowLayer::Tiled
+                        && needs_geometry)
+                        .then_some(WindowSwitchAnimation {
+                            from_rect: actual_window.rect,
+                            duration_ms: WINDOW_SWITCH_ANIMATION_DURATION_MS,
+                            frame_count: WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
+                        });
                     operations.push(ApplyOperation {
                         hwnd,
                         rect: geometry.rect,
                         activate,
+                        suppress_visual_gap: geometry.layer == WindowLayer::Tiled,
+                        window_switch_animation,
                     });
                 }
             }
@@ -760,6 +828,20 @@ impl CoreDaemonRuntime {
             .focused_window_id
             .and_then(|window_id| self.store.state().windows.get(&window_id))
             .and_then(|window| window.current_hwnd_binding)
+    }
+
+    fn should_attempt_activation_reassert(&self, actual_focused_hwnd: Option<u64>) -> bool {
+        if self.pending_focus_claim.is_some() {
+            return true;
+        }
+
+        let Some(actual_focused_hwnd) = actual_focused_hwnd else {
+            return true;
+        };
+
+        self.find_window_id_by_hwnd(actual_focused_hwnd)
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .is_some_and(|window| window.is_managed)
     }
 
     fn arm_pending_focus_claim(&mut self, previous_focused_hwnd: Option<u64>) {
@@ -1008,6 +1090,15 @@ fn should_auto_unwind_after_desync(
     affected_windows.len() > 1
 }
 
+fn apply_plan_mode_for_event(event: &DomainEvent) -> ApplyPlanMode {
+    match &event.payload {
+        DomainEventPayload::CmdFocusNext(_) | DomainEventPayload::CmdFocusPrev(_) => {
+            ApplyPlanMode::WindowSwitchNavigation
+        }
+        _ => ApplyPlanMode::SteadyState,
+    }
+}
+
 fn ensure_supported_bind_control_mode(
     bind_control_mode: BindControlMode,
 ) -> Result<(), RuntimeError> {
@@ -1050,7 +1141,9 @@ fn normalize_reason_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use flowtile_config_rules::WindowRuleDecision;
-    use flowtile_domain::{Rect, RuntimeMode, WidthSemantics, WindowLayer};
+    use flowtile_domain::{
+        CorrelationId, DomainEvent, NavigationScope, Rect, RuntimeMode, WidthSemantics, WindowLayer,
+    };
     use flowtile_windows_adapter::{
         ApplyOperation, PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot,
     };
@@ -1058,7 +1151,8 @@ mod tests {
     use crate::CoreDaemonRuntime;
 
     use super::{
-        discovered_width_semantics, operations_are_activation_only, should_auto_unwind_after_desync,
+        ApplyPlanMode, discovered_width_semantics, operations_are_activation_only,
+        should_auto_unwind_after_desync,
     };
 
     #[test]
@@ -1068,6 +1162,8 @@ mod tests {
             hwnd: 100,
             rect: Rect::new(0, 0, 420, 900),
             activate: true,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
         }];
 
         assert!(operations_are_activation_only(&snapshot, &operations));
@@ -1080,6 +1176,8 @@ mod tests {
             hwnd: 100,
             rect: Rect::new(0, 0, 420, 900),
             activate: true,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
         }];
 
         assert!(!operations_are_activation_only(&snapshot, &operations));
@@ -1091,6 +1189,8 @@ mod tests {
             hwnd: 100,
             rect: Rect::new(0, 0, 420, 900),
             activate: true,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
         }];
 
         assert!(!should_auto_unwind_after_desync(&operations, 3));
@@ -1103,11 +1203,15 @@ mod tests {
                 hwnd: 100,
                 rect: Rect::new(0, 0, 420, 900),
                 activate: true,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
             },
             ApplyOperation {
                 hwnd: 200,
                 rect: Rect::new(420, 0, 420, 900),
                 activate: false,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
             },
         ];
 
@@ -1137,6 +1241,7 @@ mod tests {
             monitor_binding: "\\\\.\\DISPLAY1".to_string(),
             is_visible: true,
             is_focused: true,
+            management_candidate: true,
         };
 
         assert_eq!(
@@ -1165,6 +1270,7 @@ mod tests {
             monitor_binding: "\\\\.\\DISPLAY1".to_string(),
             is_visible: true,
             is_focused: true,
+            management_candidate: true,
         };
 
         assert_eq!(
@@ -1176,6 +1282,7 @@ mod tests {
     #[test]
     fn initial_snapshot_gapless_plan_uses_observed_bootstrap_widths() {
         let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
             monitors: vec![PlatformMonitorSnapshot {
                 binding: "\\\\.\\DISPLAY1".to_string(),
                 work_area_rect: Rect::new(0, 0, 1200, 900),
@@ -1193,6 +1300,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: true,
+                    management_candidate: true,
                 },
                 PlatformWindowSnapshot {
                     hwnd: 101,
@@ -1204,6 +1312,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: false,
+                    management_candidate: true,
                 },
                 PlatformWindowSnapshot {
                     hwnd: 102,
@@ -1215,6 +1324,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: false,
+                    management_candidate: true,
                 },
             ],
         };
@@ -1231,14 +1341,17 @@ mod tests {
         assert_eq!(planned_operations[0].hwnd, 101);
         assert_eq!(planned_operations[0].rect.x, 320);
         assert_eq!(planned_operations[0].rect.width, 320);
+        assert!(planned_operations[0].suppress_visual_gap);
         assert_eq!(planned_operations[1].hwnd, 102);
         assert_eq!(planned_operations[1].rect.x, 640);
         assert_eq!(planned_operations[1].rect.width, 320);
+        assert!(planned_operations[1].suppress_visual_gap);
     }
 
     #[test]
     fn new_managed_window_follows_active_monitor_context() {
         let initial_snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
             monitors: vec![
                 PlatformMonitorSnapshot {
                     binding: "\\\\.\\DISPLAY1".to_string(),
@@ -1263,6 +1376,7 @@ mod tests {
                 monitor_binding: "\\\\.\\DISPLAY2".to_string(),
                 is_visible: true,
                 is_focused: true,
+                management_candidate: true,
             }],
         };
         let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
@@ -1271,6 +1385,7 @@ mod tests {
             .expect("initial sync should succeed");
 
         let snapshot_with_new_window = PlatformSnapshot {
+            foreground_hwnd: Some(100),
             monitors: vec![
                 PlatformMonitorSnapshot {
                     binding: "\\\\.\\DISPLAY1".to_string(),
@@ -1296,6 +1411,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY2".to_string(),
                     is_visible: true,
                     is_focused: true,
+                    management_candidate: true,
                 },
                 PlatformWindowSnapshot {
                     hwnd: 101,
@@ -1307,6 +1423,7 @@ mod tests {
                     monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                     is_visible: true,
                     is_focused: false,
+                    management_candidate: true,
                 },
             ],
         };
@@ -1336,8 +1453,75 @@ mod tests {
         assert_eq!(monitor.platform_binding.as_deref(), Some("\\\\.\\DISPLAY2"));
     }
 
+    #[test]
+    fn focus_navigation_plan_marks_tiled_moves_for_window_switch_animation() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(420, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(2),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus navigation should succeed");
+
+        let planned_operations = runtime
+            .plan_apply_operations_with_mode(&snapshot, ApplyPlanMode::WindowSwitchNavigation)
+            .expect("apply plan should be computed");
+
+        assert!(
+            planned_operations
+                .iter()
+                .all(|operation| operation.window_switch_animation.is_some())
+        );
+        assert!(
+            planned_operations
+                .iter()
+                .any(|operation| operation.hwnd == 101 && operation.activate)
+        );
+    }
+
     fn sample_snapshot(window_rect: Rect) -> PlatformSnapshot {
         PlatformSnapshot {
+            foreground_hwnd: None,
             monitors: vec![PlatformMonitorSnapshot {
                 binding: "\\\\.\\DISPLAY1".to_string(),
                 work_area_rect: Rect::new(0, 0, 1600, 900),
@@ -1354,6 +1538,7 @@ mod tests {
                 monitor_binding: "\\\\.\\DISPLAY1".to_string(),
                 is_visible: true,
                 is_focused: false,
+                management_candidate: true,
             }],
         }
     }
