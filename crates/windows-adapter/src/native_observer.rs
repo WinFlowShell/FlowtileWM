@@ -163,11 +163,14 @@ fn run_observer(
             let hwnd = shared.last_hwnd.swap(0, Ordering::AcqRel) as u64;
             shared.pending.store(false, Ordering::Release);
 
-            if !apply_incremental_event(event_type, hwnd, &sender, &mut snapshot) {
-                break;
+            match apply_incremental_event(event_type, hwnd, &sender, &mut snapshot) {
+                IncrementalApplyResult::Continue => {}
+                IncrementalApplyResult::Rescanned => {
+                    last_periodic_scan_at = now;
+                }
+                IncrementalApplyResult::Stop => break,
             }
             last_emit_at = now;
-            last_periodic_scan_at = now;
         } else if now.duration_since(last_periodic_scan_at) >= fallback_interval {
             if !rescan_snapshot("periodic-full-scan", &sender, &mut snapshot) {
                 break;
@@ -188,8 +191,9 @@ fn apply_incremental_event(
     hwnd: u64,
     sender: &Sender<ObserverMessage>,
     snapshot: &mut crate::PlatformSnapshot,
-) -> bool {
+) -> IncrementalApplyResult {
     let reason = event_reason(event_type);
+    let hwnd_known_before = snapshot_contains_hwnd(snapshot, hwnd);
     let updated = match event_type {
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE => {
             native_snapshot::remove_window(snapshot, hwnd);
@@ -199,12 +203,30 @@ fn apply_incremental_event(
     };
 
     match updated {
-        Ok(()) => sender
-            .send(ObserverMessage::Envelope(snapshot_envelope(
-                reason,
-                snapshot.clone(),
-            )))
-            .is_ok(),
+        Ok(()) => {
+            let hwnd_known_after = snapshot_contains_hwnd(snapshot, hwnd);
+            if should_rescan_after_incremental_event(
+                event_type,
+                hwnd_known_before,
+                hwnd_known_after,
+            ) {
+                if rescan_snapshot("event-recovery-full-scan", sender, snapshot) {
+                    IncrementalApplyResult::Rescanned
+                } else {
+                    IncrementalApplyResult::Stop
+                }
+            } else if sender
+                .send(ObserverMessage::Envelope(snapshot_envelope(
+                    reason,
+                    snapshot.clone(),
+                )))
+                .is_ok()
+            {
+                IncrementalApplyResult::Continue
+            } else {
+                IncrementalApplyResult::Stop
+            }
+        }
         Err(message) => {
             if sender
                 .send(ObserverMessage::Envelope(warning_envelope(
@@ -212,11 +234,36 @@ fn apply_incremental_event(
                 )))
                 .is_err()
             {
-                return false;
+                return IncrementalApplyResult::Stop;
             }
-            rescan_snapshot("event-recovery-full-scan", sender, snapshot)
+            if rescan_snapshot("event-recovery-full-scan", sender, snapshot) {
+                IncrementalApplyResult::Rescanned
+            } else {
+                IncrementalApplyResult::Stop
+            }
         }
     }
+}
+
+fn snapshot_contains_hwnd(snapshot: &crate::PlatformSnapshot, hwnd: u64) -> bool {
+    snapshot.windows.iter().any(|window| window.hwnd == hwnd)
+}
+
+fn should_rescan_after_incremental_event(
+    event_type: u32,
+    hwnd_known_before: bool,
+    hwnd_known_after: bool,
+) -> bool {
+    !hwnd_known_after
+        && !hwnd_known_before
+        && matches!(
+            event_type,
+            EVENT_OBJECT_CREATE
+                | EVENT_OBJECT_SHOW
+                | EVENT_OBJECT_HIDE
+                | EVENT_OBJECT_DESTROY
+                | EVENT_SYSTEM_FOREGROUND
+        )
 }
 
 fn rescan_snapshot(
@@ -441,10 +488,89 @@ struct ObserverSignalState {
     last_hwnd: AtomicUsize,
 }
 
+enum IncrementalApplyResult {
+    Continue,
+    Rescanned,
+    Stop,
+}
+
 impl ObserverSignalState {
     fn clear_pending(&self) {
         self.pending.store(false, Ordering::Release);
         self.last_event_type.store(0, Ordering::Release);
         self.last_hwnd.store(0, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+    };
+
+    use super::should_rescan_after_incremental_event;
+
+    #[test]
+    fn create_for_unknown_hwnd_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_OBJECT_CREATE,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn show_for_unknown_hwnd_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_OBJECT_SHOW,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn foreground_for_unknown_hwnd_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_SYSTEM_FOREGROUND,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn known_hwnd_does_not_force_rescan() {
+        assert!(!should_rescan_after_incremental_event(
+            EVENT_OBJECT_CREATE,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn location_change_for_unknown_hwnd_does_not_force_rescan() {
+        assert!(!should_rescan_after_incremental_event(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn destroy_for_unknown_hwnd_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_OBJECT_DESTROY,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn hide_for_unknown_hwnd_escalates_to_full_scan() {
+        assert!(should_rescan_after_incremental_event(
+            EVENT_OBJECT_HIDE,
+            false,
+            false,
+        ));
     }
 }

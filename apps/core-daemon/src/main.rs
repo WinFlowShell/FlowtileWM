@@ -10,8 +10,18 @@ use std::{env, process::ExitCode};
 use cli::{DaemonCommand, parse_command, print_usage};
 use flowtile_wm_core::{CoreDaemonBootstrap, CoreDaemonRuntime};
 use hotkeys::ensure_bind_control_mode_supported;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{ERROR_ACCESS_DENIED, GetLastError},
+    UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+};
 
 fn main() -> ExitCode {
+    if let Err(message) = ensure_process_dpi_awareness() {
+        eprintln!("{message}");
+        return ExitCode::from(1);
+    }
+
     match parse_command(env::args().skip(1).collect()) {
         Ok(command) => run(command),
         Err(message) => {
@@ -63,4 +73,33 @@ fn run(command: DaemonCommand) -> ExitCode {
             poll_only,
         } => watch::run_watch(runtime_mode, dry_run, interval_ms, iterations, poll_only),
     }
+}
+
+#[cfg(windows)]
+fn ensure_process_dpi_awareness() -> Result<(), String> {
+    let applied = {
+        // SAFETY: This sets the process DPI awareness once at startup before the daemon creates
+        // long-lived Win32 integrations. The requested context is the documented PMv2 baseline.
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    };
+    if applied != 0 {
+        return Ok(());
+    }
+
+    let error = {
+        // SAFETY: `GetLastError` is read immediately after the failed Win32 call above.
+        unsafe { GetLastError() }
+    };
+    if error == ERROR_ACCESS_DENIED {
+        return Ok(());
+    }
+
+    Err(format!(
+        "SetProcessDpiAwarenessContext failed with Win32 error {error}"
+    ))
+}
+
+#[cfg(not(windows))]
+fn ensure_process_dpi_awareness() -> Result<(), String> {
+    Ok(())
 }

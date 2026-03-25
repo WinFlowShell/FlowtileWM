@@ -8,7 +8,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{BOOL, CloseHandle, GetLastError, HWND, LPARAM, RECT},
     Graphics::{
-        Dwm::DwmGetWindowAttribute,
+        Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
             EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
             MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
@@ -35,8 +35,6 @@ use flowtile_domain::Rect as DomainRect;
 
 const CLASS_FILTER_CORE_WINDOW: &str = "Windows.UI.Core.CoreWindow";
 const DEFAULT_DPI: u32 = 96;
-const DWMWA_CLOAKED: u32 = 14;
-
 pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
     let mut monitor_context = MonitorEnumContext::default();
     let enumerated_monitors = {
@@ -301,7 +299,7 @@ fn is_window_cloaked(window_handle: HWND) -> bool {
         unsafe {
             DwmGetWindowAttribute(
                 window_handle,
-                DWMWA_CLOAKED,
+                DWMWA_CLOAKED as u32,
                 &mut cloaked as *mut _ as *mut c_void,
                 size_of::<u32>() as u32,
             )
@@ -311,6 +309,38 @@ fn is_window_cloaked(window_handle: HWND) -> bool {
 }
 
 fn query_window_rect(window_handle: HWND) -> Option<DomainRect> {
+    let outer_rect = query_outer_window_rect(window_handle)?;
+    let visible_rect = query_extended_frame_rect(window_handle)
+        .filter(|visible_rect| visible_frame_is_compatible(outer_rect, *visible_rect))
+        .unwrap_or(outer_rect);
+
+    Some(domain_rect_from_win32(visible_rect))
+}
+
+fn query_extended_frame_rect(window_handle: HWND) -> Option<RECT> {
+    let mut rect: RECT = {
+        // SAFETY: `RECT` is a plain Win32 structure and is valid when zero-initialized.
+        unsafe { zeroed() }
+    };
+    let result = {
+        // SAFETY: We pass a valid pointer to a writable `RECT` buffer with the documented size.
+        unsafe {
+            DwmGetWindowAttribute(
+                window_handle,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                &mut rect as *mut _ as *mut c_void,
+                size_of::<RECT>() as u32,
+            )
+        }
+    };
+    if result < 0 {
+        return None;
+    }
+
+    Some(rect)
+}
+
+fn query_outer_window_rect(window_handle: HWND) -> Option<RECT> {
     let mut rect: RECT = {
         // SAFETY: `RECT` is a plain Win32 structure and is valid when zero-initialized.
         unsafe { zeroed() }
@@ -323,12 +353,29 @@ fn query_window_rect(window_handle: HWND) -> Option<DomainRect> {
         return None;
     }
 
-    Some(DomainRect::new(
+    Some(rect)
+}
+
+fn visible_frame_is_compatible(outer_rect: RECT, visible_rect: RECT) -> bool {
+    rect_is_non_empty(outer_rect)
+        && rect_is_non_empty(visible_rect)
+        && visible_rect.left >= outer_rect.left
+        && visible_rect.top >= outer_rect.top
+        && visible_rect.right <= outer_rect.right
+        && visible_rect.bottom <= outer_rect.bottom
+}
+
+fn rect_is_non_empty(rect: RECT) -> bool {
+    rect.right > rect.left && rect.bottom > rect.top
+}
+
+fn domain_rect_from_win32(rect: RECT) -> DomainRect {
+    DomainRect::new(
         rect.left,
         rect.top,
         (rect.right - rect.left).max(0) as u32,
         (rect.bottom - rect.top).max(0) as u32,
-    ))
+    )
 }
 
 fn query_window_title(window_handle: HWND) -> String {
@@ -346,6 +393,31 @@ fn query_window_title(window_handle: HWND) -> String {
         unsafe { GetWindowTextW(window_handle, buffer.as_mut_ptr(), buffer.len() as i32) }
     };
     wide_buffer_to_string(&buffer, copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::Foundation::RECT;
+
+    use super::visible_frame_is_compatible;
+
+    #[test]
+    fn visible_frame_is_rejected_when_it_escapes_outer_rect() {
+        let outer = RECT {
+            left: 0,
+            top: 0,
+            right: 1200,
+            bottom: 800,
+        };
+        let incompatible = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        assert!(!visible_frame_is_compatible(outer, incompatible));
+    }
 }
 
 fn query_window_class(window_handle: HWND) -> String {

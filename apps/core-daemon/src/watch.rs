@@ -3,7 +3,7 @@ use std::{
     process::ExitCode,
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use flowtile_domain::{CorrelationId, DomainEvent, NavigationScope, RuntimeMode};
@@ -16,6 +16,8 @@ use crate::{
     hotkeys::{HotkeyListener, HotkeyListenerError, ensure_bind_control_mode_supported},
     ipc,
 };
+
+const CONTROL_RESPONSE_SLICE_MS: u64 = 16;
 
 pub(crate) fn run_watch(
     runtime_mode: RuntimeMode,
@@ -91,6 +93,10 @@ pub(crate) fn run_watch(
     let mut event_subscribers = Vec::<mpsc::Sender<String>>::new();
     let mut stream_version = 1_u64;
     let mut last_streamed_state_version = runtime.state().state_version().get();
+    let poll_interval = Duration::from_millis(interval_ms.max(1));
+    let control_response_slice = Duration::from_millis(CONTROL_RESPONSE_SLICE_MS);
+    let observer_wait_slice = poll_interval.min(control_response_slice);
+    let mut next_poll_deadline = Instant::now();
 
     if let Some(live_observer) = observer.as_mut() {
         match live_observer.recv_timeout(Duration::from_millis(interval_ms.max(5_000))) {
@@ -461,17 +467,26 @@ pub(crate) fn run_watch(
         }
 
         let mut fallback_to_polling = false;
+        let mut advanced_poll_cycle = false;
         let cycle_result = if let Some(live_observer) = observer.as_mut() {
-            match live_observer.recv_timeout(Duration::from_millis(interval_ms)) {
+            match live_observer.recv_timeout(observer_wait_slice) {
                 Ok(observation) => runtime.apply_observation(observation, dry_run),
                 Err(ObservationStreamError::Timeout) => continue,
                 Err(error) => {
                     eprintln!("live observation became unavailable: {error}; switching to polling");
                     fallback_to_polling = true;
+                    advanced_poll_cycle = true;
                     runtime.scan_and_sync(dry_run).map(Some)
                 }
             }
         } else {
+            let now = Instant::now();
+            if now < next_poll_deadline {
+                thread::sleep((next_poll_deadline - now).min(control_response_slice));
+                continue;
+            }
+
+            advanced_poll_cycle = true;
             runtime.scan_and_sync(dry_run).map(Some)
         };
 
@@ -501,8 +516,8 @@ pub(crate) fn run_watch(
             return ExitCode::SUCCESS;
         }
 
-        if observer.is_none() {
-            thread::sleep(Duration::from_millis(interval_ms));
+        if observer.is_none() && advanced_poll_cycle {
+            next_poll_deadline = Instant::now() + poll_interval;
         }
     }
 }

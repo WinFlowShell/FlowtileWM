@@ -108,10 +108,17 @@ impl StateStore {
             .state
             .active_workspace_id_for_monitor(payload.monitor_id)
             .ok_or(CoreError::NoActiveWorkspace(payload.monitor_id))?;
+        let focused_window_id = self.focused_window_in_workspace(workspace_id);
+        let focused_window_is_fullscreen = focused_window_id
+            .and_then(|window_id| self.state.windows.get(&window_id))
+            .is_some_and(|window| window.layer == WindowLayer::Fullscreen || window.is_fullscreen);
         let should_preserve_current_focus =
             matches!(payload.focus_behavior, FocusBehavior::PreserveCurrentFocus)
-                && self.focused_window_in_workspace(workspace_id).is_some();
+                && focused_window_id.is_some()
+                && !focused_window_is_fullscreen;
         let focused_column_id = self.focused_column_in_workspace(workspace_id);
+        let insertion_anchor_column_id = self.discovery_anchor_column_in_workspace(workspace_id);
+        let fullscreen_restore_index = self.fullscreen_restore_index_in_workspace(workspace_id);
         let window_id = self.state.allocate_window_id();
 
         let target_column_id = match payload.layer {
@@ -142,6 +149,7 @@ impl StateStore {
                             window_id,
                             NewColumnRequest {
                                 anchor_column_id: None,
+                                insert_index_override: None,
                                 before_anchor: false,
                                 mode: ColumnMode::Normal,
                                 width_semantics: WidthSemantics::default(),
@@ -154,7 +162,11 @@ impl StateStore {
                     workspace_id,
                     window_id,
                     NewColumnRequest {
-                        anchor_column_id: focused_column_id,
+                        anchor_column_id: insertion_anchor_column_id,
+                        insert_index_override: insertion_anchor_column_id
+                            .is_none()
+                            .then_some(fullscreen_restore_index)
+                            .flatten(),
                         before_anchor: false,
                         mode,
                         width_semantics: width,
@@ -165,7 +177,11 @@ impl StateStore {
                     workspace_id,
                     window_id,
                     NewColumnRequest {
-                        anchor_column_id: focused_column_id,
+                        anchor_column_id: insertion_anchor_column_id,
+                        insert_index_override: insertion_anchor_column_id
+                            .is_none()
+                            .then_some(fullscreen_restore_index)
+                            .flatten(),
                         before_anchor: true,
                         mode,
                         width_semantics: width,
@@ -177,6 +193,7 @@ impl StateStore {
                     window_id,
                     NewColumnRequest {
                         anchor_column_id: None,
+                        insert_index_override: None,
                         before_anchor: false,
                         mode,
                         width_semantics: width,
@@ -215,7 +232,7 @@ impl StateStore {
             workspace_set.active_workspace_id = workspace_id;
         }
 
-        let previous_column_id = focused_column_id;
+        let previous_column_id = focused_column_id.or(insertion_anchor_column_id);
         if !should_preserve_current_focus {
             self.set_focus_to_window(
                 payload.monitor_id,
@@ -406,6 +423,7 @@ impl StateStore {
             let restore_target = window.restore_target.clone().unwrap_or(RestoreTarget {
                 workspace_id,
                 column_id: self.focused_column_in_workspace(workspace_id),
+                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
                 layer: WindowLayer::Tiled,
             });
 
@@ -441,6 +459,7 @@ impl StateStore {
             let restore_target = RestoreTarget {
                 workspace_id,
                 column_id: window.column_id,
+                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
                 layer: window.layer,
             };
             self.detach_window_membership(window_id)?;
@@ -567,6 +586,7 @@ impl StateStore {
             let restore_target = window.restore_target.clone().unwrap_or(RestoreTarget {
                 workspace_id,
                 column_id: self.focused_column_in_workspace(workspace_id),
+                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
                 layer: WindowLayer::Tiled,
             });
             self.detach_window_membership(window_id)?;
@@ -601,6 +621,7 @@ impl StateStore {
             let restore_target = RestoreTarget {
                 workspace_id,
                 column_id: window.column_id,
+                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
                 layer: window.layer,
             };
             self.detach_window_membership(window_id)?;
@@ -689,29 +710,31 @@ impl StateStore {
             .workspaces
             .get_mut(&workspace_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
+        let default_insert_index = if request.before_anchor {
+            0
+        } else {
+            workspace.strip.ordered_column_ids.len()
+        };
         let insert_index = request
-            .anchor_column_id
-            .and_then(|anchor| {
-                workspace
-                    .strip
-                    .ordered_column_ids
-                    .iter()
-                    .position(|column_id| *column_id == anchor)
-                    .map(|index| {
-                        if request.before_anchor {
-                            index
-                        } else {
-                            index + 1
-                        }
-                    })
+            .insert_index_override
+            .map(|index| index.min(workspace.strip.ordered_column_ids.len()))
+            .or_else(|| {
+                request.anchor_column_id.and_then(|anchor| {
+                    workspace
+                        .strip
+                        .ordered_column_ids
+                        .iter()
+                        .position(|column_id| *column_id == anchor)
+                        .map(|index| {
+                            if request.before_anchor {
+                                index
+                            } else {
+                                index + 1
+                            }
+                        })
+                })
             })
-            .unwrap_or({
-                if request.before_anchor {
-                    0
-                } else {
-                    workspace.strip.ordered_column_ids.len()
-                }
-            });
+            .unwrap_or(default_insert_index);
 
         workspace
             .strip
@@ -749,6 +772,60 @@ impl StateStore {
             .ordered_column_ids
             .contains(&focused_column_id)
             .then_some(focused_column_id)
+    }
+
+    fn discovery_anchor_column_in_workspace(&self, workspace_id: WorkspaceId) -> Option<ColumnId> {
+        if let Some(column_id) = self.focused_column_in_workspace(workspace_id) {
+            return Some(column_id);
+        }
+
+        let focused_window_id = self.focused_window_in_workspace(workspace_id)?;
+        let window = self.state.windows.get(&focused_window_id)?;
+        if window.layer != WindowLayer::Fullscreen && !window.is_fullscreen {
+            return None;
+        }
+
+        let restore_target = window.restore_target.as_ref()?;
+        if restore_target.workspace_id != workspace_id {
+            return None;
+        }
+
+        let column_id = restore_target.column_id?;
+        self.state
+            .workspaces
+            .get(&workspace_id)?
+            .strip
+            .ordered_column_ids
+            .contains(&column_id)
+            .then_some(column_id)
+    }
+
+    fn fullscreen_restore_index_in_workspace(&self, workspace_id: WorkspaceId) -> Option<usize> {
+        let focused_window_id = self.focused_window_in_workspace(workspace_id)?;
+        let window = self.state.windows.get(&focused_window_id)?;
+        if window.layer != WindowLayer::Fullscreen && !window.is_fullscreen {
+            return None;
+        }
+
+        let restore_target = window.restore_target.as_ref()?;
+        (restore_target.workspace_id == workspace_id)
+            .then_some(restore_target.column_index)
+            .flatten()
+    }
+
+    fn column_index_in_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        column_id: Option<ColumnId>,
+    ) -> Option<usize> {
+        let column_id = column_id?;
+        self.state
+            .workspaces
+            .get(&workspace_id)?
+            .strip
+            .ordered_column_ids
+            .iter()
+            .position(|candidate_column_id| *candidate_column_id == column_id)
     }
 
     fn column_active_window(&self, column: &Column) -> Option<WindowId> {
@@ -907,8 +984,8 @@ impl StateStore {
                     restore_target.workspace_id,
                     window_id,
                     NewColumnRequest {
-                        anchor_column_id: self
-                            .focused_column_in_workspace(restore_target.workspace_id),
+                        anchor_column_id: None,
+                        insert_index_override: restore_target.column_index,
                         before_anchor: false,
                         mode: fallback_mode,
                         width_semantics: fallback_width,
@@ -1171,7 +1248,7 @@ impl StateStore {
         &mut self,
         workspace_id: WorkspaceId,
         target_column_id: ColumnId,
-        previous_column_id: Option<ColumnId>,
+        _previous_column_id: Option<ColumnId>,
     ) -> Result<(), CoreError> {
         let workspace = self
             .state
@@ -1187,26 +1264,7 @@ impl StateStore {
         else {
             return Ok(());
         };
-        let previous_bounds = previous_column_id
-            .filter(|column_id| *column_id != target_column_id)
-            .and_then(|column_id| {
-                self.column_bounds_in_workspace(workspace_id, column_id)
-                    .ok()
-            })
-            .flatten();
-        let should_center_target = if column_width < viewport_width {
-            if is_single_column_workspace {
-                true
-            } else {
-                previous_bounds.is_some_and(|(previous_left, previous_right, _)| {
-                    let reveal_span_left = previous_left.min(column_left);
-                    let reveal_span_right = previous_right.max(column_right);
-                    reveal_span_right.saturating_sub(reveal_span_left) > viewport_width
-                })
-            }
-        } else {
-            false
-        };
+        let should_center_target = column_width < viewport_width && is_single_column_workspace;
         let max_scroll_offset = self.max_scroll_offset(workspace_id)?;
         let desired_scroll_offset = if should_center_target {
             column_left

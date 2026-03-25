@@ -20,9 +20,7 @@ pub(crate) enum DaemonCommand {
 
 pub(crate) fn parse_command(arguments: Vec<String>) -> Result<DaemonCommand, String> {
     if arguments.is_empty() {
-        return Ok(DaemonCommand::Bootstrap {
-            runtime_mode: RuntimeMode::WmOnly,
-        });
+        return default_watch_command(&[]);
     }
 
     let first = arguments[0].as_str();
@@ -48,10 +46,9 @@ pub(crate) fn parse_command(arguments: Vec<String>) -> Result<DaemonCommand, Str
                 poll_only,
             })
         }
-        value if RuntimeMode::parse(value).is_some() => Ok(DaemonCommand::Bootstrap {
-            runtime_mode: RuntimeMode::parse(value)
-                .ok_or_else(|| format!("unsupported runtime mode '{value}'"))?,
-        }),
+        value if value.starts_with('-') || RuntimeMode::parse(value).is_some() => {
+            default_watch_command(&arguments)
+        }
         _ => Err(format!("unsupported command '{}'", arguments[0])),
     }
 }
@@ -59,12 +56,26 @@ pub(crate) fn parse_command(arguments: Vec<String>) -> Result<DaemonCommand, Str
 pub(crate) fn print_usage() {
     println!("flowtile-core-daemon");
     println!("usage:");
-    println!("  flowtile-core-daemon");
+    println!(
+        "  flowtile-core-daemon [--dry-run] [--poll-only] [--interval-ms N] [--iterations N] [wm-only|extended-shell|safe-mode]"
+    );
     println!("  flowtile-core-daemon bootstrap [wm-only|extended-shell|safe-mode]");
     println!("  flowtile-core-daemon run-once [--dry-run] [wm-only|extended-shell|safe-mode]");
     println!(
         "  flowtile-core-daemon watch [--dry-run] [--poll-only] [--interval-ms N] [--iterations N] [wm-only|extended-shell|safe-mode]"
     );
+}
+
+fn default_watch_command(arguments: &[String]) -> Result<DaemonCommand, String> {
+    let (runtime_mode, dry_run, interval_ms, iterations, poll_only) =
+        parse_runtime_flags(arguments)?;
+    Ok(DaemonCommand::Watch {
+        runtime_mode,
+        dry_run,
+        interval_ms,
+        iterations,
+        poll_only,
+    })
 }
 
 fn parse_runtime_mode_flags(arguments: &[String]) -> Result<RuntimeMode, String> {
@@ -121,4 +132,67 @@ fn parse_runtime_flags(
     }
 
     Ok((runtime_mode, dry_run, interval_ms, iterations, poll_only))
+}
+
+#[cfg(test)]
+mod tests {
+    use flowtile_domain::RuntimeMode;
+
+    use super::{DaemonCommand, parse_command};
+
+    #[test]
+    fn empty_arguments_start_watch_mode() {
+        let command = parse_command(Vec::new()).expect("empty invocation should parse");
+
+        assert_eq!(
+            command,
+            DaemonCommand::Watch {
+                runtime_mode: RuntimeMode::WmOnly,
+                dry_run: false,
+                interval_ms: 750,
+                iterations: None,
+                poll_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn bare_runtime_mode_uses_watch_command() {
+        let command =
+            parse_command(vec!["extended-shell".to_string()]).expect("runtime mode should parse");
+
+        assert_eq!(
+            command,
+            DaemonCommand::Watch {
+                runtime_mode: RuntimeMode::ExtendedShell,
+                dry_run: false,
+                interval_ms: 750,
+                iterations: None,
+                poll_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn watch_flags_work_without_explicit_subcommand() {
+        let command = parse_command(vec![
+            "--poll-only".to_string(),
+            "--interval-ms".to_string(),
+            "25".to_string(),
+            "--iterations".to_string(),
+            "2".to_string(),
+        ])
+        .expect("watch flags should parse without explicit subcommand");
+
+        assert_eq!(
+            command,
+            DaemonCommand::Watch {
+                runtime_mode: RuntimeMode::WmOnly,
+                dry_run: false,
+                interval_ms: 25,
+                iterations: Some(2),
+                poll_only: true,
+            }
+        );
+    }
 }

@@ -78,6 +78,7 @@ pub struct WindowRuleDecision {
     pub managed: bool,
     pub column_mode: ColumnMode,
     pub width_semantics: WidthSemantics,
+    pub width_semantics_explicit: bool,
     pub matched_rule_ids: Vec<String>,
 }
 
@@ -88,6 +89,7 @@ impl WindowRuleDecision {
             managed: true,
             column_mode: projection.default_column_mode,
             width_semantics: projection.default_column_width,
+            width_semantics_explicit: false,
             matched_rule_ids: Vec::new(),
         }
     }
@@ -495,6 +497,7 @@ pub fn classify_window(
         }
         if let Some(width_semantics) = rule.actions.width_semantics {
             decision.width_semantics = width_semantics;
+            decision.width_semantics_explicit = true;
         }
         if let Some(managed) = rule.actions.managed {
             decision.managed = managed;
@@ -1049,7 +1052,28 @@ mod tests {
         assert_eq!(decision.layer, WindowLayer::Floating);
         assert_eq!(decision.column_mode, ColumnMode::Tabbed);
         assert_eq!(decision.width_semantics, WidthSemantics::Fixed(420));
+        assert!(decision.width_semantics_explicit);
         assert_eq!(decision.matched_rule_ids, vec!["float-dialogs".to_string()]);
+    }
+
+    #[test]
+    fn default_rule_decision_keeps_width_non_explicit() {
+        let config = default_loaded_config(1, DEFAULT_CONFIG_PATH);
+        let decision = classify_window(
+            &config.rules,
+            &WindowRuleInput {
+                process_name: Some("notepad".to_string()),
+                class_name: "Notepad".to_string(),
+                title: "Untitled - Notepad".to_string(),
+            },
+            &config.projection,
+        );
+
+        assert_eq!(
+            decision.width_semantics,
+            config.projection.default_column_width
+        );
+        assert!(!decision.width_semantics_explicit);
     }
 
     #[test]

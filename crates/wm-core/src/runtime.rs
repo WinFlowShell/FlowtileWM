@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use flowtile_config_rules::{
@@ -9,7 +9,7 @@ use flowtile_config_rules::{
 };
 use flowtile_domain::{
     BindControlMode, CorrelationId, DomainEvent, DomainEventPayload, FocusBehavior, MonitorId,
-    RuntimeMode, TopologyRole, WindowId, WindowLayer, WindowPlacement, WmState,
+    RuntimeMode, TopologyRole, WidthSemantics, WindowId, WindowLayer, WindowPlacement, WmState,
 };
 use flowtile_layout_engine::recompute_workspace;
 use flowtile_windows_adapter::{
@@ -19,6 +19,8 @@ use flowtile_windows_adapter::{
 };
 
 use crate::{CoreDaemonRuntime, RuntimeCycleReport, RuntimeError, StateStore};
+
+const FOCUS_OBSERVATION_GRACE: Duration = Duration::from_millis(250);
 
 impl CoreDaemonRuntime {
     pub fn new(runtime_mode: RuntimeMode) -> Self {
@@ -41,6 +43,7 @@ impl CoreDaemonRuntime {
             active_config: startup_config.clone(),
             last_valid_config: startup_config,
             last_snapshot: None,
+            pending_focus_claim: None,
             management_enabled: runtime_mode != RuntimeMode::SafeMode,
             consecutive_desync_cycles: 0,
             next_correlation_id: 1,
@@ -87,7 +90,9 @@ impl CoreDaemonRuntime {
     ) -> Result<RuntimeCycleReport, RuntimeError> {
         let snapshot = self.adapter.scan_snapshot()?;
         let _ = self.sync_snapshot_with_reason(snapshot.clone(), true, "command-pre-sync")?;
+        let previous_focused_hwnd = self.current_focused_hwnd();
         let transition = self.store.dispatch(event)?;
+        self.arm_pending_focus_claim(previous_focused_hwnd);
         let planned_operations = if self.management_enabled {
             self.plan_apply_operations(&snapshot)?
         } else {
@@ -98,6 +103,11 @@ impl CoreDaemonRuntime {
         } else {
             self.adapter.apply_operations(&planned_operations)?
         };
+        let apply_failure_messages = apply_result
+            .failures
+            .iter()
+            .map(|failure| format!("hwnd {}: {}", failure.hwnd, failure.message))
+            .collect::<Vec<_>>();
 
         let now = unix_timestamp();
         self.store.state_mut().runtime.last_full_scan_at = Some(now);
@@ -116,6 +126,7 @@ impl CoreDaemonRuntime {
             planned_operations: planned_operations.len(),
             applied_operations: apply_result.applied,
             apply_failures: apply_result.failures.len(),
+            apply_failure_messages,
             recovery_rescans: 0,
             validation_remaining_operations: 0,
             recovery_actions: Vec::new(),
@@ -267,14 +278,22 @@ impl CoreDaemonRuntime {
             .map(|previous| diff_snapshots(previous, &snapshot))
             .unwrap_or_else(|| SnapshotDiff::initial(&snapshot));
 
-        let discovered_windows = self.ingest_created_windows(&diff.created_windows)?;
+        let discovered_windows = self.ingest_created_windows(
+            &diff.created_windows,
+            snapshot.focused_window().map(|window| window.hwnd),
+            had_previous_snapshot,
+        )?;
         let destroyed_windows = self.ingest_destroyed_windows(&diff.destroyed_hwnds)?;
 
         if had_previous_snapshot && diff.monitor_topology_changed {
             self.push_degraded_reason("monitor-topology-changed".to_string());
         }
 
-        if let Some(focused_hwnd) = diff.focused_hwnd {
+        self.refresh_pending_focus_claim(snapshot.focused_window().map(|window| window.hwnd));
+        if let Some(focused_hwnd) = diff.focused_hwnd
+            && self.current_focused_hwnd() != Some(focused_hwnd)
+            && !self.should_defer_platform_focus_observation(focused_hwnd)
+        {
             self.observe_focus(focused_hwnd)?;
         }
 
@@ -288,6 +307,11 @@ impl CoreDaemonRuntime {
         } else {
             self.adapter.apply_operations(&planned_operations)?
         };
+        let apply_failure_messages = apply_result
+            .failures
+            .iter()
+            .map(|failure| format!("hwnd {}: {}", failure.hwnd, failure.message))
+            .collect::<Vec<_>>();
 
         let now = unix_timestamp();
         self.store.state_mut().runtime.last_full_scan_at = Some(now);
@@ -306,6 +330,7 @@ impl CoreDaemonRuntime {
             planned_operations: planned_operations.len(),
             applied_operations: apply_result.applied,
             apply_failures: apply_result.failures.len(),
+            apply_failure_messages,
             recovery_rescans: 0,
             validation_remaining_operations: 0,
             recovery_actions: Vec::new(),
@@ -339,6 +364,18 @@ impl CoreDaemonRuntime {
             return Ok(());
         }
 
+        if operations_are_activation_only(&validation_snapshot, &remaining_operations) {
+            self.consecutive_desync_cycles = 0;
+            self.last_snapshot = Some(validation_snapshot);
+            self.push_degraded_reason("activation:foreground-refused".to_string());
+            report.recovery_actions.push(format!(
+                "activation-only-degraded:{}-ops-remain",
+                remaining_operations.len()
+            ));
+            report.degraded_reasons = self.store.state().runtime.degraded_flags.clone();
+            return Ok(());
+        }
+
         self.push_degraded_reason("desync:post-apply-diverged".to_string());
         report.recovery_actions.push(format!(
             "targeted-retry:{}-ops-remain",
@@ -348,6 +385,12 @@ impl CoreDaemonRuntime {
         let retry_result = self.adapter.apply_operations(&remaining_operations)?;
         report.applied_operations += retry_result.applied;
         report.apply_failures += retry_result.failures.len();
+        report.apply_failure_messages.extend(
+            retry_result
+                .failures
+                .iter()
+                .map(|failure| format!("hwnd {}: {}", failure.hwnd, failure.message)),
+        );
 
         let post_retry_snapshot = self.adapter.scan_snapshot()?;
         report.recovery_rescans += 1;
@@ -358,6 +401,16 @@ impl CoreDaemonRuntime {
         if post_retry_remaining.is_empty() {
             self.consecutive_desync_cycles = 0;
             report.recovery_actions.push("retry-recovered".to_string());
+        } else if operations_are_activation_only(
+            self.last_snapshot.as_ref().expect("snapshot set"),
+            &post_retry_remaining,
+        ) {
+            self.consecutive_desync_cycles = 0;
+            self.push_degraded_reason("activation:foreground-refused".to_string());
+            report.recovery_actions.push(format!(
+                "activation-only-degraded:{}-ops-remain",
+                post_retry_remaining.len()
+            ));
         } else {
             self.consecutive_desync_cycles += 1;
             self.push_degraded_reason(format!(
@@ -369,7 +422,10 @@ impl CoreDaemonRuntime {
                 post_retry_remaining.len()
             ));
 
-            if report.apply_failures > 0 || self.consecutive_desync_cycles >= 2 {
+            if should_auto_unwind_after_desync(
+                &post_retry_remaining,
+                self.consecutive_desync_cycles,
+            ) {
                 self.request_emergency_unwind("desync-recovery-escalated");
                 report.recovery_actions.push("safe-mode-unwind".to_string());
             }
@@ -383,6 +439,8 @@ impl CoreDaemonRuntime {
     fn ingest_created_windows(
         &mut self,
         windows: &[PlatformWindowSnapshot],
+        focused_hwnd: Option<u64>,
+        follow_active_context: bool,
     ) -> Result<usize, RuntimeError> {
         let mut discovered_windows = 0;
 
@@ -391,7 +449,8 @@ impl CoreDaemonRuntime {
                 continue;
             }
 
-            let Some(monitor_id) = self.monitor_id_by_binding(&window.monitor_binding) else {
+            let Some(actual_monitor_id) = self.monitor_id_by_binding(&window.monitor_binding)
+            else {
                 self.push_degraded_reason(format!(
                     "missing-monitor-binding:{}",
                     window.monitor_binding
@@ -407,6 +466,24 @@ impl CoreDaemonRuntime {
                     title: window.title.clone(),
                 },
                 &self.active_config.projection,
+            );
+            let discovery_width = discovered_width_semantics(&decision, window);
+            let monitor_id = if follow_active_context {
+                self.discovery_target_monitor_id(actual_monitor_id, decision.managed)
+            } else {
+                actual_monitor_id
+            };
+            let placement = self.discovery_placement_for_window(
+                monitor_id,
+                &decision,
+                discovery_width,
+                follow_active_context,
+            );
+            let focus_behavior = self.discovery_focus_behavior_for_window(
+                window.hwnd,
+                focused_hwnd,
+                monitor_id,
+                &decision,
             );
             let correlation_id = self.next_correlation_id();
             self.store.dispatch(DomainEvent::new(
@@ -424,11 +501,8 @@ impl CoreDaemonRuntime {
                     },
                     desired_size: flowtile_domain::Size::new(window.rect.width, window.rect.height),
                     last_known_rect: window.rect,
-                    placement: WindowPlacement::AppendToWorkspaceEnd {
-                        mode: decision.column_mode,
-                        width: decision.width_semantics,
-                    },
-                    focus_behavior: FocusBehavior::PreserveCurrentFocus,
+                    placement,
+                    focus_behavior,
                     layer: decision.layer,
                     managed: decision.managed,
                 }),
@@ -679,6 +753,162 @@ impl CoreDaemonRuntime {
             })
     }
 
+    fn current_focused_hwnd(&self) -> Option<u64> {
+        self.store
+            .state()
+            .focus
+            .focused_window_id
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .and_then(|window| window.current_hwnd_binding)
+    }
+
+    fn arm_pending_focus_claim(&mut self, previous_focused_hwnd: Option<u64>) {
+        let current_focused_hwnd = self.current_focused_hwnd();
+        let Some(desired_hwnd) = current_focused_hwnd else {
+            self.pending_focus_claim = None;
+            return;
+        };
+
+        if previous_focused_hwnd == Some(desired_hwnd) {
+            return;
+        }
+
+        let focus_origin = self.store.state().focus.focus_origin;
+        if focus_origin != flowtile_domain::FocusOrigin::UserCommand {
+            return;
+        }
+
+        self.pending_focus_claim = Some(crate::PendingFocusClaim {
+            desired_hwnd,
+            expires_at: Instant::now() + FOCUS_OBSERVATION_GRACE,
+        });
+    }
+
+    fn refresh_pending_focus_claim(&mut self, _actual_focused_hwnd: Option<u64>) {
+        let Some(pending_claim) = &self.pending_focus_claim else {
+            return;
+        };
+
+        if Instant::now() >= pending_claim.expires_at {
+            self.pending_focus_claim = None;
+        }
+    }
+
+    fn should_defer_platform_focus_observation(&mut self, observed_hwnd: u64) -> bool {
+        let Some(pending_claim) = &self.pending_focus_claim else {
+            return false;
+        };
+
+        if Instant::now() >= pending_claim.expires_at {
+            self.pending_focus_claim = None;
+            return false;
+        }
+
+        observed_hwnd != pending_claim.desired_hwnd
+    }
+
+    fn discovery_target_monitor_id(
+        &self,
+        actual_monitor_id: MonitorId,
+        managed: bool,
+    ) -> MonitorId {
+        if !managed {
+            return actual_monitor_id;
+        }
+
+        self.store
+            .state()
+            .focus
+            .focused_window_id
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .and_then(|window| self.store.state().workspaces.get(&window.workspace_id))
+            .map(|workspace| workspace.monitor_id)
+            .or(self.store.state().focus.focused_monitor_id)
+            .unwrap_or(actual_monitor_id)
+    }
+
+    fn discovery_placement_for_window(
+        &self,
+        monitor_id: MonitorId,
+        decision: &flowtile_config_rules::WindowRuleDecision,
+        discovery_width: WidthSemantics,
+        follow_active_context: bool,
+    ) -> WindowPlacement {
+        if follow_active_context
+            && decision.managed
+            && decision.layer == WindowLayer::Tiled
+            && self.active_context_has_focused_window(monitor_id)
+        {
+            WindowPlacement::NewColumnAfterFocus {
+                mode: decision.column_mode,
+                width: discovery_width,
+            }
+        } else {
+            WindowPlacement::AppendToWorkspaceEnd {
+                mode: decision.column_mode,
+                width: discovery_width,
+            }
+        }
+    }
+
+    fn discovery_focus_behavior_for_window(
+        &self,
+        hwnd: u64,
+        focused_hwnd: Option<u64>,
+        monitor_id: MonitorId,
+        decision: &flowtile_config_rules::WindowRuleDecision,
+    ) -> FocusBehavior {
+        if Some(hwnd) == focused_hwnd {
+            return FocusBehavior::FollowNewWindow;
+        }
+
+        if decision.managed
+            && decision.layer == WindowLayer::Tiled
+            && self.active_context_window_is_fullscreen(monitor_id)
+        {
+            return FocusBehavior::FollowNewWindow;
+        }
+
+        FocusBehavior::PreserveCurrentFocus
+    }
+
+    fn active_context_has_focused_window(&self, monitor_id: MonitorId) -> bool {
+        let Some(workspace_id) = self
+            .store
+            .state()
+            .active_workspace_id_for_monitor(monitor_id)
+        else {
+            return false;
+        };
+
+        self.store
+            .state()
+            .focus
+            .focused_window_id
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .is_some_and(|window| window.workspace_id == workspace_id)
+    }
+
+    fn active_context_window_is_fullscreen(&self, monitor_id: MonitorId) -> bool {
+        let Some(workspace_id) = self
+            .store
+            .state()
+            .active_workspace_id_for_monitor(monitor_id)
+        else {
+            return false;
+        };
+
+        self.store
+            .state()
+            .focus
+            .focused_window_id
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .is_some_and(|window| {
+                window.workspace_id == workspace_id
+                    && (window.layer == WindowLayer::Fullscreen || window.is_fullscreen)
+            })
+    }
+
     fn push_degraded_reason(&mut self, reason: String) {
         if !self.store.state().runtime.degraded_flags.contains(&reason) {
             self.store.state_mut().runtime.degraded_flags.push(reason);
@@ -729,6 +959,55 @@ fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<
     changed_sections
 }
 
+fn discovered_width_semantics(
+    decision: &flowtile_config_rules::WindowRuleDecision,
+    window: &PlatformWindowSnapshot,
+) -> WidthSemantics {
+    if decision.layer == WindowLayer::Tiled && !decision.width_semantics_explicit {
+        WidthSemantics::Fixed(window.rect.width.max(1))
+    } else {
+        decision.width_semantics
+    }
+}
+
+fn operations_are_activation_only(
+    snapshot: &PlatformSnapshot,
+    operations: &[ApplyOperation],
+) -> bool {
+    if operations.is_empty() {
+        return false;
+    }
+
+    let actual_windows = snapshot
+        .windows
+        .iter()
+        .map(|window| (window.hwnd, window.rect))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    operations.iter().all(|operation| {
+        operation.activate
+            && actual_windows
+                .get(&operation.hwnd)
+                .is_some_and(|actual_rect| !needs_geometry_apply(*actual_rect, operation.rect))
+    })
+}
+
+fn should_auto_unwind_after_desync(
+    remaining_operations: &[ApplyOperation],
+    consecutive_desync_cycles: u32,
+) -> bool {
+    if consecutive_desync_cycles < 3 {
+        return false;
+    }
+
+    let affected_windows = remaining_operations
+        .iter()
+        .map(|operation| operation.hwnd)
+        .collect::<std::collections::HashSet<_>>();
+
+    affected_windows.len() > 1
+}
+
 fn ensure_supported_bind_control_mode(
     bind_control_mode: BindControlMode,
 ) -> Result<(), RuntimeError> {
@@ -766,4 +1045,316 @@ fn normalize_reason_token(value: &str) -> String {
             }
         })
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use flowtile_config_rules::WindowRuleDecision;
+    use flowtile_domain::{Rect, RuntimeMode, WidthSemantics, WindowLayer};
+    use flowtile_windows_adapter::{
+        ApplyOperation, PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot,
+    };
+
+    use crate::CoreDaemonRuntime;
+
+    use super::{
+        discovered_width_semantics, operations_are_activation_only, should_auto_unwind_after_desync,
+    };
+
+    #[test]
+    fn treats_focus_mismatch_without_geometry_drift_as_activation_only() {
+        let snapshot = sample_snapshot(Rect::new(0, 0, 420, 900));
+        let operations = vec![ApplyOperation {
+            hwnd: 100,
+            rect: Rect::new(0, 0, 420, 900),
+            activate: true,
+        }];
+
+        assert!(operations_are_activation_only(&snapshot, &operations));
+    }
+
+    #[test]
+    fn does_not_treat_geometry_retry_as_activation_only() {
+        let snapshot = sample_snapshot(Rect::new(20, 0, 420, 900));
+        let operations = vec![ApplyOperation {
+            hwnd: 100,
+            rect: Rect::new(0, 0, 420, 900),
+            activate: true,
+        }];
+
+        assert!(!operations_are_activation_only(&snapshot, &operations));
+    }
+
+    #[test]
+    fn single_window_desync_does_not_force_auto_unwind() {
+        let operations = vec![ApplyOperation {
+            hwnd: 100,
+            rect: Rect::new(0, 0, 420, 900),
+            activate: true,
+        }];
+
+        assert!(!should_auto_unwind_after_desync(&operations, 3));
+    }
+
+    #[test]
+    fn multi_window_persistent_desync_can_force_auto_unwind() {
+        let operations = vec![
+            ApplyOperation {
+                hwnd: 100,
+                rect: Rect::new(0, 0, 420, 900),
+                activate: true,
+            },
+            ApplyOperation {
+                hwnd: 200,
+                rect: Rect::new(420, 0, 420, 900),
+                activate: false,
+            },
+        ];
+
+        assert!(should_auto_unwind_after_desync(&operations, 3));
+    }
+
+    #[test]
+    fn discovery_without_explicit_width_bootstraps_from_observed_rect() {
+        let decision = WindowRuleDecision {
+            layer: WindowLayer::Tiled,
+            managed: true,
+            column_mode: flowtile_domain::ColumnMode::Normal,
+            width_semantics: WidthSemantics::MonitorFraction {
+                numerator: 1,
+                denominator: 2,
+            },
+            width_semantics_explicit: false,
+            matched_rule_ids: Vec::new(),
+        };
+        let window = PlatformWindowSnapshot {
+            hwnd: 100,
+            title: "Window 100".to_string(),
+            class_name: "Notepad".to_string(),
+            process_id: 4242,
+            process_name: Some("notepad".to_string()),
+            rect: Rect::new(0, 0, 420, 900),
+            monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+            is_visible: true,
+            is_focused: true,
+        };
+
+        assert_eq!(
+            discovered_width_semantics(&decision, &window),
+            WidthSemantics::Fixed(420)
+        );
+    }
+
+    #[test]
+    fn discovery_with_explicit_rule_width_keeps_rule_semantics() {
+        let decision = WindowRuleDecision {
+            layer: WindowLayer::Tiled,
+            managed: true,
+            column_mode: flowtile_domain::ColumnMode::Normal,
+            width_semantics: WidthSemantics::Fixed(560),
+            width_semantics_explicit: true,
+            matched_rule_ids: vec!["prefer-wide-column".to_string()],
+        };
+        let window = PlatformWindowSnapshot {
+            hwnd: 100,
+            title: "Window 100".to_string(),
+            class_name: "Notepad".to_string(),
+            process_id: 4242,
+            process_name: Some("notepad".to_string()),
+            rect: Rect::new(0, 0, 420, 900),
+            monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+            is_visible: true,
+            is_focused: true,
+        };
+
+        assert_eq!(
+            discovered_width_semantics(&decision, &window),
+            WidthSemantics::Fixed(560)
+        );
+    }
+
+    #[test]
+    fn initial_snapshot_gapless_plan_uses_observed_bootstrap_widths() {
+        let snapshot = PlatformSnapshot {
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 320, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(430, 0, 320, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 102,
+                    title: "Window 102".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(860, 0, 320, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                },
+            ],
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        let planned_operations = runtime
+            .plan_apply_operations(&snapshot)
+            .expect("apply plan should be computed");
+
+        assert_eq!(planned_operations.len(), 2);
+        assert_eq!(planned_operations[0].hwnd, 101);
+        assert_eq!(planned_operations[0].rect.x, 320);
+        assert_eq!(planned_operations[0].rect.width, 320);
+        assert_eq!(planned_operations[1].hwnd, 102);
+        assert_eq!(planned_operations[1].rect.x, 640);
+        assert_eq!(planned_operations[1].rect.width, 320);
+    }
+
+    #[test]
+    fn new_managed_window_follows_active_monitor_context() {
+        let initial_snapshot = PlatformSnapshot {
+            monitors: vec![
+                PlatformMonitorSnapshot {
+                    binding: "\\\\.\\DISPLAY1".to_string(),
+                    work_area_rect: Rect::new(0, 0, 1200, 900),
+                    dpi: 96,
+                    is_primary: true,
+                },
+                PlatformMonitorSnapshot {
+                    binding: "\\\\.\\DISPLAY2".to_string(),
+                    work_area_rect: Rect::new(1200, 0, 1200, 900),
+                    dpi: 96,
+                    is_primary: false,
+                },
+            ],
+            windows: vec![PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(1200, 0, 420, 900),
+                monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+                is_visible: true,
+                is_focused: true,
+            }],
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(initial_snapshot, true)
+            .expect("initial sync should succeed");
+
+        let snapshot_with_new_window = PlatformSnapshot {
+            monitors: vec![
+                PlatformMonitorSnapshot {
+                    binding: "\\\\.\\DISPLAY1".to_string(),
+                    work_area_rect: Rect::new(0, 0, 1200, 900),
+                    dpi: 96,
+                    is_primary: true,
+                },
+                PlatformMonitorSnapshot {
+                    binding: "\\\\.\\DISPLAY2".to_string(),
+                    work_area_rect: Rect::new(1200, 0, 1200, 900),
+                    dpi: 96,
+                    is_primary: false,
+                },
+            ],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(1200, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4343,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                },
+            ],
+        };
+        runtime
+            .sync_snapshot(snapshot_with_new_window, true)
+            .expect("second sync should succeed");
+
+        let new_window_id = runtime
+            .find_window_id_by_hwnd(101)
+            .expect("new window should exist");
+        let new_window = runtime
+            .state()
+            .windows
+            .get(&new_window_id)
+            .expect("new window should be tracked");
+        let workspace = runtime
+            .state()
+            .workspaces
+            .get(&new_window.workspace_id)
+            .expect("workspace should exist");
+        let monitor = runtime
+            .state()
+            .monitors
+            .get(&workspace.monitor_id)
+            .expect("monitor should exist");
+
+        assert_eq!(monitor.platform_binding.as_deref(), Some("\\\\.\\DISPLAY2"));
+    }
+
+    fn sample_snapshot(window_rect: Rect) -> PlatformSnapshot {
+        PlatformSnapshot {
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: window_rect,
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: false,
+            }],
+        }
+    }
 }

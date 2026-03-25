@@ -279,6 +279,7 @@ impl Column {
 pub struct RestoreTarget {
     pub workspace_id: WorkspaceId,
     pub column_id: Option<ColumnId>,
+    pub column_index: Option<usize>,
     pub layer: WindowLayer,
 }
 

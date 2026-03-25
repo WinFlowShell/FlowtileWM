@@ -781,6 +781,50 @@ mod tests {
     }
 
     #[test]
+    fn pure_win_j_chord_focuses_next_without_input_leakage() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+J".to_string(),
+            command: WatchCommand::FocusNext,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'J'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'J'), WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::FocusNext),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'J'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
     fn unmatched_pure_win_key_replays_prefix_back_to_shell() {
         let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
             trigger: "Win+H".to_string(),
