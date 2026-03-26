@@ -198,16 +198,35 @@ pub struct WindowSwitchAnimation {
     pub frame_count: u8,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WindowVisualEmphasis {
+    pub opacity_alpha: u8,
+    #[serde(default)]
+    pub border_color_rgb: Option<u32>,
+    pub border_thickness_px: u8,
+    #[serde(default)]
+    pub rounded_corners: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApplyOperation {
     pub hwnd: u64,
     pub rect: Rect,
+    #[serde(default = "default_true")]
+    pub apply_geometry: bool,
     #[serde(default)]
     pub activate: bool,
     #[serde(default)]
     pub suppress_visual_gap: bool,
     #[serde(default)]
     pub window_switch_animation: Option<WindowSwitchAnimation>,
+    #[serde(default)]
+    pub visual_emphasis: Option<WindowVisualEmphasis>,
+}
+
+#[allow(dead_code)]
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]

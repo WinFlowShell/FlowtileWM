@@ -11,8 +11,8 @@ use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, RECT},
     Graphics::Dwm::{
         DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
-        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmGetWindowAttribute,
-        DwmSetWindowAttribute,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+        DwmGetWindowAttribute, DwmSetWindowAttribute,
     },
     System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::{
@@ -22,16 +22,18 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             BeginDeferWindowPos, BringWindowToTop, DeferWindowPos, EndDeferWindowPos,
-            GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic, SW_RESTORE,
-            SW_SHOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
-            SetForegroundWindow, SetWindowPos, ShowWindow,
+            GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+            GetWindowThreadProcessId, IsIconic, LWA_ALPHA, SW_RESTORE, SW_SHOW,
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
+            SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+            ShowWindow, WS_EX_LAYERED,
         },
     },
 };
 
 use crate::{
     ApplyBatchResult, ApplyFailure, ApplyOperation, TILED_VISUAL_OVERLAP_X_PX,
-    WindowSwitchAnimation, dpi,
+    WindowSwitchAnimation, WindowVisualEmphasis, dpi,
 };
 
 const GEOMETRY_APPLY_FLAGS: u32 =
@@ -73,11 +75,39 @@ fn apply_operations_direct(operations: &[ApplyOperation]) -> ApplyBatchResult {
         return ApplyBatchResult::default();
     }
 
-    if operations.len() > 1 && try_apply_operations_batched(operations).is_ok() {
-        return finalize_apply_without_animation(operations);
+    let (geometry_operations, visual_only_operations): (Vec<_>, Vec<_>) = operations
+        .iter()
+        .cloned()
+        .partition(|operation| operation.apply_geometry);
+
+    let mut result = ApplyBatchResult::default();
+
+    if geometry_operations.is_empty() {
+        merge_apply_result(
+            &mut result,
+            apply_operations_individually(&visual_only_operations),
+        );
+        return result;
     }
 
-    apply_operations_individually(operations)
+    if geometry_operations.len() > 1 && try_apply_operations_batched(&geometry_operations).is_ok() {
+        merge_apply_result(
+            &mut result,
+            finalize_apply_without_animation(&geometry_operations),
+        );
+    } else {
+        merge_apply_result(
+            &mut result,
+            apply_operations_individually(&geometry_operations),
+        );
+    }
+
+    merge_apply_result(
+        &mut result,
+        apply_operations_individually(&visual_only_operations),
+    );
+
+    result
 }
 
 fn apply_operations_individually(operations: &[ApplyOperation]) -> ApplyBatchResult {
@@ -216,22 +246,27 @@ fn try_apply_window_switch_animations(operations: &[ApplyOperation]) -> Result<(
 }
 
 fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
-    match apply_geometry(operation) {
-        Ok(()) => {}
-        Err(error) => {
-            if operation.activate && error.code == ERROR_ACCESS_DENIED {
-                activate_window(operation.hwnd).map_err(|activation_error| {
-                    format!(
-                        "{}; activation fallback failed: {}",
-                        error.message, activation_error
-                    )
-                })?;
-                return Ok(());
-            }
+    if operation.apply_geometry {
+        match apply_geometry(operation) {
+            Ok(()) => {}
+            Err(error) => {
+                if operation.activate && error.code == ERROR_ACCESS_DENIED {
+                    apply_visual_emphasis_for_operation(operation)?;
+                    activate_window(operation.hwnd).map_err(|activation_error| {
+                        format!(
+                            "{}; activation fallback failed: {}",
+                            error.message, activation_error
+                        )
+                    })?;
+                    return Ok(());
+                }
 
-            return Err(error.message);
+                return Err(error.message);
+            }
         }
     }
+
+    apply_visual_emphasis_for_operation(operation)?;
 
     if operation.activate {
         activate_window(operation.hwnd)?;
@@ -244,7 +279,20 @@ fn finalize_apply_without_animation(operations: &[ApplyOperation]) -> ApplyBatch
     let mut applied = operations.len();
     let mut failures = Vec::new();
 
-    for operation in operations.iter().filter(|operation| operation.activate) {
+    for operation in operations {
+        if let Err(message) = apply_visual_emphasis_for_operation(operation) {
+            applied = applied.saturating_sub(1);
+            failures.push(ApplyFailure {
+                hwnd: operation.hwnd,
+                message,
+            });
+            continue;
+        }
+
+        if !operation.activate {
+            continue;
+        }
+
         if let Err(message) = activate_window(operation.hwnd) {
             applied = applied.saturating_sub(1);
             failures.push(ApplyFailure {
@@ -268,7 +316,8 @@ fn merge_apply_result(target: &mut ApplyBatchResult, source: ApplyBatchResult) {
 }
 
 fn uses_window_switch_animation(operation: &ApplyOperation) -> bool {
-    operation
+    operation.apply_geometry
+        && operation
         .window_switch_animation
         .as_ref()
         .is_some_and(|animation| animation.frame_count > 1 && animation.from_rect != operation.rect)
@@ -282,9 +331,11 @@ fn animated_frame_operation(operation: &ApplyOperation, progress: f32) -> ApplyO
     ApplyOperation {
         hwnd: operation.hwnd,
         rect: interpolate_rect(animation, operation.rect, progress),
+        apply_geometry: true,
         activate: false,
         suppress_visual_gap: operation.suppress_visual_gap,
         window_switch_animation: None,
+        visual_emphasis: None,
     }
 }
 
@@ -352,12 +403,72 @@ fn apply_geometry(operation: &ApplyOperation) -> Result<(), Win32ApiError> {
 }
 
 fn apply_gapless_visual_policy(hwnd: HWND) {
+    set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, DWMWA_COLOR_NONE);
+}
+
+fn apply_visual_emphasis_for_operation(operation: &ApplyOperation) -> Result<(), String> {
+    let Some(visual_emphasis) = &operation.visual_emphasis else {
+        return Ok(());
+    };
+    let hwnd = hwnd_from_raw(operation.hwnd)?;
+    apply_window_opacity(hwnd, visual_emphasis.opacity_alpha)?;
+    apply_window_corners(hwnd, visual_emphasis);
+    apply_window_border(hwnd, visual_emphasis);
+    Ok(())
+}
+
+fn apply_window_opacity(hwnd: HWND, opacity_alpha: u8) -> Result<(), String> {
+    let ex_style = {
+        // SAFETY: `GetWindowLongPtrW` is a read-only style query for a validated window handle.
+        unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
+    };
+    if ex_style == 0 {
+        let error = {
+            // SAFETY: reading the thread-local last-error code after a Win32 call is valid.
+            unsafe { GetLastError() }
+        };
+        if error != 0 {
+            return Err(format!(
+                "GetWindowLongPtrW failed with Win32 error {error}"
+            ));
+        }
+    }
+
+    let layered_style = (ex_style as u32) | WS_EX_LAYERED;
+    let _ = {
+        // SAFETY: we write back the same style flags plus `WS_EX_LAYERED` for the validated HWND.
+        unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, layered_style as isize) }
+    };
+    let layered_applied = {
+        // SAFETY: we pass a validated HWND and a simple alpha value for the documented layered-window API.
+        unsafe { SetLayeredWindowAttributes(hwnd, 0, opacity_alpha, LWA_ALPHA) }
+    };
+    if layered_applied == 0 {
+        return Err(last_error_message("SetLayeredWindowAttributes"));
+    }
+
+    Ok(())
+}
+
+fn apply_window_border(hwnd: HWND, visual_emphasis: &WindowVisualEmphasis) {
+    let border_color = visual_emphasis
+        .border_color_rgb
+        .unwrap_or(DWMWA_COLOR_NONE);
+    let _ = visual_emphasis.border_thickness_px;
+    set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, border_color);
+}
+
+fn apply_window_corners(hwnd: HWND, visual_emphasis: &WindowVisualEmphasis) {
+    let corner_preference = if visual_emphasis.rounded_corners {
+        DWMWCP_ROUND
+    } else {
+        DWMWCP_DONOTROUND
+    };
     set_dwm_i32_attribute(
         hwnd,
         DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-        DWMWCP_DONOTROUND,
+        corner_preference,
     );
-    set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, DWMWA_COLOR_NONE);
 }
 
 fn set_dwm_i32_attribute(hwnd: HWND, attribute: u32, value: i32) {
@@ -772,6 +883,7 @@ mod tests {
         let operation = crate::ApplyOperation {
             hwnd: 100,
             rect: Rect::new(120, 0, 420, 900),
+            apply_geometry: true,
             activate: true,
             suppress_visual_gap: true,
             window_switch_animation: Some(WindowSwitchAnimation {
@@ -779,6 +891,7 @@ mod tests {
                 duration_ms: 90,
                 frame_count: 6,
             }),
+            visual_emphasis: None,
         };
 
         assert!(uses_window_switch_animation(&operation));

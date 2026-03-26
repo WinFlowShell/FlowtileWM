@@ -16,18 +16,18 @@ use flowtile_windows_adapter::{
     ApplyBatchResult, ApplyOperation, ObservationEnvelope, ObservationKind,
     PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff,
     WINDOW_SWITCH_ANIMATION_DURATION_MS, WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
-    WindowSwitchAnimation, WindowsAdapter, diff_snapshots, needs_activation_apply,
-    needs_geometry_apply, needs_tiled_gapless_geometry_apply,
+    WindowSwitchAnimation, WindowVisualEmphasis, WindowsAdapter, diff_snapshots,
+    needs_activation_apply, needs_geometry_apply, needs_tiled_gapless_geometry_apply,
 };
 
 use crate::{CoreDaemonRuntime, RuntimeCycleReport, RuntimeError, StateStore};
 
 const FOCUS_OBSERVATION_GRACE: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ApplyPlanMode {
-    SteadyState,
-    WindowSwitchNavigation,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ApplyPlanContext {
+    previous_focused_hwnd: Option<u64>,
+    animate_window_switch: bool,
 }
 
 impl CoreDaemonRuntime {
@@ -99,11 +99,12 @@ impl CoreDaemonRuntime {
         let snapshot = self.adapter.scan_snapshot()?;
         let _ = self.sync_snapshot_with_reason(snapshot.clone(), true, "command-pre-sync")?;
         let previous_focused_hwnd = self.current_focused_hwnd();
-        let apply_plan_mode = apply_plan_mode_for_event(&event);
         let transition = self.store.dispatch(event)?;
+        let apply_plan_context =
+            self.build_apply_plan_context(previous_focused_hwnd, self.current_focused_hwnd());
         self.arm_pending_focus_claim(previous_focused_hwnd);
         let planned_operations = if self.management_enabled {
-            self.plan_apply_operations_with_mode(&snapshot, apply_plan_mode)?
+            self.plan_apply_operations_with_context(&snapshot, apply_plan_context)?
         } else {
             Vec::new()
         };
@@ -278,6 +279,7 @@ impl CoreDaemonRuntime {
     ) -> Result<RuntimeCycleReport, RuntimeError> {
         snapshot.sort_for_stability();
         self.note_observation_reason(observation_reason);
+        let previous_focused_hwnd = self.current_focused_hwnd();
         self.sync_monitors_from_snapshot(&snapshot.monitors)?;
 
         let had_previous_snapshot = self.last_snapshot.is_some();
@@ -307,8 +309,10 @@ impl CoreDaemonRuntime {
             self.observe_focus(focused_hwnd)?;
         }
 
+        let apply_plan_context =
+            self.build_apply_plan_context(previous_focused_hwnd, self.current_focused_hwnd());
         let planned_operations = if self.management_enabled {
-            self.plan_apply_operations(&snapshot)?
+            self.plan_apply_operations_with_context(&snapshot, apply_plan_context)?
         } else {
             Vec::new()
         };
@@ -597,13 +601,13 @@ impl CoreDaemonRuntime {
         &self,
         snapshot: &PlatformSnapshot,
     ) -> Result<Vec<ApplyOperation>, RuntimeError> {
-        self.plan_apply_operations_with_mode(snapshot, ApplyPlanMode::SteadyState)
+        self.plan_apply_operations_with_context(snapshot, ApplyPlanContext::default())
     }
 
-    fn plan_apply_operations_with_mode(
+    fn plan_apply_operations_with_context(
         &self,
         snapshot: &PlatformSnapshot,
-        apply_plan_mode: ApplyPlanMode,
+        apply_plan_context: ApplyPlanContext,
     ) -> Result<Vec<ApplyOperation>, RuntimeError> {
         let actual_windows = snapshot
             .windows
@@ -648,14 +652,21 @@ impl CoreDaemonRuntime {
                     .is_some_and(|desired_hwnd| {
                         needs_activation_apply(actual_focused_hwnd, desired_hwnd)
                     });
+                let active_state_changed = apply_plan_context.previous_focused_hwnd
+                    != desired_focused_hwnd
+                    && (apply_plan_context.previous_focused_hwnd == Some(hwnd)
+                        || desired_focused_hwnd == Some(hwnd));
                 let needs_geometry = if geometry.layer == WindowLayer::Tiled {
                     needs_tiled_gapless_geometry_apply(actual_window.rect, geometry.rect)
                 } else {
                     needs_geometry_apply(actual_window.rect, geometry.rect)
                 };
-                if needs_geometry || activate {
-                    let window_switch_animation = (apply_plan_mode
-                        == ApplyPlanMode::WindowSwitchNavigation
+                let visual_emphasis =
+                    (needs_geometry || activate || active_state_changed).then(|| {
+                        build_visual_emphasis(desired_focused_hwnd == Some(hwnd))
+                    });
+                if needs_geometry || activate || visual_emphasis.is_some() {
+                    let window_switch_animation = (apply_plan_context.animate_window_switch
                         && geometry.layer == WindowLayer::Tiled
                         && needs_geometry)
                         .then_some(WindowSwitchAnimation {
@@ -666,9 +677,11 @@ impl CoreDaemonRuntime {
                     operations.push(ApplyOperation {
                         hwnd,
                         rect: geometry.rect,
+                        apply_geometry: needs_geometry,
                         activate,
                         suppress_visual_gap: geometry.layer == WindowLayer::Tiled,
                         window_switch_animation,
+                        visual_emphasis,
                     });
                 }
             }
@@ -830,6 +843,20 @@ impl CoreDaemonRuntime {
             .and_then(|window| window.current_hwnd_binding)
     }
 
+    fn build_apply_plan_context(
+        &self,
+        previous_focused_hwnd: Option<u64>,
+        current_focused_hwnd: Option<u64>,
+    ) -> ApplyPlanContext {
+        ApplyPlanContext {
+            previous_focused_hwnd,
+            animate_window_switch: self.should_animate_window_switch(
+                previous_focused_hwnd,
+                current_focused_hwnd,
+            ),
+        }
+    }
+
     fn should_attempt_activation_reassert(&self, actual_focused_hwnd: Option<u64>) -> bool {
         if self.pending_focus_claim.is_some() {
             return true;
@@ -842,6 +869,21 @@ impl CoreDaemonRuntime {
         self.find_window_id_by_hwnd(actual_focused_hwnd)
             .and_then(|window_id| self.store.state().windows.get(&window_id))
             .is_some_and(|window| window.is_managed)
+    }
+
+    fn should_animate_window_switch(
+        &self,
+        previous_focused_hwnd: Option<u64>,
+        current_focused_hwnd: Option<u64>,
+    ) -> bool {
+        if previous_focused_hwnd == current_focused_hwnd {
+            return false;
+        }
+
+        current_focused_hwnd
+            .and_then(|hwnd| self.find_window_id_by_hwnd(hwnd))
+            .and_then(|window_id| self.store.state().windows.get(&window_id))
+            .is_some_and(|window| window.is_managed && window.layer == WindowLayer::Tiled)
     }
 
     fn arm_pending_focus_claim(&mut self, previous_focused_hwnd: Option<u64>) {
@@ -1105,13 +1147,17 @@ fn should_auto_unwind_after_desync(
     affected_windows.len() > 1
 }
 
-fn apply_plan_mode_for_event(event: &DomainEvent) -> ApplyPlanMode {
-    match &event.payload {
-        DomainEventPayload::CmdFocusNext(_) | DomainEventPayload::CmdFocusPrev(_) => {
-            ApplyPlanMode::WindowSwitchNavigation
-        }
-        _ => ApplyPlanMode::SteadyState,
+fn build_visual_emphasis(is_active_window: bool) -> WindowVisualEmphasis {
+    WindowVisualEmphasis {
+        opacity_alpha: if is_active_window { 255 } else { 208 },
+        border_color_rgb: is_active_window.then_some(rgb_color(0x4C, 0xA8, 0xFF)),
+        border_thickness_px: 3,
+        rounded_corners: true,
     }
+}
+
+const fn rgb_color(red: u8, green: u8, blue: u8) -> u32 {
+    red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
 }
 
 fn ensure_supported_bind_control_mode(
@@ -1166,7 +1212,7 @@ mod tests {
     use crate::CoreDaemonRuntime;
 
     use super::{
-        ApplyPlanMode, operations_are_activation_only,
+        ApplyPlanContext, build_visual_emphasis, operations_are_activation_only,
         should_auto_unwind_after_desync,
     };
 
@@ -1176,9 +1222,11 @@ mod tests {
         let operations = vec![ApplyOperation {
             hwnd: 100,
             rect: Rect::new(0, 0, 420, 900),
+            apply_geometry: true,
             activate: true,
             suppress_visual_gap: false,
             window_switch_animation: None,
+            visual_emphasis: None,
         }];
 
         assert!(operations_are_activation_only(&snapshot, &operations));
@@ -1190,9 +1238,11 @@ mod tests {
         let operations = vec![ApplyOperation {
             hwnd: 100,
             rect: Rect::new(0, 0, 420, 900),
+            apply_geometry: true,
             activate: true,
             suppress_visual_gap: false,
             window_switch_animation: None,
+            visual_emphasis: None,
         }];
 
         assert!(!operations_are_activation_only(&snapshot, &operations));
@@ -1203,9 +1253,11 @@ mod tests {
         let operations = vec![ApplyOperation {
             hwnd: 100,
             rect: Rect::new(0, 0, 420, 900),
+            apply_geometry: true,
             activate: true,
             suppress_visual_gap: false,
             window_switch_animation: None,
+            visual_emphasis: None,
         }];
 
         assert!(!should_auto_unwind_after_desync(&operations, 3));
@@ -1217,16 +1269,20 @@ mod tests {
             ApplyOperation {
                 hwnd: 100,
                 rect: Rect::new(0, 0, 420, 900),
+                apply_geometry: true,
                 activate: true,
                 suppress_visual_gap: false,
                 window_switch_animation: None,
+                visual_emphasis: None,
             },
             ApplyOperation {
                 hwnd: 200,
                 rect: Rect::new(420, 0, 420, 900),
+                apply_geometry: true,
                 activate: false,
                 suppress_visual_gap: false,
                 window_switch_animation: None,
+                visual_emphasis: None,
             },
         ];
 
@@ -1466,7 +1522,13 @@ mod tests {
             .expect("focus navigation should succeed");
 
         let planned_operations = runtime
-            .plan_apply_operations_with_mode(&snapshot, ApplyPlanMode::WindowSwitchNavigation)
+            .plan_apply_operations_with_context(
+                &snapshot,
+                ApplyPlanContext {
+                    previous_focused_hwnd: Some(100),
+                    animate_window_switch: true,
+                },
+            )
             .expect("apply plan should be computed");
         let last = planned_operations
             .iter()
@@ -1633,7 +1695,13 @@ mod tests {
             .expect("focus navigation should succeed");
 
         let planned_operations = runtime
-            .plan_apply_operations_with_mode(&snapshot, ApplyPlanMode::WindowSwitchNavigation)
+            .plan_apply_operations_with_context(
+                &snapshot,
+                ApplyPlanContext {
+                    previous_focused_hwnd: Some(100),
+                    animate_window_switch: true,
+                },
+            )
             .expect("apply plan should be computed");
 
         assert!(
@@ -1646,6 +1714,79 @@ mod tests {
                 .iter()
                 .any(|operation| operation.hwnd == 101 && operation.activate)
         );
+    }
+
+    #[test]
+    fn active_window_change_refreshes_visual_emphasis_for_old_and_new_focus() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(420, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(2),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus navigation should succeed");
+
+        let planned_operations = runtime
+            .plan_apply_operations_with_context(
+                &snapshot,
+                ApplyPlanContext {
+                    previous_focused_hwnd: Some(100),
+                    animate_window_switch: true,
+                },
+            )
+            .expect("apply plan should be computed");
+
+        let previous_focus = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 100)
+            .expect("previous focus operation should exist");
+        let new_focus = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .expect("new focus operation should exist");
+
+        assert_eq!(previous_focus.visual_emphasis, Some(build_visual_emphasis(false)));
+        assert_eq!(new_focus.visual_emphasis, Some(build_visual_emphasis(true)));
     }
 
     fn sample_snapshot(window_rect: Rect) -> PlatformSnapshot {
