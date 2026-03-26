@@ -1,15 +1,19 @@
 mod cli;
 mod control;
+mod diag;
 mod hotkeys;
 mod ipc;
 mod projection;
+mod touchpad;
 mod watch;
 
 use std::{env, process::ExitCode};
 
 use cli::{DaemonCommand, parse_command, print_usage};
+use diag::write_runtime_log;
 use flowtile_wm_core::{CoreDaemonBootstrap, CoreDaemonRuntime};
 use hotkeys::ensure_bind_control_mode_supported;
+use touchpad::ensure_touchpad_override_supported;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_ACCESS_DENIED, GetLastError},
@@ -24,14 +28,23 @@ use windows_sys::Win32::{
 };
 
 fn main() -> ExitCode {
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    write_runtime_log(format!("main: args={arguments:?}"));
+
     if let Err(message) = ensure_process_dpi_awareness() {
+        write_runtime_log(format!("main: dpi-awareness-error={message}"));
         eprintln!("{message}");
         return ExitCode::from(1);
     }
+    write_runtime_log("main: dpi-awareness-ok");
 
-    match parse_command(env::args().skip(1).collect()) {
-        Ok(command) => run(command),
+    match parse_command(arguments) {
+        Ok(command) => {
+            write_runtime_log(format!("main: parsed-command={command:?}"));
+            run(command)
+        }
         Err(message) => {
+            write_runtime_log(format!("main: parse-error={message}"));
             eprintln!("{message}");
             print_usage();
             ExitCode::from(2)
@@ -42,6 +55,7 @@ fn main() -> ExitCode {
 fn run(command: DaemonCommand) -> ExitCode {
     match command {
         DaemonCommand::Bootstrap { runtime_mode } => {
+            write_runtime_log(format!("run: bootstrap runtime_mode={runtime_mode:?}"));
             let bootstrap = CoreDaemonBootstrap::new(runtime_mode);
             println!("flowtile-core-daemon bootstrap");
             for line in bootstrap.summary_lines() {
@@ -53,13 +67,23 @@ fn run(command: DaemonCommand) -> ExitCode {
             runtime_mode,
             dry_run,
         } => {
+            write_runtime_log(format!(
+                "run: run-once runtime_mode={runtime_mode:?} dry_run={dry_run}"
+            ));
             let mut runtime = CoreDaemonRuntime::new(runtime_mode);
             if let Err(error) = ensure_bind_control_mode_supported(runtime.bind_control_mode()) {
+                write_runtime_log(format!("run: bind-control-startup-error={error}"));
                 eprintln!("bind control mode startup failed: {error}");
+                return ExitCode::from(1);
+            }
+            if let Err(error) = ensure_touchpad_override_supported(runtime.touchpad_config()) {
+                write_runtime_log(format!("run: touchpad-startup-error={error}"));
+                eprintln!("touchpad override startup failed: {error}");
                 return ExitCode::from(1);
             }
             match runtime.scan_and_sync(dry_run) {
                 Ok(report) => {
+                    write_runtime_log("run: run-once scan-and-sync-ok");
                     println!("flowtile-core-daemon run-once");
                     for line in report.summary_lines() {
                         println!("{line}");
@@ -67,6 +91,7 @@ fn run(command: DaemonCommand) -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
+                    write_runtime_log(format!("run: run-once scan-and-sync-error={error:?}"));
                     eprintln!("{error:?}");
                     ExitCode::from(1)
                 }
@@ -78,7 +103,12 @@ fn run(command: DaemonCommand) -> ExitCode {
             interval_ms,
             iterations,
             poll_only,
-        } => watch::run_watch(runtime_mode, dry_run, interval_ms, iterations, poll_only),
+        } => {
+            write_runtime_log(format!(
+                "run: watch runtime_mode={runtime_mode:?} dry_run={dry_run} interval_ms={interval_ms} iterations={iterations:?} poll_only={poll_only}"
+            ));
+            watch::run_watch(runtime_mode, dry_run, interval_ms, iterations, poll_only)
+        }
     }
 }
 

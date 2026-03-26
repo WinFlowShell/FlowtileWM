@@ -13,8 +13,13 @@ use flowtile_wm_core::{CoreDaemonRuntime, RuntimeCycleReport};
 
 use crate::{
     control::{ControlMessage, WatchCommand},
+    diag::write_runtime_log,
     hotkeys::{HotkeyListener, HotkeyListenerError, ensure_bind_control_mode_supported},
     ipc,
+    touchpad::{
+        TouchpadListener, TouchpadListenerError, assess_touchpad_override,
+        ensure_touchpad_override_supported,
+    },
 };
 
 const CONTROL_RESPONSE_SLICE_MS: u64 = 16;
@@ -26,21 +31,39 @@ pub(crate) fn run_watch(
     iterations: Option<u64>,
     poll_only: bool,
 ) -> ExitCode {
+    write_runtime_log(format!(
+        "watch: start runtime_mode={runtime_mode:?} dry_run={dry_run} interval_ms={interval_ms} iterations={iterations:?} poll_only={poll_only}"
+    ));
     let adapter = WindowsAdapter::new();
     let mut runtime = CoreDaemonRuntime::with_adapter(runtime_mode, adapter.clone());
     if let Err(error) = validate_runtime_bind_control_mode(&runtime) {
+        write_runtime_log(format!("watch: bind-control-validation-error={error}"));
         eprintln!("bind control mode startup failed: {error}");
         return ExitCode::from(1);
     }
+    write_runtime_log("watch: bind-control-validation-ok");
+    if let Err(error) = validate_runtime_touchpad_override(&runtime) {
+        write_runtime_log(format!("watch: touchpad-validation-error={error}"));
+        eprintln!("touchpad override startup failed: {error}");
+        return ExitCode::from(1);
+    }
+    write_runtime_log("watch: touchpad-validation-ok");
     let mut observer = if poll_only {
+        write_runtime_log("watch: observation-mode=poll-only");
         None
     } else {
         match adapter.spawn_observer(LiveObservationOptions {
             fallback_scan_interval_ms: interval_ms.max(1_000),
             ..LiveObservationOptions::default()
         }) {
-            Ok(stream) => Some(stream),
+            Ok(stream) => {
+                write_runtime_log("watch: live-observer-started");
+                Some(stream)
+            }
             Err(error) => {
+                write_runtime_log(format!(
+                    "watch: live-observer-start-failed={error}; using polling fallback"
+                ));
                 eprintln!("live observation failed to start: {error}; falling back to polling");
                 None
             }
@@ -50,13 +73,35 @@ pub(crate) fn run_watch(
     let (control_sender, control_receiver) = mpsc::channel::<ControlMessage>();
     ipc::spawn_ipc_servers(control_sender.clone());
     let mut hotkey_listener = match start_hotkey_listener(&runtime, &control_sender) {
-        Ok(listener) => listener,
+        Ok(listener) => {
+            write_runtime_log(format!(
+                "watch: hotkey-listener-started enabled={}",
+                listener.is_some()
+            ));
+            listener
+        }
         Err(error) => {
+            write_runtime_log(format!("watch: hotkey-listener-start-error={error}"));
             eprintln!("global hotkeys failed to start: {error}");
             return ExitCode::from(1);
         }
     };
+    let mut touchpad_listener = match start_touchpad_listener(&runtime, &control_sender) {
+        Ok(listener) => {
+            write_runtime_log(format!(
+                "watch: touchpad-listener-started enabled={}",
+                listener.is_some()
+            ));
+            listener
+        }
+        Err(error) => {
+            write_runtime_log(format!("watch: touchpad-listener-start-error={error}"));
+            eprintln!("touchpad override failed to start: {error}");
+            return ExitCode::from(1);
+        }
+    };
     spawn_stdin_listener(control_sender.clone());
+    write_runtime_log("watch: stdin-listener-started");
 
     let ipc = ipc_bootstrap();
     println!("flowtile-core-daemon watch");
@@ -81,6 +126,10 @@ pub(crate) fn run_watch(
         }
     );
     println!(
+        "touchpad override: {}",
+        touchpad_watch_status(runtime.touchpad_config(), touchpad_listener.is_some())
+    );
+    println!(
         "ipc command pipe: {} | event stream pipe: {}",
         ipc.command_pipe_name, ipc.event_stream_pipe_name
     );
@@ -97,6 +146,7 @@ pub(crate) fn run_watch(
     let control_response_slice = Duration::from_millis(CONTROL_RESPONSE_SLICE_MS);
     let observer_wait_slice = poll_interval.min(control_response_slice);
     let mut next_poll_deadline = Instant::now();
+    write_runtime_log("watch: entering-main-loop");
 
     if let Some(live_observer) = observer.as_mut() {
         match live_observer.recv_timeout(Duration::from_millis(interval_ms.max(5_000))) {
@@ -367,6 +417,14 @@ pub(crate) fn run_watch(
                                     return ExitCode::from(1);
                                 }
                             };
+                            touchpad_listener =
+                                match start_touchpad_listener(&runtime, &control_sender) {
+                                    Ok(listener) => listener,
+                                    Err(error) => {
+                                        eprintln!("touchpad override failed to restart: {error}");
+                                        return ExitCode::from(1);
+                                    }
+                                };
                             println!(
                                 "global hotkeys reloaded: {}",
                                 if hotkey_listener.is_some() {
@@ -374,6 +432,13 @@ pub(crate) fn run_watch(
                                 } else {
                                     "disabled"
                                 }
+                            );
+                            println!(
+                                "touchpad override reloaded: {}",
+                                touchpad_watch_status(
+                                    runtime.touchpad_config(),
+                                    touchpad_listener.is_some(),
+                                )
                             );
                             println!("manual command: reload-config");
                             print_iteration(completed_iterations + 1, &report);
@@ -414,7 +479,10 @@ pub(crate) fn run_watch(
                             return ExitCode::from(1);
                         }
                     },
-                    WatchCommand::Quit => return ExitCode::SUCCESS,
+                    WatchCommand::Quit => {
+                        write_runtime_log("watch: quit-command-received");
+                        return ExitCode::SUCCESS;
+                    }
                 },
                 ControlMessage::IpcRequest {
                     request,
@@ -435,6 +503,14 @@ pub(crate) fn run_watch(
                                 return ExitCode::from(1);
                             }
                         };
+                        touchpad_listener = match start_touchpad_listener(&runtime, &control_sender)
+                        {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                eprintln!("touchpad override failed to restart via IPC: {error}");
+                                return ExitCode::from(1);
+                            }
+                        };
                         println!(
                             "global hotkeys reloaded via IPC: {}",
                             if hotkey_listener.is_some() {
@@ -442,6 +518,13 @@ pub(crate) fn run_watch(
                             } else {
                                 "disabled"
                             }
+                        );
+                        println!(
+                            "touchpad override reloaded via IPC: {}",
+                            touchpad_watch_status(
+                                runtime.touchpad_config(),
+                                touchpad_listener.is_some(),
+                            )
                         );
                     }
                     let _ = response_sender.send(response);
@@ -513,6 +596,9 @@ pub(crate) fn run_watch(
         }
 
         if iterations.is_some_and(|limit| completed_iterations >= limit) {
+            write_runtime_log(format!(
+                "watch: iteration-limit-reached completed_iterations={completed_iterations}"
+            ));
             return ExitCode::SUCCESS;
         }
 
@@ -577,6 +663,7 @@ fn print_report(report: &RuntimeCycleReport) {
 
 fn print_state_snapshot(runtime: &CoreDaemonRuntime) {
     let state = runtime.state();
+    let touchpad = assess_touchpad_override(runtime.touchpad_config());
     println!("state snapshot");
     println!("state version: {}", state.state_version().get());
     println!("monitors: {}", state.monitors.len());
@@ -596,6 +683,14 @@ fn print_state_snapshot(runtime: &CoreDaemonRuntime) {
         "config rules: {}",
         state.config_projection.active_rule_count
     );
+    println!("touchpad override: {}", touchpad.summary_label());
+    println!(
+        "touchpad gesture bindings: {}",
+        touchpad.configured_gesture_count
+    );
+    if let Some(detail) = touchpad.detail {
+        println!("touchpad override detail: {detail}");
+    }
     if let Some(monitor_id) = state.focus.focused_monitor_id
         && let Some(workspace_id) = state.active_workspace_id_for_monitor(monitor_id)
         && let Some(workspace) = state.workspaces.get(&workspace_id)
@@ -630,4 +725,28 @@ fn validate_runtime_bind_control_mode(
     runtime: &CoreDaemonRuntime,
 ) -> Result<(), HotkeyListenerError> {
     ensure_bind_control_mode_supported(runtime.bind_control_mode())
+}
+
+fn start_touchpad_listener(
+    runtime: &CoreDaemonRuntime,
+    command_sender: &mpsc::Sender<ControlMessage>,
+) -> Result<Option<TouchpadListener>, TouchpadListenerError> {
+    TouchpadListener::spawn(runtime.touchpad_config(), command_sender.clone())
+}
+
+fn validate_runtime_touchpad_override(
+    runtime: &CoreDaemonRuntime,
+) -> Result<(), TouchpadListenerError> {
+    ensure_touchpad_override_supported(runtime.touchpad_config())
+}
+
+fn touchpad_watch_status(
+    config: &flowtile_config_rules::TouchpadConfig,
+    listener_running: bool,
+) -> &'static str {
+    if listener_running {
+        "enabled"
+    } else {
+        assess_touchpad_override(config).summary_label()
+    }
 }

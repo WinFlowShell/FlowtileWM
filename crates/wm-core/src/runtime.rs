@@ -4,8 +4,8 @@ use std::{
 };
 
 use flowtile_config_rules::{
-    HotkeyBinding, LoadedConfig, WindowRuleInput, bootstrap as config_bootstrap, classify_window,
-    default_loaded_config, ensure_default_config, load_from_path, load_or_default,
+    HotkeyBinding, LoadedConfig, TouchpadConfig, WindowRuleInput, bootstrap as config_bootstrap,
+    classify_window, default_loaded_config, ensure_default_config, load_from_path, load_or_default,
 };
 use flowtile_domain::{
     BindControlMode, CorrelationId, DomainEvent, DomainEventPayload, FocusBehavior, MonitorId,
@@ -71,6 +71,10 @@ impl CoreDaemonRuntime {
 
     pub fn hotkeys(&self) -> &[HotkeyBinding] {
         &self.active_config.hotkeys
+    }
+
+    pub fn touchpad_config(&self) -> &TouchpadConfig {
+        &self.active_config.touchpad
     }
 
     pub const fn bind_control_mode(&self) -> BindControlMode {
@@ -663,7 +667,10 @@ impl CoreDaemonRuntime {
                 };
                 let visual_emphasis =
                     (needs_geometry || activate || active_state_changed).then(|| {
-                        build_visual_emphasis(desired_focused_hwnd == Some(hwnd))
+                        build_visual_emphasis(
+                            desired_focused_hwnd == Some(hwnd),
+                            actual_window.process_name.as_deref(),
+                        )
                     });
                 if needs_geometry || activate || visual_emphasis.is_some() {
                     let window_switch_animation = (apply_plan_context.animate_window_switch
@@ -850,10 +857,8 @@ impl CoreDaemonRuntime {
     ) -> ApplyPlanContext {
         ApplyPlanContext {
             previous_focused_hwnd,
-            animate_window_switch: self.should_animate_window_switch(
-                previous_focused_hwnd,
-                current_focused_hwnd,
-            ),
+            animate_window_switch: self
+                .should_animate_window_switch(previous_focused_hwnd, current_focused_hwnd),
         }
     }
 
@@ -1079,7 +1084,11 @@ impl CoreDaemonRuntime {
             .state()
             .monitors
             .get(&monitor_id)
-            .map(|monitor| padded_tiled_viewport(monitor.work_area_rect, &self.active_config.projection).width.max(1))
+            .map(|monitor| {
+                padded_tiled_viewport(monitor.work_area_rect, &self.active_config.projection)
+                    .width
+                    .max(1)
+            })
             .unwrap_or(1)
     }
 }
@@ -1096,6 +1105,7 @@ fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<
     }
     if previous.projection.bind_control_mode != current.projection.bind_control_mode
         || previous.hotkeys != current.hotkeys
+        || previous.touchpad != current.touchpad
     {
         changed_sections.push("input".to_string());
     }
@@ -1147,13 +1157,34 @@ fn should_auto_unwind_after_desync(
     affected_windows.len() > 1
 }
 
-fn build_visual_emphasis(is_active_window: bool) -> WindowVisualEmphasis {
+fn build_visual_emphasis(
+    is_active_window: bool,
+    process_name: Option<&str>,
+) -> WindowVisualEmphasis {
     WindowVisualEmphasis {
-        opacity_alpha: if is_active_window { 255 } else { 208 },
+        opacity_alpha: inactive_window_opacity_alpha(is_active_window, process_name),
         border_color_rgb: is_active_window.then_some(rgb_color(0x4C, 0xA8, 0xFF)),
         border_thickness_px: 3,
         rounded_corners: true,
     }
+}
+
+fn inactive_window_opacity_alpha(is_active_window: bool, process_name: Option<&str>) -> u8 {
+    if is_active_window || process_uses_unsafe_layered_opacity(process_name) {
+        255
+    } else {
+        208
+    }
+}
+
+fn process_uses_unsafe_layered_opacity(process_name: Option<&str>) -> bool {
+    let Some(process_name) = process_name else {
+        return false;
+    };
+    matches!(
+        process_name.to_ascii_lowercase().as_str(),
+        "msedge.exe" | "chrome.exe" | "brave.exe" | "opera.exe" | "vivaldi.exe" | "chromium.exe"
+    )
 }
 
 const fn rgb_color(red: u8, green: u8, blue: u8) -> u32 {
@@ -1316,10 +1347,11 @@ mod tests {
         };
 
         let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
-        let monitor_id = runtime
-            .store
-            .state_mut()
-            .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
+        let monitor_id =
+            runtime
+                .store
+                .state_mut()
+                .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
 
         assert_eq!(
             runtime.discovered_width_semantics(&decision, &window, monitor_id),
@@ -1353,10 +1385,11 @@ mod tests {
             management_candidate: true,
         };
         let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
-        let monitor_id = runtime
-            .store
-            .state_mut()
-            .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
+        let monitor_id =
+            runtime
+                .store
+                .state_mut()
+                .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
 
         assert_eq!(
             runtime.discovered_width_semantics(&decision, &window, monitor_id),
@@ -1387,10 +1420,11 @@ mod tests {
             management_candidate: true,
         };
         let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
-        let monitor_id = runtime
-            .store
-            .state_mut()
-            .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
+        let monitor_id =
+            runtime
+                .store
+                .state_mut()
+                .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
 
         assert_eq!(
             runtime.discovered_width_semantics(&decision, &window, monitor_id),
@@ -1785,8 +1819,30 @@ mod tests {
             .find(|operation| operation.hwnd == 101)
             .expect("new focus operation should exist");
 
-        assert_eq!(previous_focus.visual_emphasis, Some(build_visual_emphasis(false)));
-        assert_eq!(new_focus.visual_emphasis, Some(build_visual_emphasis(true)));
+        assert_eq!(
+            previous_focus.visual_emphasis,
+            Some(build_visual_emphasis(false, Some("notepad")))
+        );
+        assert_eq!(
+            new_focus.visual_emphasis,
+            Some(build_visual_emphasis(true, Some("notepad")))
+        );
+    }
+
+    #[test]
+    fn chromium_windows_degrade_inactive_opacity_to_avoid_layered_alpha_artifacts() {
+        assert_eq!(
+            build_visual_emphasis(false, Some("msedge.exe")).opacity_alpha,
+            255
+        );
+        assert_eq!(
+            build_visual_emphasis(false, Some("chrome.exe")).opacity_alpha,
+            255
+        );
+        assert_eq!(
+            build_visual_emphasis(false, Some("notepad.exe")).opacity_alpha,
+            208
+        );
     }
 
     fn sample_snapshot(window_rect: Rect) -> PlatformSnapshot {

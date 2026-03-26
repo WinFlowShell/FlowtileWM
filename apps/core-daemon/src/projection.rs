@@ -8,8 +8,11 @@ use flowtile_ipc::{
 use flowtile_windows_adapter::PlatformWindowSnapshot;
 use flowtile_wm_core::CoreDaemonRuntime;
 
+use crate::touchpad::assess_touchpad_override;
+
 pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProjection {
     let state = runtime.state();
+    let touchpad = assess_touchpad_override(runtime.touchpad_config());
     let metadata_by_hwnd = runtime
         .last_snapshot()
         .map(|snapshot| {
@@ -174,6 +177,8 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
             last_transition_label: state.diagnostics_summary.last_transition_label.clone(),
             degraded_flags: state.runtime.degraded_flags.clone(),
             management_enabled: runtime.management_enabled(),
+            touchpad_override_status: touchpad.summary_label().to_string(),
+            touchpad_override_detail: touchpad.detail.clone(),
         },
         config: ConfigProjection {
             config_version: state.config_projection.config_version,
@@ -183,6 +188,8 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
                 .bind_control_mode
                 .as_str()
                 .to_string(),
+            touchpad_override_enabled: touchpad.requested,
+            touchpad_gesture_count: touchpad.configured_gesture_count,
             active_rule_count: state.config_projection.active_rule_count,
             strip_scroll_step: state.config_projection.strip_scroll_step,
             default_column_mode: state

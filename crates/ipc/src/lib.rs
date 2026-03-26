@@ -30,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
     "toggle_maximized",
     "toggle_fullscreen",
     "toggle_overview",
+    "touchpad_gesture",
     "capture_action",
     "reload_config",
     "dump_diagnostics",
@@ -185,6 +186,9 @@ pub struct DiagnosticsProjection {
     pub last_transition_label: Option<String>,
     pub degraded_flags: Vec<String>,
     pub management_enabled: bool,
+    pub touchpad_override_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touchpad_override_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,6 +196,8 @@ pub struct ConfigProjection {
     pub config_version: u64,
     pub source_path: String,
     pub bind_control_mode: String,
+    pub touchpad_override_enabled: bool,
+    pub touchpad_gesture_count: usize,
     pub active_rule_count: usize,
     pub strip_scroll_step: u32,
     pub default_column_mode: String,
@@ -291,6 +297,7 @@ mod tests {
         assert_eq!(bootstrap.command_pipe_name, COMMAND_PIPE_NAME);
         assert_eq!(bootstrap.event_stream_pipe_name, EVENT_STREAM_PIPE_NAME);
         assert!(bootstrap.commands.contains(&"toggle_overview"));
+        assert!(bootstrap.commands.contains(&"touchpad_gesture"));
     }
 
     #[test]

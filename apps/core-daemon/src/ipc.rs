@@ -9,7 +9,10 @@ use flowtile_ipc::{IpcError, IpcEvent, IpcRequest, IpcResponse, NamedPipeListene
 use flowtile_wm_core::{CoreDaemonRuntime, RuntimeCycleReport, RuntimeError};
 use serde_json::{Value, json};
 
-use crate::{control::ControlMessage, projection::build_snapshot_projection};
+use crate::{
+    control::ControlMessage, projection::build_snapshot_projection,
+    touchpad::ipc_command_for_touchpad_gesture,
+};
 
 pub fn spawn_ipc_servers(control_sender: mpsc::Sender<ControlMessage>) {
     spawn_command_listener(control_sender.clone());
@@ -202,6 +205,57 @@ pub fn handle_ipc_request(
             ),
             "ipc-toggle-overview",
         ),
+        "touchpad_gesture" => {
+            let Some(gesture) = request.payload.get("gesture").and_then(Value::as_str) else {
+                return (
+                    IpcResponse::error(
+                        request_id,
+                        IpcError::new(
+                            "invalid_payload",
+                            "touchpad_gesture requires payload.gesture",
+                            "contract",
+                            false,
+                        ),
+                    ),
+                    false,
+                );
+            };
+
+            match ipc_command_for_touchpad_gesture(runtime.touchpad_config(), gesture) {
+                Ok(Some(mapped_command)) => {
+                    let derived_request =
+                        IpcRequest::new(request_id, mapped_command, json!({ "gesture": gesture }));
+                    handle_ipc_request(runtime, dry_run, derived_request, manual_correlation_id)
+                }
+                Ok(None) => (
+                    IpcResponse::error(
+                        request_id,
+                        IpcError::new(
+                            "unbound_touchpad_gesture",
+                            format!(
+                                "touchpad gesture '{}' is not bound in the current daemon configuration",
+                                gesture
+                            ),
+                            "input",
+                            false,
+                        ),
+                    ),
+                    false,
+                ),
+                Err(error) => (
+                    IpcResponse::error(
+                        request_id,
+                        IpcError::new(
+                            "invalid_touchpad_gesture",
+                            error.to_string(),
+                            "input",
+                            false,
+                        ),
+                    ),
+                    false,
+                ),
+            }
+        }
         "reload_config" => match runtime.reload_config(dry_run) {
             Ok(report) => (
                 IpcResponse::ok(request_id, runtime_report_value(runtime, &report)),

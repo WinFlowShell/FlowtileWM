@@ -11,8 +11,8 @@ use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, RECT},
     Graphics::Dwm::{
         DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
-        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-        DwmGetWindowAttribute, DwmSetWindowAttribute,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmGetWindowAttribute,
+        DwmSetWindowAttribute,
     },
     System::Threading::{AttachThreadInput, GetCurrentThreadId},
     UI::{
@@ -21,12 +21,11 @@ use windows_sys::Win32::{
             SetActiveWindow, SetFocus, VK_MENU,
         },
         WindowsAndMessaging::{
-            BeginDeferWindowPos, BringWindowToTop, DeferWindowPos, EndDeferWindowPos,
-            GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, IsIconic, LWA_ALPHA, SW_RESTORE, SW_SHOW,
-            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
-            SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-            ShowWindow, WS_EX_LAYERED,
+            BeginDeferWindowPos, BringWindowToTop, DeferWindowPos, EndDeferWindowPos, GWL_EXSTYLE,
+            GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+            IsIconic, LWA_ALPHA, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+            SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetLayeredWindowAttributes,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_LAYERED,
         },
     },
 };
@@ -318,9 +317,11 @@ fn merge_apply_result(target: &mut ApplyBatchResult, source: ApplyBatchResult) {
 fn uses_window_switch_animation(operation: &ApplyOperation) -> bool {
     operation.apply_geometry
         && operation
-        .window_switch_animation
-        .as_ref()
-        .is_some_and(|animation| animation.frame_count > 1 && animation.from_rect != operation.rect)
+            .window_switch_animation
+            .as_ref()
+            .is_some_and(|animation| {
+                animation.frame_count > 1 && animation.from_rect != operation.rect
+            })
 }
 
 fn animated_frame_operation(operation: &ApplyOperation, progress: f32) -> ApplyOperation {
@@ -428,9 +429,7 @@ fn apply_window_opacity(hwnd: HWND, opacity_alpha: u8) -> Result<(), String> {
             unsafe { GetLastError() }
         };
         if error != 0 {
-            return Err(format!(
-                "GetWindowLongPtrW failed with Win32 error {error}"
-            ));
+            return Err(format!("GetWindowLongPtrW failed with Win32 error {error}"));
         }
     }
 
@@ -451,9 +450,7 @@ fn apply_window_opacity(hwnd: HWND, opacity_alpha: u8) -> Result<(), String> {
 }
 
 fn apply_window_border(hwnd: HWND, visual_emphasis: &WindowVisualEmphasis) {
-    let border_color = visual_emphasis
-        .border_color_rgb
-        .unwrap_or(DWMWA_COLOR_NONE);
+    let border_color = visual_emphasis.border_color_rgb.unwrap_or(DWMWA_COLOR_NONE);
     let _ = visual_emphasis.border_thickness_px;
     set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, border_color);
 }

@@ -10,6 +10,11 @@ layout {
 
 input {
   bind-control-mode "coexistence"
+  touchpad-override true
+  touchpad-gesture "three-finger-swipe-left" "focus-next"
+  touchpad-gesture "three-finger-swipe-right" "focus-prev"
+  touchpad-gesture "four-finger-swipe-up" "toggle-overview"
+  touchpad-gesture "four-finger-swipe-down" "toggle-overview"
   hotkey "Win+H" "focus-prev"
   hotkey "Win+J" "focus-next"
   hotkey "Win+Ctrl+Shift+F" "toggle-floating"

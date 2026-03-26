@@ -37,6 +37,18 @@ pub struct HotkeyBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TouchpadGestureBinding {
+    pub gesture: String,
+    pub command: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TouchpadConfig {
+    pub override_enabled: bool,
+    pub gestures: Vec<TouchpadGestureBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowRuleMatch {
     pub process_name: Option<String>,
     pub class_substring: Option<String>,
@@ -64,6 +76,7 @@ pub struct WindowRule {
 pub struct LoadedConfig {
     pub projection: ConfigProjection,
     pub hotkeys: Vec<HotkeyBinding>,
+    pub touchpad: TouchpadConfig,
     pub rules: Vec<WindowRule>,
 }
 
@@ -143,6 +156,7 @@ pub fn default_loaded_config(
             ..ConfigProjection::default()
         },
         hotkeys: default_hotkeys(),
+        touchpad: default_touchpad_config(),
         rules: Vec::new(),
     }
 }
@@ -155,6 +169,13 @@ fn default_hotkeys() -> Vec<HotkeyBinding> {
             command: (*command).to_string(),
         })
         .collect()
+}
+
+fn default_touchpad_config() -> TouchpadConfig {
+    TouchpadConfig {
+        override_enabled: false,
+        gestures: Vec::new(),
+    }
 }
 
 pub fn load_or_default(
@@ -194,6 +215,7 @@ fn parse_kdl_document(
         ..ConfigProjection::default()
     };
     let mut hotkeys = Vec::new();
+    let mut touchpad = default_touchpad_config();
     let mut rules = Vec::new();
 
     for node in document.nodes() {
@@ -213,7 +235,7 @@ fn parse_kdl_document(
                 }
             }
             "layout" => parse_layout(node, &mut projection)?,
-            "input" => parse_input(node, &mut projection, &mut hotkeys)?,
+            "input" => parse_input(node, &mut projection, &mut hotkeys, &mut touchpad)?,
             "rules" => parse_rules(node, &mut rules)?,
             _ => {}
         }
@@ -229,6 +251,7 @@ fn parse_kdl_document(
     Ok(LoadedConfig {
         projection,
         hotkeys,
+        touchpad,
         rules,
     })
 }
@@ -244,6 +267,7 @@ fn parse_kdl_like_source(
         ..ConfigProjection::default()
     };
     let mut hotkeys = Vec::new();
+    let mut touchpad = default_touchpad_config();
     let mut rules = Vec::new();
     let mut current_section: Option<String> = None;
     let mut current_rule: Option<WindowRule> = None;
@@ -448,6 +472,29 @@ fn parse_kdl_like_source(
                     };
                     hotkeys.push(HotkeyBinding { trigger, command });
                 }
+                "touchpad-override" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "input touchpad-override is missing value".to_string(),
+                        ));
+                    };
+                    touchpad.override_enabled = parse_bool_token(value, "input touchpad-override")?;
+                }
+                "touchpad-gesture" => {
+                    let Some(gesture) = tokens.get(1).cloned() else {
+                        return Err(ConfigError::Validation(
+                            "input touchpad-gesture is missing gesture".to_string(),
+                        ));
+                    };
+                    let Some(command) = tokens.get(2).cloned() else {
+                        return Err(ConfigError::Validation(
+                            "input touchpad-gesture is missing command".to_string(),
+                        ));
+                    };
+                    touchpad
+                        .gestures
+                        .push(TouchpadGestureBinding { gesture, command });
+                }
                 _ => {}
             },
             Some("rules") if current_rule.is_some() && !in_actions => {
@@ -548,6 +595,7 @@ fn parse_kdl_like_source(
     Ok(LoadedConfig {
         projection,
         hotkeys,
+        touchpad,
         rules,
     })
 }
@@ -661,6 +709,7 @@ fn parse_input(
     node: &KdlNode,
     projection: &mut ConfigProjection,
     hotkeys: &mut Vec<HotkeyBinding>,
+    touchpad: &mut TouchpadConfig,
 ) -> Result<(), ConfigError> {
     for child in child_nodes(node) {
         match child.name().value() {
@@ -677,6 +726,24 @@ fn parse_input(
                     ConfigError::Validation("input hotkey is missing command".to_string())
                 })?;
                 hotkeys.push(HotkeyBinding { trigger, command });
+            }
+            "touchpad-override" => {
+                touchpad.override_enabled = first_bool(child)?.ok_or_else(|| {
+                    ConfigError::Validation(
+                        "input touchpad-override is missing bool value".to_string(),
+                    )
+                })?;
+            }
+            "touchpad-gesture" => {
+                let gesture = nth_string(child, 0)?.ok_or_else(|| {
+                    ConfigError::Validation("input touchpad-gesture is missing gesture".to_string())
+                })?;
+                let command = nth_string(child, 1)?.ok_or_else(|| {
+                    ConfigError::Validation("input touchpad-gesture is missing command".to_string())
+                })?;
+                touchpad
+                    .gestures
+                    .push(TouchpadGestureBinding { gesture, command });
             }
             _ => {}
         }
@@ -934,6 +1001,16 @@ fn parse_non_negative_u32_token(value: &str, field_name: &str) -> Result<u32, Co
     })
 }
 
+fn parse_bool_token(value: &str, field_name: &str) -> Result<bool, ConfigError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::Validation(format!(
+            "{field_name} must be true or false"
+        ))),
+    }
+}
+
 fn rule_matches(rule: &WindowRule, input: &WindowRuleInput) -> bool {
     if let Some(process_name) = &rule.matchers.process_name {
         let Some(candidate_process) = &input.process_name else {
@@ -1062,6 +1139,7 @@ pub fn default_config_source() -> String {
         String::new(),
         "input {".to_string(),
         "  bind-control-mode \"coexistence\"".to_string(),
+        "  touchpad-override false".to_string(),
     ];
 
     lines.extend(
@@ -1133,6 +1211,8 @@ mod tests {
         assert_eq!(config.projection.layout_spacing, LayoutSpacing::default());
         assert_eq!(config.hotkeys.len(), 5);
         assert_eq!(config.hotkeys, super::default_hotkeys());
+        assert!(!config.touchpad.override_enabled);
+        assert!(config.touchpad.gestures.is_empty());
     }
 
     #[test]
@@ -1165,6 +1245,7 @@ mod tests {
         assert_eq!(config.projection.layout_spacing.floating_margin, 16);
         assert_eq!(config.rules.len(), 2);
         assert_eq!(config.projection.active_rule_count, 2);
+        assert!(!config.touchpad.override_enabled);
     }
 
     #[test]
@@ -1233,6 +1314,7 @@ mod tests {
 
         assert_eq!(created_path, path);
         assert!(source.contains("bind-control-mode \"coexistence\""));
+        assert!(source.contains("touchpad-override false"));
         assert!(source.contains("strip-scroll-step 240"));
         assert!(source.contains("outer-padding 16"));
         assert!(source.contains("column-gap 12"));
@@ -1259,6 +1341,28 @@ input {
             config.projection.bind_control_mode,
             BindControlMode::ManagedShell
         );
+    }
+
+    #[test]
+    fn parses_touchpad_override_and_gestures_from_kdl_like_fallback() {
+        let source = r#"
+input {
+  touchpad-override true
+  touchpad-gesture "three-finger-swipe-left" "focus-next"
+  touchpad-gesture "three-finger-swipe-right" "focus-prev"
+}
+"#;
+
+        let config = parse_kdl_like_source(source, std::path::Path::new(DEFAULT_CONFIG_PATH), 10)
+            .expect("kdl-like fallback should parse touchpad config");
+
+        assert!(config.touchpad.override_enabled);
+        assert_eq!(config.touchpad.gestures.len(), 2);
+        assert_eq!(
+            config.touchpad.gestures[0].gesture,
+            "three-finger-swipe-left"
+        );
+        assert_eq!(config.touchpad.gestures[0].command, "focus-next");
     }
 
     fn unique_test_path(label: &str) -> std::path::PathBuf {
