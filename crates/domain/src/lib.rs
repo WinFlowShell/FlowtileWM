@@ -18,10 +18,10 @@ pub use geometry::{Point, Rect, Size};
 pub use ids::{ColumnId, CorrelationId, MonitorId, WindowId, WorkspaceId, WorkspaceSetId};
 pub use model::{
     BindControlMode, CapturePolicy, Column, ColumnMode, ConfigProjection, DiagnosticsSummary,
-    FloatingLayer, FocusOrigin, FocusState, LayoutState, MaximizedState, Monitor, OverviewState,
-    RestoreTarget, RuntimeMode, RuntimeState, ScrollingStrip, StripLayoutMode, TopologyRole,
-    WidthSemantics, WindowClassification, WindowLayer, WindowNode, WmState, Workspace,
-    WorkspaceSet, all_column_modes,
+    EdgeInsets, FloatingLayer, FocusOrigin, FocusState, LayoutSpacing, LayoutState, MaximizedState,
+    Monitor, OverviewState, RestoreTarget, RuntimeMode, RuntimeState, ScrollingStrip,
+    StripLayoutMode, TopologyRole, WidthSemantics, WindowClassification, WindowLayer, WindowNode,
+    WmState, Workspace, WorkspaceSet, all_column_modes,
 };
 
 pub const VERSION_LINE: &str = "v.1.0.0";

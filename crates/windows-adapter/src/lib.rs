@@ -3,19 +3,15 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
-    path::PathBuf,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     time::Duration,
-};
-#[cfg(not(windows))]
-use std::{
-    io::{BufRead, BufReader, Write},
-    process::{Child, Command, Stdio},
-    thread::{self, JoinHandle},
 };
 
 use flowtile_domain::Rect;
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(windows))]
+compile_error!("flowtile-windows-adapter currently supports only Windows builds.");
 
 #[cfg(windows)]
 mod dpi;
@@ -31,12 +27,6 @@ pub const FALLBACK_DISCOVERY_PATH: &str = "full-window-scan";
 pub const TILED_VISUAL_OVERLAP_X_PX: i32 = 1;
 pub const WINDOW_SWITCH_ANIMATION_DURATION_MS: u16 = 90;
 pub const WINDOW_SWITCH_ANIMATION_FRAME_COUNT: u8 = 6;
-#[cfg(not(windows))]
-const APPLY_SCRIPT_NAME: &str = "apply-geometry.ps1";
-#[cfg(not(windows))]
-const OBSERVE_SCRIPT_NAME: &str = "observe-platform.ps1";
-#[cfg(not(windows))]
-const SCAN_SCRIPT_NAME: &str = "scan-platform.ps1";
 #[cfg(windows)]
 const NATIVE_OBSERVER_COMPONENT: &str = "native-observer";
 
@@ -281,22 +271,11 @@ impl From<std::io::Error> for ObservationStreamError {
 
 pub(crate) enum ObserverMessage {
     Envelope(ObservationEnvelope),
-    #[cfg(not(windows))]
-    Failure(String),
-}
-
-#[cfg(not(windows))]
-struct ScriptObservationRuntime {
-    child: Child,
-    stdout_thread: Option<JoinHandle<()>>,
-    stderr_thread: Option<JoinHandle<()>>,
 }
 
 enum ObservationBackend {
     #[cfg(windows)]
     Native(native_observer::NativeObservationRuntime),
-    #[cfg(not(windows))]
-    Script(ScriptObservationRuntime),
 }
 
 pub struct ObservationStream {
@@ -311,10 +290,6 @@ impl ObservationStream {
     ) -> Result<ObservationEnvelope, ObservationStreamError> {
         match self.receiver.recv_timeout(timeout) {
             Ok(ObserverMessage::Envelope(envelope)) => Ok(envelope),
-            #[cfg(not(windows))]
-            Ok(ObserverMessage::Failure(message)) => {
-                Err(ObservationStreamError::Adapter(self.failure_error(message)))
-            }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(error) = self.try_backend_exit_error()? {
                     return Err(ObservationStreamError::Adapter(error));
@@ -329,17 +304,6 @@ impl ObservationStream {
 
                 Err(ObservationStreamError::ChannelClosed)
             }
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn failure_error(&self, message: String) -> WindowsAdapterError {
-        match &self.backend {
-            #[cfg(not(windows))]
-            ObservationBackend::Script(_) => WindowsAdapterError::ScriptFailed {
-                script: OBSERVE_SCRIPT_NAME,
-                message,
-            },
         }
     }
 
@@ -358,17 +322,6 @@ impl ObservationStream {
                     Ok(None)
                 }
             }
-            #[cfg(not(windows))]
-            ObservationBackend::Script(runtime) => {
-                if let Some(status) = runtime.child.try_wait()? {
-                    Ok(Some(WindowsAdapterError::ScriptFailed {
-                        script: OBSERVE_SCRIPT_NAME,
-                        message: format!("observer exited with status {status}"),
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }
         }
     }
 }
@@ -378,36 +331,15 @@ impl Drop for ObservationStream {
         match &mut self.backend {
             #[cfg(windows)]
             ObservationBackend::Native(runtime) => runtime.shutdown(),
-            #[cfg(not(windows))]
-            ObservationBackend::Script(runtime) => {
-                let _ = runtime.child.kill();
-                let _ = runtime.child.wait();
-
-                if let Some(stdout_thread) = runtime.stdout_thread.take() {
-                    let _ = stdout_thread.join();
-                }
-                if let Some(stderr_thread) = runtime.stderr_thread.take() {
-                    let _ = stderr_thread.join();
-                }
-            }
         }
     }
 }
 
 #[derive(Debug)]
 pub enum WindowsAdapterError {
-    EmptyScriptOutput(&'static str),
-    InvalidJson {
-        script: &'static str,
-        source: serde_json::Error,
-    },
     Io(std::io::Error),
     RuntimeFailed {
         component: &'static str,
-        message: String,
-    },
-    ScriptFailed {
-        script: &'static str,
         message: String,
     },
 }
@@ -415,21 +347,9 @@ pub enum WindowsAdapterError {
 impl fmt::Display for WindowsAdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyScriptOutput(script) => {
-                write!(formatter, "script '{script}' returned empty output")
-            }
-            Self::InvalidJson { script, source } => {
-                write!(
-                    formatter,
-                    "script '{script}' returned invalid json: {source}"
-                )
-            }
             Self::Io(source) => source.fmt(formatter),
             Self::RuntimeFailed { component, message } => {
                 write!(formatter, "{component} failed: {message}")
-            }
-            Self::ScriptFailed { script, message } => {
-                write!(formatter, "script '{script}' failed: {message}")
             }
         }
     }
@@ -443,170 +363,28 @@ impl From<std::io::Error> for WindowsAdapterError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WindowsAdapter {
-    powershell_executable: String,
-    script_root: PathBuf,
-}
-
-impl Default for WindowsAdapter {
-    fn default() -> Self {
-        Self {
-            powershell_executable: "pwsh".to_string(),
-            script_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts"),
-        }
-    }
-}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WindowsAdapter;
 
 impl WindowsAdapter {
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_paths(
-        powershell_executable: impl Into<String>,
-        script_root: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            powershell_executable: powershell_executable.into(),
-            script_root: script_root.into(),
-        }
+        Self
     }
 
     pub fn spawn_observer(
         &self,
         options: LiveObservationOptions,
     ) -> Result<ObservationStream, WindowsAdapterError> {
-        #[cfg(windows)]
-        {
-            let (sender, receiver) = mpsc::channel::<ObserverMessage>();
-            let runtime = native_observer::spawn(options, sender)?;
-            Ok(ObservationStream {
-                backend: ObservationBackend::Native(runtime),
-                receiver,
-            })
-        }
-
-        #[cfg(not(windows))]
-        {
-            let script_path = self.script_path(OBSERVE_SCRIPT_NAME);
-            let mut command = Command::new(&self.powershell_executable);
-            command
-                .arg("-NoProfile")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-File")
-                .arg(&script_path)
-                .arg("-FallbackScanIntervalMs")
-                .arg(options.fallback_scan_interval_ms.to_string())
-                .arg("-DebounceMs")
-                .arg(options.debounce_ms.to_string())
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            let mut child = command.spawn()?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or(WindowsAdapterError::EmptyScriptOutput(OBSERVE_SCRIPT_NAME))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or(WindowsAdapterError::EmptyScriptOutput(OBSERVE_SCRIPT_NAME))?;
-            let (sender, receiver) = mpsc::channel::<ObserverMessage>();
-
-            let stdout_sender = sender.clone();
-            let stdout_thread = thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            match serde_json::from_str::<ObservationEnvelope>(line) {
-                                Ok(envelope) => {
-                                    if stdout_sender
-                                        .send(ObserverMessage::Envelope(envelope))
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(source) => {
-                                    let _ = stdout_sender.send(ObserverMessage::Failure(format!(
-                                        "observer returned invalid json: {source}"
-                                    )));
-                                    break;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let _ = stdout_sender.send(ObserverMessage::Failure(format!(
-                                "failed to read observer stdout: {error}"
-                            )));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stderr_thread = thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            let _ = sender.send(ObserverMessage::Failure(line.to_string()));
-                            break;
-                        }
-                        Err(error) => {
-                            let _ = sender.send(ObserverMessage::Failure(format!(
-                                "failed to read observer stderr: {error}"
-                            )));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            Ok(ObservationStream {
-                backend: ObservationBackend::Script(ScriptObservationRuntime {
-                    child,
-                    stdout_thread: Some(stdout_thread),
-                    stderr_thread: Some(stderr_thread),
-                }),
-                receiver,
-            })
-        }
+        let (sender, receiver) = mpsc::channel::<ObserverMessage>();
+        let runtime = native_observer::spawn(options, sender)?;
+        Ok(ObservationStream {
+            backend: ObservationBackend::Native(runtime),
+            receiver,
+        })
     }
 
     pub fn scan_snapshot(&self) -> Result<PlatformSnapshot, WindowsAdapterError> {
-        #[cfg(windows)]
-        {
-            native_snapshot::scan_snapshot()
-        }
-
-        #[cfg(not(windows))]
-        {
-            let stdout = self.run_script(SCAN_SCRIPT_NAME, None)?;
-            let mut snapshot =
-                serde_json::from_str::<PlatformSnapshot>(&stdout).map_err(|source| {
-                    WindowsAdapterError::InvalidJson {
-                        script: SCAN_SCRIPT_NAME,
-                        source,
-                    }
-                })?;
-            snapshot.sort_for_stability();
-            Ok(snapshot)
-        }
+        native_snapshot::scan_snapshot()
     }
 
     pub fn apply_operations(
@@ -617,86 +395,8 @@ impl WindowsAdapter {
             return Ok(ApplyBatchResult::default());
         }
 
-        #[cfg(windows)]
-        {
-            Ok(native_apply::apply_operations(operations))
-        }
-
-        #[cfg(not(windows))]
-        {
-            let payload =
-                serde_json::to_string(&ApplyRequest { operations }).map_err(|source| {
-                    WindowsAdapterError::ScriptFailed {
-                        script: APPLY_SCRIPT_NAME,
-                        message: format!("failed to encode apply request: {source}"),
-                    }
-                })?;
-            let stdout = self.run_script(APPLY_SCRIPT_NAME, Some(&payload))?;
-            serde_json::from_str::<ApplyBatchResult>(&stdout).map_err(|source| {
-                WindowsAdapterError::InvalidJson {
-                    script: APPLY_SCRIPT_NAME,
-                    source,
-                }
-            })
-        }
+        Ok(native_apply::apply_operations(operations))
     }
-
-    #[cfg(not(windows))]
-    fn run_script(
-        &self,
-        script_name: &'static str,
-        stdin_payload: Option<&str>,
-    ) -> Result<String, WindowsAdapterError> {
-        let script_path = self.script_path(script_name);
-        let mut command = Command::new(&self.powershell_executable);
-        command
-            .arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(&script_path)
-            .stdin(if stdin_payload.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = command.spawn()?;
-        if let Some(payload) = stdin_payload
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            stdin.write_all(payload.as_bytes())?;
-        }
-
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(WindowsAdapterError::ScriptFailed {
-                script: script_name,
-                message,
-            });
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            return Err(WindowsAdapterError::EmptyScriptOutput(script_name));
-        }
-
-        Ok(stdout)
-    }
-
-    #[cfg(not(windows))]
-    fn script_path(&self, script_name: &'static str) -> PathBuf {
-        self.script_root.join(script_name)
-    }
-}
-
-#[cfg(not(windows))]
-#[derive(Serialize)]
-struct ApplyRequest<'a> {
-    operations: &'a [ApplyOperation],
 }
 
 pub fn needs_geometry_apply(actual: Rect, desired: Rect) -> bool {

@@ -11,7 +11,7 @@ use flowtile_domain::{
     BindControlMode, CorrelationId, DomainEvent, DomainEventPayload, FocusBehavior, MonitorId,
     RuntimeMode, TopologyRole, WidthSemantics, WindowId, WindowLayer, WindowPlacement, WmState,
 };
-use flowtile_layout_engine::recompute_workspace;
+use flowtile_layout_engine::{padded_tiled_viewport, recompute_workspace};
 use flowtile_windows_adapter::{
     ApplyBatchResult, ApplyOperation, ObservationEnvelope, ObservationKind,
     PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff,
@@ -475,12 +475,12 @@ impl CoreDaemonRuntime {
                 },
                 &self.active_config.projection,
             );
-            let discovery_width = discovered_width_semantics(&decision, window);
             let monitor_id = if follow_active_context {
                 self.discovery_target_monitor_id(actual_monitor_id, decision.managed)
             } else {
                 actual_monitor_id
             };
+            let discovery_width = self.discovered_width_semantics(&decision, window, monitor_id);
             let placement = self.discovery_placement_for_window(
                 monitor_id,
                 &decision,
@@ -1015,6 +1015,31 @@ impl CoreDaemonRuntime {
         self.next_correlation_id += 1;
         correlation_id
     }
+
+    fn discovered_width_semantics(
+        &self,
+        decision: &flowtile_config_rules::WindowRuleDecision,
+        window: &PlatformWindowSnapshot,
+        target_monitor_id: MonitorId,
+    ) -> WidthSemantics {
+        if decision.layer != WindowLayer::Tiled || decision.width_semantics_explicit {
+            return decision.width_semantics;
+        }
+
+        let observed_width = window.rect.width.max(1);
+        let maximum_tiled_width = self.maximum_tiled_width_for_monitor(target_monitor_id);
+
+        WidthSemantics::Fixed(observed_width.min(maximum_tiled_width))
+    }
+
+    fn maximum_tiled_width_for_monitor(&self, monitor_id: MonitorId) -> u32 {
+        self.store
+            .state()
+            .monitors
+            .get(&monitor_id)
+            .map(|monitor| padded_tiled_viewport(monitor.work_area_rect, &self.active_config.projection).width.max(1))
+            .unwrap_or(1)
+    }
 }
 
 fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<String> {
@@ -1023,6 +1048,7 @@ fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<
     if previous.projection.strip_scroll_step != current.projection.strip_scroll_step
         || previous.projection.default_column_mode != current.projection.default_column_mode
         || previous.projection.default_column_width != current.projection.default_column_width
+        || previous.projection.layout_spacing != current.projection.layout_spacing
     {
         changed_sections.push("layout".to_string());
     }
@@ -1039,17 +1065,6 @@ fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<
     }
 
     changed_sections
-}
-
-fn discovered_width_semantics(
-    decision: &flowtile_config_rules::WindowRuleDecision,
-    window: &PlatformWindowSnapshot,
-) -> WidthSemantics {
-    if decision.layer == WindowLayer::Tiled && !decision.width_semantics_explicit {
-        WidthSemantics::Fixed(window.rect.width.max(1))
-    } else {
-        decision.width_semantics
-    }
 }
 
 fn operations_are_activation_only(
@@ -1151,7 +1166,7 @@ mod tests {
     use crate::CoreDaemonRuntime;
 
     use super::{
-        ApplyPlanMode, discovered_width_semantics, operations_are_activation_only,
+        ApplyPlanMode, operations_are_activation_only,
         should_auto_unwind_after_desync,
     };
 
@@ -1219,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_without_explicit_width_bootstraps_from_observed_rect() {
+    fn discovery_without_explicit_width_uses_observed_width_below_padded_limit() {
         let decision = WindowRuleDecision {
             layer: WindowLayer::Tiled,
             managed: true,
@@ -1244,9 +1259,52 @@ mod tests {
             management_candidate: true,
         };
 
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let monitor_id = runtime
+            .store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
+
         assert_eq!(
-            discovered_width_semantics(&decision, &window),
+            runtime.discovered_width_semantics(&decision, &window, monitor_id),
             WidthSemantics::Fixed(420)
+        );
+    }
+
+    #[test]
+    fn discovery_without_explicit_width_clamps_observed_width_to_padded_limit() {
+        let decision = WindowRuleDecision {
+            layer: WindowLayer::Tiled,
+            managed: true,
+            column_mode: flowtile_domain::ColumnMode::Normal,
+            width_semantics: WidthSemantics::MonitorFraction {
+                numerator: 1,
+                denominator: 2,
+            },
+            width_semantics_explicit: false,
+            matched_rule_ids: Vec::new(),
+        };
+        let window = PlatformWindowSnapshot {
+            hwnd: 100,
+            title: "Window 100".to_string(),
+            class_name: "Notepad".to_string(),
+            process_id: 4242,
+            process_name: Some("notepad".to_string()),
+            rect: Rect::new(0, 0, 4000, 900),
+            monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+            is_visible: true,
+            is_focused: true,
+            management_candidate: true,
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let monitor_id = runtime
+            .store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
+
+        assert_eq!(
+            runtime.discovered_width_semantics(&decision, &window, monitor_id),
+            WidthSemantics::Fixed(1168)
         );
     }
 
@@ -1272,15 +1330,20 @@ mod tests {
             is_focused: true,
             management_candidate: true,
         };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let monitor_id = runtime
+            .store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 1200, 900), 96, true);
 
         assert_eq!(
-            discovered_width_semantics(&decision, &window),
+            runtime.discovered_width_semantics(&decision, &window, monitor_id),
             WidthSemantics::Fixed(560)
         );
     }
 
     #[test]
-    fn initial_snapshot_gapless_plan_uses_observed_bootstrap_widths() {
+    fn initial_snapshot_plan_uses_observed_bootstrap_widths_inside_padded_viewport() {
         let snapshot = PlatformSnapshot {
             foreground_hwnd: Some(100),
             monitors: vec![PlatformMonitorSnapshot {
@@ -1337,15 +1400,81 @@ mod tests {
             .plan_apply_operations(&snapshot)
             .expect("apply plan should be computed");
 
-        assert_eq!(planned_operations.len(), 2);
-        assert_eq!(planned_operations[0].hwnd, 101);
-        assert_eq!(planned_operations[0].rect.x, 320);
+        assert_eq!(planned_operations.len(), 3);
+        assert_eq!(planned_operations[0].hwnd, 100);
+        assert_eq!(planned_operations[0].rect.x, 16);
         assert_eq!(planned_operations[0].rect.width, 320);
         assert!(planned_operations[0].suppress_visual_gap);
-        assert_eq!(planned_operations[1].hwnd, 102);
-        assert_eq!(planned_operations[1].rect.x, 640);
+        assert_eq!(planned_operations[1].hwnd, 101);
+        assert_eq!(planned_operations[1].rect.x, 348);
         assert_eq!(planned_operations[1].rect.width, 320);
         assert!(planned_operations[1].suppress_visual_gap);
+        assert_eq!(planned_operations[2].hwnd, 102);
+        assert_eq!(planned_operations[2].rect.x, 680);
+        assert_eq!(planned_operations[2].rect.width, 320);
+        assert!(planned_operations[2].suppress_visual_gap);
+    }
+
+    #[test]
+    fn focus_next_to_last_bootstrap_column_keeps_right_outer_padding() {
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 1180, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(1180, 0, 1180, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(2),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus navigation should succeed");
+
+        let planned_operations = runtime
+            .plan_apply_operations_with_mode(&snapshot, ApplyPlanMode::WindowSwitchNavigation)
+            .expect("apply plan should be computed");
+        let last = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .expect("last column operation should exist");
+
+        assert_eq!(last.rect.width, 1168);
+        assert_eq!(last.rect.x + last.rect.width as i32, 1184);
     }
 
     #[test]

@@ -368,6 +368,7 @@ pub struct ConfigProjection {
     pub strip_scroll_step: u32,
     pub default_column_mode: ColumnMode,
     pub default_column_width: WidthSemantics,
+    pub layout_spacing: LayoutSpacing,
     pub active_rule_count: usize,
 }
 
@@ -382,7 +383,60 @@ impl Default for ConfigProjection {
             strip_scroll_step: 240,
             default_column_mode: ColumnMode::Normal,
             default_column_width: WidthSemantics::default(),
+            layout_spacing: LayoutSpacing::default(),
             active_rule_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EdgeInsets {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl EdgeInsets {
+    pub const fn all(value: u32) -> Self {
+        Self {
+            left: value,
+            top: value,
+            right: value,
+            bottom: value,
+        }
+    }
+
+    pub const fn horizontal(self) -> u32 {
+        self.left.saturating_add(self.right)
+    }
+
+    pub const fn vertical(self) -> u32 {
+        self.top.saturating_add(self.bottom)
+    }
+}
+
+impl Default for EdgeInsets {
+    fn default() -> Self {
+        Self::all(16)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayoutSpacing {
+    pub outer_padding: EdgeInsets,
+    pub column_gap: u32,
+    pub window_gap: u32,
+    pub floating_margin: u32,
+}
+
+impl Default for LayoutSpacing {
+    fn default() -> Self {
+        Self {
+            outer_padding: EdgeInsets::default(),
+            column_gap: 12,
+            window_gap: 12,
+            floating_margin: 16,
         }
     }
 }

@@ -452,7 +452,7 @@ mod tests {
                 .as_ref()
                 .expect("layout should exist")
                 .scroll_offset,
-            220
+            232
         );
     }
 
@@ -998,7 +998,7 @@ mod tests {
                 .as_ref()
                 .expect("layout should exist")
                 .scroll_offset,
-            300
+            356
         );
     }
 
@@ -1111,7 +1111,7 @@ mod tests {
                 .as_ref()
                 .expect("layout should exist")
                 .scroll_offset,
-            400
+            456
         );
         assert_eq!(
             store.state().focus.focused_window_id,
@@ -1123,7 +1123,7 @@ mod tests {
                 .as_ref()
                 .expect("layout should exist")
                 .scroll_offset,
-            400
+            456
         );
     }
 
@@ -1177,10 +1177,10 @@ mod tests {
         assert_eq!(projection.scroll_offset, 0);
         assert_eq!(
             geometry_x_width(projection, flowtile_domain::WindowId::new(1)).0,
-            560
+            532
         );
         let second_geometry = geometry_x_width(projection, flowtile_domain::WindowId::new(2));
-        assert_eq!(second_geometry.0, 780);
+        assert_eq!(second_geometry.0, 764);
         assert_eq!(
             second_geometry.0 + second_geometry.1 as i32,
             projection.viewport.x + projection.viewport.width as i32
@@ -1280,7 +1280,7 @@ mod tests {
                 .as_ref()
                 .expect("layout should exist")
                 .scroll_offset,
-            200
+            244
         );
     }
 
@@ -1353,7 +1353,7 @@ mod tests {
                 .map(|window_id| window_id.get()),
             Some(2)
         );
-        assert_eq!(projection.scroll_offset, 200);
+        assert_eq!(projection.scroll_offset, 244);
     }
 
     #[test]
@@ -1511,7 +1511,7 @@ mod tests {
                 .as_ref()
                 .expect("layout should exist")
                 .scroll_offset,
-            200
+            244
         );
     }
 
@@ -1616,16 +1616,16 @@ mod tests {
 
         assert_eq!(projection.workspace_id, workspace_id);
         assert_eq!(projection.scroll_offset, 240);
-        assert_eq!(geometry_x_width(projection, first_window_id).0, -240);
-        assert_eq!(geometry_x_width(projection, second_window_id).0, 60);
-        assert_eq!(geometry_x_width(projection, third_window_id).0, 360);
+        assert_eq!(geometry_x_width(projection, first_window_id).0, -224);
+        assert_eq!(geometry_x_width(projection, second_window_id).0, 88);
+        assert_eq!(geometry_x_width(projection, third_window_id).0, 400);
         assert_eq!(planned_operations.len(), 3);
         assert_eq!(
             planned_operations
                 .iter()
                 .find(|operation| operation.hwnd == 100)
                 .map(|operation| operation.rect.x),
-            Some(-240)
+            Some(-224)
         );
         assert_eq!(
             planned_operations
@@ -1639,7 +1639,7 @@ mod tests {
                 .iter()
                 .find(|operation| operation.hwnd == 101)
                 .map(|operation| operation.rect.x),
-            Some(60)
+            Some(88)
         );
         assert_eq!(
             planned_operations
@@ -1653,7 +1653,7 @@ mod tests {
                 .iter()
                 .find(|operation| operation.hwnd == 102)
                 .map(|operation| operation.rect.x),
-            Some(360)
+            Some(400)
         );
         assert_eq!(
             planned_operations

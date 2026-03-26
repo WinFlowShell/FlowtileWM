@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use flowtile_domain::{BindControlMode, ColumnMode, ConfigProjection, WidthSemantics, WindowLayer};
+use flowtile_domain::{
+    BindControlMode, ColumnMode, ConfigProjection, EdgeInsets, WidthSemantics, WindowLayer,
+};
 use kdl::{KdlDocument, KdlNode, KdlValue};
 
 pub const PREFERRED_CONFIG_FORMAT: &str = "KDL";
@@ -338,6 +340,79 @@ fn parse_kdl_like_source(
                         )
                     })?;
                 }
+                "outer-padding" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout outer-padding is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.outer_padding = EdgeInsets::all(
+                        parse_non_negative_u32_token(value, "layout outer-padding")?,
+                    );
+                }
+                "outer-padding-left" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout outer-padding-left is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.outer_padding.left =
+                        parse_non_negative_u32_token(value, "layout outer-padding-left")?;
+                }
+                "outer-padding-top" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout outer-padding-top is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.outer_padding.top =
+                        parse_non_negative_u32_token(value, "layout outer-padding-top")?;
+                }
+                "outer-padding-right" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout outer-padding-right is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.outer_padding.right =
+                        parse_non_negative_u32_token(value, "layout outer-padding-right")?;
+                }
+                "outer-padding-bottom" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout outer-padding-bottom is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.outer_padding.bottom =
+                        parse_non_negative_u32_token(value, "layout outer-padding-bottom")?;
+                }
+                "column-gap" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout column-gap is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.column_gap =
+                        parse_non_negative_u32_token(value, "layout column-gap")?;
+                }
+                "window-gap" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout window-gap is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.window_gap =
+                        parse_non_negative_u32_token(value, "layout window-gap")?;
+                }
+                "floating-margin" => {
+                    let Some(value) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "layout floating-margin is missing value".to_string(),
+                        ));
+                    };
+                    projection.layout_spacing.floating_margin =
+                        parse_non_negative_u32_token(value, "layout floating-margin")?;
+                }
                 "default-column-mode" => {
                     let Some(mode) = tokens.get(1) else {
                         return Err(ConfigError::Validation(
@@ -517,6 +592,54 @@ fn parse_layout(node: &KdlNode, projection: &mut ConfigProjection) -> Result<(),
                             "layout strip-scroll-step must be positive".to_string(),
                         )
                     })?;
+                }
+            }
+            "outer-padding" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.outer_padding =
+                        EdgeInsets::all(parse_non_negative_u32(value, "layout outer-padding")?);
+                }
+            }
+            "outer-padding-left" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.outer_padding.left =
+                        parse_non_negative_u32(value, "layout outer-padding-left")?;
+                }
+            }
+            "outer-padding-top" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.outer_padding.top =
+                        parse_non_negative_u32(value, "layout outer-padding-top")?;
+                }
+            }
+            "outer-padding-right" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.outer_padding.right =
+                        parse_non_negative_u32(value, "layout outer-padding-right")?;
+                }
+            }
+            "outer-padding-bottom" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.outer_padding.bottom =
+                        parse_non_negative_u32(value, "layout outer-padding-bottom")?;
+                }
+            }
+            "column-gap" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.column_gap =
+                        parse_non_negative_u32(value, "layout column-gap")?;
+                }
+            }
+            "window-gap" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.window_gap =
+                        parse_non_negative_u32(value, "layout window-gap")?;
+                }
+            }
+            "floating-margin" => {
+                if let Some(value) = first_integer(child)? {
+                    projection.layout_spacing.floating_margin =
+                        parse_non_negative_u32(value, "layout floating-margin")?;
                 }
             }
             "default-column-mode" => {
@@ -799,6 +922,18 @@ fn tokenize_kdl_like(line: &str) -> Result<Vec<String>, ConfigError> {
     Ok(tokens)
 }
 
+fn parse_non_negative_u32(value: i64, field_name: &str) -> Result<u32, ConfigError> {
+    u32::try_from(value).map_err(|_| {
+        ConfigError::Validation(format!("{field_name} must be a non-negative integer"))
+    })
+}
+
+fn parse_non_negative_u32_token(value: &str, field_name: &str) -> Result<u32, ConfigError> {
+    value.parse::<u32>().map_err(|_| {
+        ConfigError::Validation(format!("{field_name} must be a non-negative integer"))
+    })
+}
+
 fn rule_matches(rule: &WindowRule, input: &WindowRuleInput) -> bool {
     if let Some(process_name) = &rule.matchers.process_name {
         let Some(candidate_process) = &input.process_name else {
@@ -919,6 +1054,10 @@ pub fn default_config_source() -> String {
         "  strip-scroll-step 240".to_string(),
         "  default-column-mode \"normal\"".to_string(),
         "  default-column-width \"fraction\" 1 2".to_string(),
+        "  outer-padding 16".to_string(),
+        "  column-gap 12".to_string(),
+        "  window-gap 12".to_string(),
+        "  floating-margin 16".to_string(),
         "}".to_string(),
         String::new(),
         "input {".to_string(),
@@ -968,7 +1107,9 @@ mod tests {
         default_loaded_config, ensure_default_config, load_from_path, load_or_default,
         parse_kdl_like_source,
     };
-    use flowtile_domain::{BindControlMode, ColumnMode, WidthSemantics, WindowLayer};
+    use flowtile_domain::{
+        BindControlMode, ColumnMode, EdgeInsets, LayoutSpacing, WidthSemantics, WindowLayer,
+    };
 
     #[test]
     fn exposes_expected_bootstrap_contract() {
@@ -989,6 +1130,7 @@ mod tests {
         );
         assert_eq!(config.projection.strip_scroll_step, 240);
         assert_eq!(config.projection.default_column_mode, ColumnMode::Normal);
+        assert_eq!(config.projection.layout_spacing, LayoutSpacing::default());
         assert_eq!(config.hotkeys.len(), 5);
         assert_eq!(config.hotkeys, super::default_hotkeys());
     }
@@ -1014,6 +1156,13 @@ mod tests {
                 denominator: 2
             }
         );
+        assert_eq!(
+            config.projection.layout_spacing.outer_padding,
+            EdgeInsets::all(16)
+        );
+        assert_eq!(config.projection.layout_spacing.column_gap, 12);
+        assert_eq!(config.projection.layout_spacing.window_gap, 12);
+        assert_eq!(config.projection.layout_spacing.floating_margin, 16);
         assert_eq!(config.rules.len(), 2);
         assert_eq!(config.projection.active_rule_count, 2);
     }
@@ -1085,6 +1234,10 @@ mod tests {
         assert_eq!(created_path, path);
         assert!(source.contains("bind-control-mode \"coexistence\""));
         assert!(source.contains("strip-scroll-step 240"));
+        assert!(source.contains("outer-padding 16"));
+        assert!(source.contains("column-gap 12"));
+        assert!(source.contains("window-gap 12"));
+        assert!(source.contains("floating-margin 16"));
         assert!(source.contains("hotkey \"Win+H\" \"focus-prev\""));
         assert!(source.contains("hotkey \"Win+J\" \"focus-next\""));
         assert!(!source.contains("hotkey \"Alt+J\" \"focus-next\""));

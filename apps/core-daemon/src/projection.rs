@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use flowtile_domain::{FocusOrigin, WindowClassification, WindowLayer};
 use flowtile_ipc::{
-    ConfigProjection, DiagnosticsProjection, FocusProjection, OutputProjection, OverviewProjection,
-    RectProjection, SnapshotProjection, WindowProjection, WorkspaceProjection,
+    ConfigProjection, DiagnosticsProjection, FocusProjection, InsetsProjection, OutputProjection,
+    OverviewProjection, RectProjection, SnapshotProjection, WindowProjection, WorkspaceProjection,
 };
 use flowtile_windows_adapter::PlatformWindowSnapshot;
 use flowtile_wm_core::CoreDaemonRuntime;
@@ -190,6 +190,15 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
                 .default_column_mode
                 .as_str()
                 .to_string(),
+            outer_padding: InsetsProjection {
+                left: state.config_projection.layout_spacing.outer_padding.left,
+                top: state.config_projection.layout_spacing.outer_padding.top,
+                right: state.config_projection.layout_spacing.outer_padding.right,
+                bottom: state.config_projection.layout_spacing.outer_padding.bottom,
+            },
+            column_gap: state.config_projection.layout_spacing.column_gap,
+            window_gap: state.config_projection.layout_spacing.window_gap,
+            floating_margin: state.config_projection.layout_spacing.floating_margin,
         },
     }
 }

@@ -195,6 +195,18 @@ pub struct ConfigProjection {
     pub active_rule_count: usize,
     pub strip_scroll_step: u32,
     pub default_column_mode: String,
+    pub outer_padding: InsetsProjection,
+    pub column_gap: u32,
+    pub window_gap: u32,
+    pub floating_margin: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InsetsProjection {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
 }
 
 impl IpcRequest {

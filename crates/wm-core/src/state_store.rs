@@ -1,10 +1,10 @@
 use flowtile_diagnostics::{layout_recomputed, transition_applied};
 use flowtile_domain::{
     Column, ColumnId, ColumnMode, DomainEvent, DomainEventPayload, FocusBehavior, FocusOrigin,
-    MaximizedState, MonitorId, NavigationScope, RestoreTarget, RuntimeMode, WidthSemantics,
+    MaximizedState, MonitorId, NavigationScope, Rect, RestoreTarget, RuntimeMode, WidthSemantics,
     WindowId, WindowLayer, WindowNode, WindowPlacement, WmState, WorkspaceId,
 };
-use flowtile_layout_engine::recompute_workspace;
+use flowtile_layout_engine::{padded_tiled_viewport, recompute_workspace};
 
 use crate::{CoreError, NewColumnRequest, StateStore, TransitionResult};
 
@@ -703,6 +703,7 @@ impl StateStore {
                 vec![window_id],
             ),
         );
+        let tiled_viewport_width = self.workspace_tiled_viewport(workspace_id)?.width;
 
         let workspace = self
             .state
@@ -744,11 +745,16 @@ impl StateStore {
             && request.before_anchor
             && request.anchor_column_id.is_some()
         {
+            let column_gap = self.state.config_projection.layout_spacing.column_gap;
             let width = request
                 .width_semantics
-                .resolve(workspace.strip.visible_region.width)
+                .resolve(tiled_viewport_width)
                 .min(i32::MAX as u32) as i32;
-            workspace.strip.scroll_offset = workspace.strip.scroll_offset.saturating_add(width);
+            workspace.strip.scroll_offset = workspace
+                .strip
+                .scroll_offset
+                .saturating_add(width)
+                .saturating_add(column_gap.min(i32::MAX as u32) as i32);
         }
 
         Ok(column_id)
@@ -1165,12 +1171,10 @@ impl StateStore {
     }
 
     fn max_scroll_offset(&self, workspace_id: WorkspaceId) -> Result<i32, CoreError> {
-        let workspace = self
-            .state
-            .workspaces
-            .get(&workspace_id)
-            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        let viewport_width = workspace.strip.visible_region.width.min(i32::MAX as u32) as i32;
+        let viewport_width = self
+            .workspace_tiled_viewport(workspace_id)?
+            .width
+            .min(i32::MAX as u32) as i32;
         let content_width = self.workspace_content_width(workspace_id)?;
         Ok((content_width - viewport_width).max(0))
     }
@@ -1181,14 +1185,11 @@ impl StateStore {
             .workspaces
             .get(&workspace_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        let monitor = self
-            .state
-            .monitors
-            .get(&workspace.monitor_id)
-            .ok_or(CoreError::UnknownMonitor(workspace.monitor_id))?;
+        let viewport = self.workspace_tiled_viewport(workspace_id)?;
         let mut total_width = 0_i32;
+        let column_gap = self.state.config_projection.layout_spacing.column_gap;
 
-        for column_id in &workspace.strip.ordered_column_ids {
+        for (index, column_id) in workspace.strip.ordered_column_ids.iter().enumerate() {
             let column = self
                 .state
                 .layout
@@ -1196,9 +1197,12 @@ impl StateStore {
                 .get(column_id)
                 .ok_or(CoreError::UnknownColumn(*column_id))?;
             let column_width = self
-                .resolve_column_width(column, monitor.work_area_rect.width)
+                .resolve_column_width(column, viewport.width)
                 .min(i32::MAX as u32) as i32;
             total_width = total_width.saturating_add(column_width);
+            if index > 0 {
+                total_width = total_width.saturating_add(column_gap.min(i32::MAX as u32) as i32);
+            }
         }
 
         Ok(total_width)
@@ -1214,14 +1218,11 @@ impl StateStore {
             .workspaces
             .get(&workspace_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        let monitor = self
-            .state
-            .monitors
-            .get(&workspace.monitor_id)
-            .ok_or(CoreError::UnknownMonitor(workspace.monitor_id))?;
+        let viewport = self.workspace_tiled_viewport(workspace_id)?;
         let mut column_left = 0_i32;
+        let column_gap = self.state.config_projection.layout_spacing.column_gap;
 
-        for column_id in &workspace.strip.ordered_column_ids {
+        for (index, column_id) in workspace.strip.ordered_column_ids.iter().enumerate() {
             let column = self
                 .state
                 .layout
@@ -1229,7 +1230,7 @@ impl StateStore {
                 .get(column_id)
                 .ok_or(CoreError::UnknownColumn(*column_id))?;
             let column_width = self
-                .resolve_column_width(column, monitor.work_area_rect.width)
+                .resolve_column_width(column, viewport.width)
                 .min(i32::MAX as u32) as i32;
             let column_right = column_left.saturating_add(column_width);
 
@@ -1237,7 +1238,13 @@ impl StateStore {
                 return Ok(Some((column_left, column_right, column_width)));
             }
 
-            column_left = column_right;
+            column_left = column_right.saturating_add(
+                if index + 1 < workspace.strip.ordered_column_ids.len() {
+                    column_gap.min(i32::MAX as u32) as i32
+                } else {
+                    0
+                },
+            );
         }
 
         Ok(None)
@@ -1254,7 +1261,10 @@ impl StateStore {
             .workspaces
             .get(&workspace_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        let viewport_width = workspace.strip.visible_region.width.min(i32::MAX as u32) as i32;
+        let viewport_width = self
+            .workspace_tiled_viewport(workspace_id)?
+            .width
+            .min(i32::MAX as u32) as i32;
         let visible_left = workspace.strip.scroll_offset;
         let visible_right = visible_left.saturating_add(viewport_width);
         let is_single_column_workspace = workspace.strip.ordered_column_ids.len() == 1;
@@ -1294,6 +1304,23 @@ impl StateStore {
         } else {
             column.width_semantics.resolve(monitor_width)
         }
+    }
+
+    fn workspace_tiled_viewport(&self, workspace_id: WorkspaceId) -> Result<Rect, CoreError> {
+        let workspace = self
+            .state
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
+        let monitor = self
+            .state
+            .monitors
+            .get(&workspace.monitor_id)
+            .ok_or(CoreError::UnknownMonitor(workspace.monitor_id))?;
+        Ok(padded_tiled_viewport(
+            monitor.work_area_rect,
+            &self.state.config_projection,
+        ))
     }
 
     fn retarget_focus_after_destroy(
