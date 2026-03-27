@@ -86,16 +86,13 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
     let mut windows = state
         .windows
         .values()
-        .map(|window| {
+        .filter_map(|window| {
             let metadata = window
                 .current_hwnd_binding
                 .and_then(|hwnd| metadata_by_hwnd.get(&hwnd).copied());
-            let workspace = state
-                .workspaces
-                .get(&window.workspace_id)
-                .expect("window workspace should exist");
+            let workspace = state.workspaces.get(&window.workspace_id)?;
 
-            WindowProjection {
+            Some(WindowProjection {
                 window_id: window.id.get(),
                 monitor_id: workspace.monitor_id.get(),
                 workspace_id: window.workspace_id.get(),
@@ -112,7 +109,7 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
                 classification: window_classification_name(window.classification).to_string(),
                 is_managed: window.is_managed,
                 is_focused: state.focus.focused_window_id == Some(window.id),
-            }
+            })
         })
         .collect::<Vec<_>>();
     windows.sort_by(|left, right| {

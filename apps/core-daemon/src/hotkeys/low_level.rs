@@ -2,8 +2,8 @@ use std::{
     collections::{HashMap, HashSet},
     mem::zeroed,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Sender},
     },
     thread::{self, JoinHandle},
@@ -27,6 +27,7 @@ use windows_sys::Win32::{
 };
 
 use crate::control::{ControlMessage, WatchCommand};
+use crate::diag::write_runtime_log;
 
 use super::native::{NativeHotkeyRegistration, last_error_message};
 
@@ -387,6 +388,18 @@ fn low_level_hook_runtimes() -> &'static Mutex<HashMap<u32, Arc<LowLevelHotkeyRu
     LOW_LEVEL_HOOK_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn lookup_low_level_runtime(thread_id: u32) -> Option<Arc<LowLevelHotkeyRuntime>> {
+    let Ok(runtimes) = low_level_hook_runtimes().lock() else {
+        return None;
+    };
+
+    runtimes.get(&thread_id).cloned().or_else(|| {
+        (runtimes.len() == 1)
+            .then(|| runtimes.values().next().cloned())
+            .flatten()
+    })
+}
+
 fn replay_action(action: ReplayAction) {
     match action {
         ReplayAction::WinTap { win_vk } => {
@@ -481,10 +494,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
     }
 
     let thread_id = unsafe { GetCurrentThreadId() };
-    let runtime = low_level_hook_runtimes()
-        .lock()
-        .ok()
-        .and_then(|runtimes| runtimes.get(&thread_id).cloned());
+    let runtime = lookup_low_level_runtime(thread_id);
     let Some(runtime) = runtime else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
@@ -493,6 +503,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
     let injected = (hook_data.flags & LLKHF_INJECTED) != 0;
     let decision = runtime.handle_key_event(hook_data.vkCode, message, injected);
     if let Some(command) = decision.command {
+        write_runtime_log(format!(
+            "hotkey: low-level-dispatch thread_id={} vk={} message={} command={}",
+            thread_id,
+            hook_data.vkCode,
+            message,
+            command.as_hotkey_command_name()
+        ));
         let _ = runtime.command_sender.send(ControlMessage::Watch(command));
     }
     if decision.suppress {

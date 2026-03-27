@@ -143,16 +143,13 @@ pub(crate) fn ipc_command_for_touchpad_gesture(
         return Ok(None);
     };
 
-    command
-        .as_ipc_command_name()
-        .map(Some)
-        .ok_or_else(|| {
-            TouchpadListenerError::Startup(format!(
-                "touchpad gesture '{}' resolves to unsupported IPC command '{}'",
-                gesture_name(gesture),
-                command.as_hotkey_command_name()
-            ))
-        })
+    command.as_ipc_command_name().map(Some).ok_or_else(|| {
+        TouchpadListenerError::Startup(format!(
+            "touchpad gesture '{}' resolves to unsupported IPC command '{}'",
+            gesture_name(gesture),
+            command.as_hotkey_command_name()
+        ))
+    })
 }
 
 fn gesture_name(gesture: TouchpadGesture) -> &'static str {

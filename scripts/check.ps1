@@ -1,5 +1,5 @@
 param(
-    [switch]$RequireUiHost
+    [switch]$RequireVisualCompanion
 )
 
 Set-StrictMode -Version Latest
@@ -16,8 +16,8 @@ cargo clippy --target-dir $TargetDir --workspace --all-targets -- -D warnings
 Write-Host "Running cargo test..."
 cargo test --target-dir $TargetDir --workspace
 
-if ($RequireUiHost) {
-    throw "UI Host project was removed from the current working line."
+if ($RequireVisualCompanion) {
+    throw "A separate visual companion process is not part of the current working line."
 }
 
 Write-Host "Check completed."

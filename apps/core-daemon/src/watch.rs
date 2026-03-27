@@ -107,7 +107,9 @@ pub(crate) fn run_watch(
             controller
         }
         Err(error) => {
-            write_runtime_log(format!("watch: manual-resize-controller-start-error={error}"));
+            write_runtime_log(format!(
+                "watch: manual-resize-controller-start-error={error}"
+            ));
             eprintln!("manual width resize failed to start: {error}");
             return ExitCode::from(1);
         }
@@ -300,9 +302,9 @@ pub(crate) fn run_watch(
                         }
                     },
                     WatchCommand::CycleColumnWidth => match runtime.dispatch_command(
-                        DomainEvent::cycle_column_width(
-                            next_manual_correlation_id(&mut manual_correlation_id),
-                        ),
+                        DomainEvent::cycle_column_width(next_manual_correlation_id(
+                            &mut manual_correlation_id,
+                        )),
                         dry_run,
                         "manual-cycle-column-width",
                     ) {
@@ -719,6 +721,7 @@ fn print_iteration(iteration: u64, report: &RuntimeCycleReport) {
 fn print_report(report: &RuntimeCycleReport) {
     for line in report.summary_lines() {
         println!("{line}");
+        write_runtime_log(format!("report: {line}"));
     }
 }
 

@@ -9,14 +9,14 @@ use flowtile_config_rules::{
 };
 use flowtile_domain::{
     BindControlMode, ColumnId, CorrelationId, DomainEvent, DomainEventPayload, FocusBehavior,
-    MonitorId, Rect, ResizeEdge, RuntimeMode, TopologyRole, WidthSemantics, WindowId,
-    WindowLayer, WindowPlacement, WmState,
+    MonitorId, Rect, ResizeEdge, RuntimeMode, TopologyRole, WidthSemantics, WindowId, WindowLayer,
+    WindowPlacement, WmState,
 };
 use flowtile_layout_engine::{padded_tiled_viewport, recompute_workspace};
 use flowtile_windows_adapter::{
     ApplyBatchResult, ApplyOperation, ObservationEnvelope, ObservationKind,
     PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff,
-    WINDOW_SWITCH_ANIMATION_DURATION_MS, WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
+    WINDOW_SWITCH_ANIMATION_DURATION_MS, WINDOW_SWITCH_ANIMATION_FRAME_COUNT, WindowOpacityMode,
     WindowSwitchAnimation, WindowVisualEmphasis, WindowsAdapter, diff_snapshots,
     needs_activation_apply, needs_geometry_apply, needs_tiled_gapless_geometry_apply,
 };
@@ -24,12 +24,14 @@ use flowtile_windows_adapter::{
 use crate::{CoreDaemonRuntime, RuntimeCycleReport, RuntimeError, StateStore};
 
 const FOCUS_OBSERVATION_GRACE: Duration = Duration::from_millis(250);
+const GEOMETRY_SETTLE_GRACE: Duration = Duration::from_millis(180);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ApplyPlanContext {
     previous_focused_hwnd: Option<u64>,
     animate_window_switch: bool,
     animate_tiled_geometry: bool,
+    refresh_visual_emphasis: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +66,7 @@ impl CoreDaemonRuntime {
             last_valid_config: startup_config,
             last_snapshot: None,
             pending_focus_claim: None,
+            pending_geometry_settle_until: None,
             management_enabled: runtime_mode != RuntimeMode::SafeMode,
             consecutive_desync_cycles: 0,
             next_correlation_id: 1,
@@ -109,12 +112,16 @@ impl CoreDaemonRuntime {
     pub fn active_tiled_resize_target(
         &self,
     ) -> Result<Option<ActiveTiledResizeTarget>, RuntimeError> {
-        let Some(workspace_id) = self
-            .store
-            .state()
-            .focus
-            .focused_monitor_id
-            .and_then(|monitor_id| self.store.state().active_workspace_id_for_monitor(monitor_id))
+        let Some(workspace_id) =
+            self.store
+                .state()
+                .focus
+                .focused_monitor_id
+                .and_then(|monitor_id| {
+                    self.store
+                        .state()
+                        .active_workspace_id_for_monitor(monitor_id)
+                })
         else {
             return Ok(None);
         };
@@ -173,6 +180,7 @@ impl CoreDaemonRuntime {
             previous_focused_hwnd,
             self.current_focused_hwnd(),
             reason,
+            false,
         );
         self.arm_pending_focus_claim(previous_focused_hwnd);
         let planned_operations = if self.management_enabled {
@@ -185,11 +193,15 @@ impl CoreDaemonRuntime {
         } else {
             self.adapter.apply_operations(&planned_operations)?
         };
+        self.arm_pending_geometry_settle(reason, planned_operations.len(), dry_run);
         let apply_failure_messages = apply_result
             .failures
             .iter()
             .map(|failure| format!("hwnd {}: {}", failure.hwnd, failure.message))
             .collect::<Vec<_>>();
+        let strip_movement_logs = self.describe_strip_movements(&snapshot, &planned_operations);
+        let window_trace_logs =
+            self.describe_window_trace("plan", &snapshot, &planned_operations, None);
 
         let now = unix_timestamp();
         self.store.state_mut().runtime.last_full_scan_at = Some(now);
@@ -215,6 +227,9 @@ impl CoreDaemonRuntime {
             management_enabled: self.management_enabled,
             dry_run,
             degraded_reasons: self.store.state().runtime.degraded_flags.clone(),
+            strip_movement_logs,
+            window_trace_logs,
+            validation_trace_logs: Vec::new(),
         };
         self.validate_after_apply(&mut report, dry_run)?;
         Ok(report)
@@ -226,13 +241,11 @@ impl CoreDaemonRuntime {
         pointer_x: i32,
     ) -> Result<bool, RuntimeError> {
         let correlation_id = self.next_correlation_id();
-        match self
-            .store
-            .dispatch(DomainEvent::begin_column_width_resize(
-                correlation_id,
-                edge,
-                pointer_x,
-            )) {
+        match self.store.dispatch(DomainEvent::begin_column_width_resize(
+            correlation_id,
+            edge,
+            pointer_x,
+        )) {
             Ok(_) => Ok(self.store.state().layout.width_resize_session.is_some()),
             Err(crate::CoreError::InvalidEvent(_)) => Ok(false),
             Err(error) => Err(RuntimeError::Core(error)),
@@ -354,6 +367,9 @@ impl CoreDaemonRuntime {
     ) -> Result<Option<RuntimeCycleReport>, RuntimeError> {
         match observation.kind {
             ObservationKind::Snapshot => {
+                if self.should_defer_geometry_observation(&observation.reason) {
+                    return Ok(None);
+                }
                 let Some(snapshot) = observation.snapshot else {
                     self.push_degraded_reason(format!(
                         "observer-missing-snapshot:{}",
@@ -439,8 +455,12 @@ impl CoreDaemonRuntime {
             self.observe_focus(focused_hwnd)?;
         }
 
-        let apply_plan_context =
-            self.build_apply_plan_context(previous_focused_hwnd, self.current_focused_hwnd(), "");
+        let apply_plan_context = self.build_apply_plan_context(
+            previous_focused_hwnd,
+            self.current_focused_hwnd(),
+            "",
+            !had_previous_snapshot || discovered_windows > 0,
+        );
         let planned_operations = if self.management_enabled {
             self.plan_apply_operations_with_context(&snapshot, apply_plan_context)?
         } else {
@@ -451,11 +471,15 @@ impl CoreDaemonRuntime {
         } else {
             self.adapter.apply_operations(&planned_operations)?
         };
+        self.arm_pending_geometry_settle(observation_reason, planned_operations.len(), dry_run);
         let apply_failure_messages = apply_result
             .failures
             .iter()
             .map(|failure| format!("hwnd {}: {}", failure.hwnd, failure.message))
             .collect::<Vec<_>>();
+        let strip_movement_logs = self.describe_strip_movements(&snapshot, &planned_operations);
+        let window_trace_logs =
+            self.describe_window_trace("plan", &snapshot, &planned_operations, None);
 
         let now = unix_timestamp();
         self.store.state_mut().runtime.last_full_scan_at = Some(now);
@@ -481,6 +505,9 @@ impl CoreDaemonRuntime {
             management_enabled: self.management_enabled,
             dry_run,
             degraded_reasons: self.store.state().runtime.degraded_flags.clone(),
+            strip_movement_logs,
+            window_trace_logs,
+            validation_trace_logs: Vec::new(),
         })
     }
 
@@ -495,7 +522,27 @@ impl CoreDaemonRuntime {
 
         let validation_snapshot = self.adapter.scan_snapshot()?;
         report.recovery_rescans += 1;
-        let remaining_operations = self.plan_apply_operations(&validation_snapshot)?;
+        let mut remaining_operations = self.filter_validatable_operations_for_snapshot(
+            &validation_snapshot,
+            self.plan_apply_operations(&validation_snapshot)?,
+        );
+        let adapted_platform_min_width =
+            self.adapt_to_platform_min_widths(&validation_snapshot, &remaining_operations)?;
+        if adapted_platform_min_width {
+            report
+                .recovery_actions
+                .push("platform-min-width-adapted".to_string());
+            remaining_operations = self.filter_validatable_operations_for_snapshot(
+                &validation_snapshot,
+                self.plan_apply_operations(&validation_snapshot)?,
+            );
+        }
+        report.validation_trace_logs = self.describe_window_trace(
+            "validation",
+            &validation_snapshot,
+            &remaining_operations,
+            Some("remaining"),
+        );
         report.validation_remaining_operations = remaining_operations.len();
 
         if remaining_operations.is_empty() {
@@ -512,6 +559,21 @@ impl CoreDaemonRuntime {
             self.push_degraded_reason("activation:foreground-refused".to_string());
             report.recovery_actions.push(format!(
                 "activation-only-degraded:{}-ops-remain",
+                remaining_operations.len()
+            ));
+            report.degraded_reasons = self.store.state().runtime.degraded_flags.clone();
+            return Ok(());
+        }
+
+        if !adapted_platform_min_width
+            && report
+                .observation_reason
+                .as_deref()
+                .is_some_and(should_defer_post_apply_retry)
+        {
+            self.consecutive_desync_cycles = 0;
+            report.recovery_actions.push(format!(
+                "post-apply-settling:{}-ops-remain",
                 remaining_operations.len()
             ));
             report.degraded_reasons = self.store.state().runtime.degraded_flags.clone();
@@ -536,7 +598,10 @@ impl CoreDaemonRuntime {
 
         let post_retry_snapshot = self.adapter.scan_snapshot()?;
         report.recovery_rescans += 1;
-        let post_retry_remaining = self.plan_apply_operations(&post_retry_snapshot)?;
+        let post_retry_remaining = self.filter_validatable_operations_for_snapshot(
+            &post_retry_snapshot,
+            self.plan_apply_operations(&post_retry_snapshot)?,
+        );
         report.validation_remaining_operations = post_retry_remaining.len();
 
         if post_retry_remaining.is_empty() {
@@ -791,16 +856,27 @@ impl CoreDaemonRuntime {
                 } else {
                     needs_geometry_apply(actual_window.rect, geometry.rect)
                 };
-                let visual_emphasis =
-                    (needs_geometry || activate || active_state_changed).then(|| {
+                let visual_emphasis = (needs_geometry
+                    || activate
+                    || active_state_changed
+                    || apply_plan_context.refresh_visual_emphasis)
+                    .then(|| {
                         build_visual_emphasis(
                             desired_focused_hwnd == Some(hwnd),
                             actual_window.process_name.as_deref(),
+                            &actual_window.class_name,
+                            &actual_window.title,
                         )
-                    });
+                    })
+                    .filter(visual_emphasis_has_effect);
                 if needs_geometry || activate || visual_emphasis.is_some() {
                     let window_switch_animation = ((apply_plan_context.animate_window_switch
                         || apply_plan_context.animate_tiled_geometry)
+                        && supports_tiled_window_switch_animation(
+                            actual_window.process_name.as_deref(),
+                            &actual_window.class_name,
+                            &actual_window.title,
+                        )
                         && geometry.layer == WindowLayer::Tiled
                         && needs_geometry)
                         .then_some(WindowSwitchAnimation {
@@ -813,7 +889,12 @@ impl CoreDaemonRuntime {
                         rect: geometry.rect,
                         apply_geometry: needs_geometry,
                         activate,
-                        suppress_visual_gap: geometry.layer == WindowLayer::Tiled,
+                        suppress_visual_gap: should_suppress_visual_gap(
+                            geometry.layer,
+                            actual_window.process_name.as_deref(),
+                            &actual_window.class_name,
+                            &actual_window.title,
+                        ),
                         window_switch_animation,
                         visual_emphasis,
                     });
@@ -844,10 +925,13 @@ impl CoreDaemonRuntime {
             if let Some(monitor_id) = self.monitor_id_by_binding(&monitor_snapshot.binding) {
                 let workspace_set_id = {
                     let state = self.store.state_mut();
-                    let monitor = state
-                        .monitors
-                        .get_mut(&monitor_id)
-                        .expect("known monitor should exist");
+                    let Some(monitor) = state.monitors.get_mut(&monitor_id) else {
+                        self.push_degraded_reason(format!(
+                            "missing-monitor-state:{}",
+                            monitor_snapshot.binding
+                        ));
+                        continue;
+                    };
                     monitor.platform_binding = Some(monitor_snapshot.binding.clone());
                     monitor.work_area_rect = monitor_snapshot.work_area_rect;
                     monitor.dpi = monitor_snapshot.dpi;
@@ -909,10 +993,10 @@ impl CoreDaemonRuntime {
 
             let workspace_set_id = {
                 let state = self.store.state_mut();
-                let monitor = state
-                    .monitors
-                    .get_mut(&monitor_id)
-                    .expect("known monitor should exist");
+                let Some(monitor) = state.monitors.get_mut(&monitor_id) else {
+                    self.push_degraded_reason(format!("missing-monitor-state:{missing_binding}"));
+                    continue;
+                };
                 monitor.work_area_rect = fallback_monitor.work_area_rect;
                 monitor.dpi = fallback_monitor.dpi;
                 monitor.is_primary_hint = false;
@@ -982,12 +1066,15 @@ impl CoreDaemonRuntime {
         previous_focused_hwnd: Option<u64>,
         current_focused_hwnd: Option<u64>,
         reason: &str,
+        refresh_visual_emphasis: bool,
     ) -> ApplyPlanContext {
         ApplyPlanContext {
             previous_focused_hwnd,
             animate_window_switch: self
                 .should_animate_window_switch(previous_focused_hwnd, current_focused_hwnd),
             animate_tiled_geometry: should_animate_tiled_geometry(reason),
+            refresh_visual_emphasis: refresh_visual_emphasis
+                || previous_focused_hwnd != current_focused_hwnd,
         }
     }
 
@@ -1050,6 +1137,33 @@ impl CoreDaemonRuntime {
         if Instant::now() >= pending_claim.expires_at {
             self.pending_focus_claim = None;
         }
+    }
+
+    fn arm_pending_geometry_settle(
+        &mut self,
+        reason: &str,
+        planned_operations: usize,
+        dry_run: bool,
+    ) {
+        if dry_run || planned_operations == 0 || !should_defer_post_apply_retry(reason) {
+            self.pending_geometry_settle_until = None;
+            return;
+        }
+
+        self.pending_geometry_settle_until = Some(Instant::now() + GEOMETRY_SETTLE_GRACE);
+    }
+
+    fn should_defer_geometry_observation(&mut self, reason: &str) -> bool {
+        let Some(expires_at) = self.pending_geometry_settle_until else {
+            return false;
+        };
+
+        if Instant::now() >= expires_at {
+            self.pending_geometry_settle_until = None;
+            return false;
+        }
+
+        normalize_reason_token(reason).contains("location-change")
     }
 
     fn should_defer_platform_focus_observation(&mut self, observed_hwnd: u64) -> bool {
@@ -1220,6 +1334,243 @@ impl CoreDaemonRuntime {
             })
             .unwrap_or(1)
     }
+
+    fn describe_strip_movements(
+        &self,
+        snapshot: &PlatformSnapshot,
+        operations: &[ApplyOperation],
+    ) -> Vec<String> {
+        let actual_windows = snapshot
+            .windows
+            .iter()
+            .map(|window| (window.hwnd, window))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        operations
+            .iter()
+            .filter_map(|operation| {
+                let window_id = self.find_window_id_by_hwnd(operation.hwnd)?;
+                let window = self.store.state().windows.get(&window_id)?;
+                if !window.is_managed || window.layer != WindowLayer::Tiled {
+                    return None;
+                }
+
+                let actual_rect = actual_windows.get(&operation.hwnd).map(|window| window.rect);
+                let from_rect = actual_rect.unwrap_or(operation.rect);
+                let dx = operation.rect.x as i64 - from_rect.x as i64;
+                let dy = operation.rect.y as i64 - from_rect.y as i64;
+                let dw = operation.rect.width as i64 - from_rect.width as i64;
+                let dh = operation.rect.height as i64 - from_rect.height as i64;
+                let animated = operation.window_switch_animation.is_some();
+
+                Some(format!(
+                    "strip-move: hwnd={} window_id={} from=({},{} {}x{}) to=({},{} {}x{}) delta=({},{} {}x{}) animated={} activate={}",
+                    operation.hwnd,
+                    window_id.get(),
+                    from_rect.x,
+                    from_rect.y,
+                    from_rect.width,
+                    from_rect.height,
+                    operation.rect.x,
+                    operation.rect.y,
+                    operation.rect.width,
+                    operation.rect.height,
+                    dx,
+                    dy,
+                    dw,
+                    dh,
+                    animated,
+                    operation.activate
+                ))
+            })
+            .collect()
+    }
+
+    fn describe_window_trace(
+        &self,
+        stage: &str,
+        snapshot: &PlatformSnapshot,
+        operations: &[ApplyOperation],
+        remaining_label: Option<&str>,
+    ) -> Vec<String> {
+        let operations_by_hwnd = operations
+            .iter()
+            .map(|operation| (operation.hwnd, operation))
+            .collect::<std::collections::HashMap<_, _>>();
+        let state_windows_by_hwnd = self
+            .store
+            .state()
+            .windows
+            .values()
+            .filter_map(|window| window.current_hwnd_binding.map(|hwnd| (hwnd, window)))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let mut lines = snapshot
+            .windows
+            .iter()
+            .map(|observed_window| {
+                let tracked_window = state_windows_by_hwnd.get(&observed_window.hwnd).copied();
+                let operation = operations_by_hwnd.get(&observed_window.hwnd).copied();
+                format_window_trace_line(
+                    stage,
+                    remaining_label,
+                    observed_window.hwnd,
+                    observed_window.process_id,
+                    observed_window.process_name.as_deref().unwrap_or("unknown"),
+                    tracked_window.map(|window| window.layer),
+                    sanitize_log_text(&observed_window.title),
+                    observed_window.is_focused,
+                    observed_window.management_candidate,
+                    tracked_window.is_some_and(|window| window.is_managed),
+                    tracked_window.map(|window| window.workspace_id.get()),
+                    tracked_window.and_then(|window| window.column_id.map(|id| id.get())),
+                    observed_window.rect,
+                    operation,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for operation in operations {
+            if snapshot
+                .windows
+                .iter()
+                .any(|window| window.hwnd == operation.hwnd)
+            {
+                continue;
+            }
+
+            let tracked_window = self
+                .find_window_id_by_hwnd(operation.hwnd)
+                .and_then(|window_id| self.store.state().windows.get(&window_id));
+            lines.push(format!(
+                "window-trace[{stage}]: hwnd={} process=unknown pid=0 layer={} title=\"missing-from-snapshot\" focused=false candidate=false managed={} workspace={:?} column={:?} observed=missing target=({},{} {}x{}) delta=missing apply_geometry={} activate={} animated={} suppress_gap={} status={}",
+                operation.hwnd,
+                tracked_window
+                    .map(|window| window_layer_name(window.layer))
+                    .unwrap_or("untracked"),
+                tracked_window.is_some_and(|window| window.is_managed),
+                tracked_window.map(|window| window.workspace_id.get()),
+                tracked_window.and_then(|window| window.column_id.map(|id| id.get())),
+                operation.rect.x,
+                operation.rect.y,
+                operation.rect.width,
+                operation.rect.height,
+                operation.apply_geometry,
+                operation.activate,
+                operation.window_switch_animation.is_some(),
+                operation.suppress_visual_gap,
+                remaining_label.unwrap_or("planned")
+            ));
+        }
+
+        lines
+    }
+
+    fn adapt_to_platform_min_widths(
+        &mut self,
+        snapshot: &PlatformSnapshot,
+        operations: &[ApplyOperation],
+    ) -> Result<bool, RuntimeError> {
+        let actual_windows = snapshot
+            .windows
+            .iter()
+            .map(|window| (window.hwnd, window.rect))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut adapted = false;
+
+        for operation in operations {
+            if !operation.apply_geometry {
+                continue;
+            }
+
+            let Some(actual_rect) = actual_windows.get(&operation.hwnd).copied() else {
+                continue;
+            };
+            if actual_rect.width <= operation.rect.width {
+                continue;
+            }
+
+            let same_left = actual_rect.x == operation.rect.x;
+            let actual_right = actual_rect.x.saturating_add(actual_rect.width as i32);
+            let desired_right = operation.rect.x.saturating_add(operation.rect.width as i32);
+            let same_right = actual_right == desired_right;
+            if !same_left && !same_right {
+                continue;
+            }
+
+            let Some(window_id) = self.find_window_id_by_hwnd(operation.hwnd) else {
+                continue;
+            };
+            let Some(window) = self.store.state().windows.get(&window_id).cloned() else {
+                continue;
+            };
+            let Some(column_id) = window.column_id else {
+                continue;
+            };
+            if !window.is_managed || window.layer != WindowLayer::Tiled {
+                continue;
+            }
+
+            let Some(column) = self.store.state_mut().layout.columns.get_mut(&column_id) else {
+                continue;
+            };
+            if column.width_semantics == WidthSemantics::Fixed(actual_rect.width) {
+                continue;
+            }
+
+            column.width_semantics = WidthSemantics::Fixed(actual_rect.width);
+            adapted = true;
+        }
+
+        Ok(adapted)
+    }
+
+    fn filter_validatable_operations(
+        &self,
+        operations: Vec<ApplyOperation>,
+    ) -> Vec<ApplyOperation> {
+        operations
+            .into_iter()
+            .filter(|operation| operation.apply_geometry || operation.activate)
+            .collect()
+    }
+
+    fn filter_validatable_operations_for_snapshot(
+        &self,
+        snapshot: &PlatformSnapshot,
+        operations: Vec<ApplyOperation>,
+    ) -> Vec<ApplyOperation> {
+        let windows_by_hwnd = snapshot
+            .windows
+            .iter()
+            .map(|window| (window.hwnd, window))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        self.filter_validatable_operations(operations)
+            .into_iter()
+            .filter_map(|operation| {
+                let window = windows_by_hwnd.get(&operation.hwnd)?;
+                let safety = classify_window_visual_safety(
+                    window.process_name.as_deref(),
+                    &window.class_name,
+                    &window.title,
+                );
+                if safety == WindowVisualSafety::SafeFullEmphasis {
+                    return Some(operation);
+                }
+                if operation.activate {
+                    return Some(ApplyOperation {
+                        apply_geometry: false,
+                        suppress_visual_gap: false,
+                        window_switch_animation: None,
+                        ..operation
+                    });
+                }
+
+                None
+            })
+            .collect()
+    }
 }
 
 fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<String> {
@@ -1277,6 +1628,126 @@ fn should_animate_tiled_geometry(reason: &str) -> bool {
     )
 }
 
+fn should_defer_post_apply_retry(reason: &str) -> bool {
+    matches!(
+        reason,
+        "manual-column-width-commit" | "manual-cycle-column-width"
+    )
+}
+
+fn visual_emphasis_has_effect(emphasis: &WindowVisualEmphasis) -> bool {
+    emphasis.opacity_alpha.is_some()
+        || emphasis.force_clear_layered_style
+        || emphasis.border_color_rgb.is_some()
+        || !emphasis.disable_visual_effects
+}
+
+fn should_suppress_visual_gap(
+    layer: WindowLayer,
+    process_name: Option<&str>,
+    class_name: &str,
+    title: &str,
+) -> bool {
+    layer == WindowLayer::Tiled
+        && supports_nonessential_tiled_window_effects(process_name, class_name, title)
+}
+
+fn supports_nonessential_tiled_window_effects(
+    process_name: Option<&str>,
+    class_name: &str,
+    title: &str,
+) -> bool {
+    classify_window_visual_safety(process_name, class_name, title)
+        == WindowVisualSafety::SafeFullEmphasis
+}
+
+fn supports_tiled_window_switch_animation(
+    process_name: Option<&str>,
+    class_name: &str,
+    title: &str,
+) -> bool {
+    matches!(
+        classify_window_visual_safety(process_name, class_name, title),
+        WindowVisualSafety::SafeFullEmphasis | WindowVisualSafety::BrowserOpacityOnly
+    )
+}
+
+fn format_window_trace_line(
+    stage: &str,
+    remaining_label: Option<&str>,
+    hwnd: u64,
+    process_id: u32,
+    process_name: &str,
+    layer: Option<WindowLayer>,
+    title: String,
+    focused: bool,
+    management_candidate: bool,
+    managed: bool,
+    workspace_id: Option<u64>,
+    column_id: Option<u64>,
+    observed_rect: Rect,
+    operation: Option<&ApplyOperation>,
+) -> String {
+    let target_rect = operation.map(|item| item.rect);
+    let delta = target_rect
+        .map(|rect| {
+            format!(
+                "({},{ } {}x{})",
+                rect.x as i64 - observed_rect.x as i64,
+                rect.y as i64 - observed_rect.y as i64,
+                rect.width as i64 - observed_rect.width as i64,
+                rect.height as i64 - observed_rect.height as i64
+            )
+        })
+        .unwrap_or_else(|| "none".to_string())
+        .replace(", ", ",");
+
+    format!(
+        "window-trace[{stage}]: hwnd={} process={} pid={} layer={} title=\"{}\" focused={} candidate={} managed={} workspace={:?} column={:?} observed=({},{} {}x{}) target={} delta={} apply_geometry={} activate={} animated={} suppress_gap={} status={}",
+        hwnd,
+        sanitize_log_text(process_name),
+        process_id,
+        layer.map(window_layer_name).unwrap_or("untracked"),
+        title,
+        focused,
+        management_candidate,
+        managed,
+        workspace_id,
+        column_id,
+        observed_rect.x,
+        observed_rect.y,
+        observed_rect.width,
+        observed_rect.height,
+        target_rect
+            .map(|rect| format!("({},{} {}x{})", rect.x, rect.y, rect.width, rect.height))
+            .unwrap_or_else(|| "none".to_string()),
+        delta,
+        operation.is_some_and(|item| item.apply_geometry),
+        operation.is_some_and(|item| item.activate),
+        operation.is_some_and(|item| item.window_switch_animation.is_some()),
+        operation.is_some_and(|item| item.suppress_visual_gap),
+        remaining_label.unwrap_or_else(|| if operation.is_some() {
+            "planned"
+        } else {
+            "steady"
+        })
+    )
+}
+
+fn window_layer_name(layer: WindowLayer) -> &'static str {
+    match layer {
+        WindowLayer::Tiled => "tiled",
+        WindowLayer::Floating => "floating",
+        WindowLayer::Fullscreen => "fullscreen",
+    }
+}
+
+fn sanitize_log_text(text: &str) -> String {
+    text.replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('"', "'")
+}
+
 fn should_auto_unwind_after_desync(
     remaining_operations: &[ApplyOperation],
     consecutive_desync_cycles: u32,
@@ -1293,34 +1764,127 @@ fn should_auto_unwind_after_desync(
     affected_windows.len() > 1
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowVisualSafety {
+    SafeFullEmphasis,
+    BrowserOpacityOnly,
+    SkipVisualEmphasis,
+}
+
 fn build_visual_emphasis(
     is_active_window: bool,
     process_name: Option<&str>,
+    class_name: &str,
+    title: &str,
 ) -> WindowVisualEmphasis {
-    WindowVisualEmphasis {
-        opacity_alpha: inactive_window_opacity_alpha(is_active_window, process_name),
-        border_color_rgb: is_active_window.then_some(rgb_color(0x4C, 0xA8, 0xFF)),
-        border_thickness_px: 3,
-        rounded_corners: true,
+    match classify_window_visual_safety(process_name, class_name, title) {
+        WindowVisualSafety::SafeFullEmphasis => WindowVisualEmphasis {
+            opacity_alpha: inactive_window_opacity_alpha(is_active_window),
+            opacity_mode: WindowOpacityMode::DirectLayered,
+            // Active managed windows must always converge back to a fully opaque baseline even
+            // if a previous opacity pass or an older daemon run left the HWND layered.
+            force_clear_layered_style: is_active_window,
+            disable_visual_effects: false,
+            border_color_rgb: is_active_window.then_some(rgb_color(0x4C, 0xA8, 0xFF)),
+            border_thickness_px: 3,
+            rounded_corners: true,
+        },
+        WindowVisualSafety::BrowserOpacityOnly => WindowVisualEmphasis {
+            opacity_alpha: inactive_window_opacity_alpha(is_active_window),
+            opacity_mode: WindowOpacityMode::BrowserSurrogate,
+            force_clear_layered_style: is_active_window,
+            disable_visual_effects: true,
+            border_color_rgb: None,
+            border_thickness_px: 3,
+            rounded_corners: false,
+        },
+        WindowVisualSafety::SkipVisualEmphasis => WindowVisualEmphasis {
+            opacity_alpha: None,
+            opacity_mode: WindowOpacityMode::DirectLayered,
+            force_clear_layered_style: false,
+            disable_visual_effects: true,
+            border_color_rgb: None,
+            border_thickness_px: 3,
+            rounded_corners: false,
+        },
     }
 }
 
-fn inactive_window_opacity_alpha(is_active_window: bool, process_name: Option<&str>) -> u8 {
-    if is_active_window || process_uses_unsafe_layered_opacity(process_name) {
-        255
-    } else {
-        208
-    }
+fn inactive_window_opacity_alpha(is_active_window: bool) -> Option<u8> {
+    if is_active_window { None } else { Some(208) }
 }
 
-fn process_uses_unsafe_layered_opacity(process_name: Option<&str>) -> bool {
-    let Some(process_name) = process_name else {
-        return false;
+fn classify_window_visual_safety(
+    process_name: Option<&str>,
+    class_name: &str,
+    _title: &str,
+) -> WindowVisualSafety {
+    let normalized_class_name = normalize_class_name(class_name);
+    let normalized_process_name = normalize_process_name(process_name);
+    if normalized_class_name.is_none() && normalized_process_name.is_none() {
+        return WindowVisualSafety::SkipVisualEmphasis;
+    }
+    if matches!(
+        normalized_class_name.as_deref(),
+        Some("chrome_widgetwin_0" | "chrome_widgetwin_1" | "mozillawindowclass")
+    ) {
+        return WindowVisualSafety::BrowserOpacityOnly;
+    }
+
+    if matches!(
+        normalized_class_name.as_deref(),
+        Some("org.wezfurlong.wezterm")
+    ) {
+        return WindowVisualSafety::SkipVisualEmphasis;
+    }
+
+    let Some(process_name) = normalized_process_name else {
+        return WindowVisualSafety::SafeFullEmphasis;
     };
-    matches!(
-        process_name.to_ascii_lowercase().as_str(),
-        "msedge.exe" | "chrome.exe" | "brave.exe" | "opera.exe" | "vivaldi.exe" | "chromium.exe"
+    if matches!(
+        process_name.as_str(),
+        "msedge"
+            | "chrome"
+            | "brave"
+            | "opera"
+            | "vivaldi"
+            | "chromium"
+            | "firefox"
+            | "librewolf"
+            | "waterfox"
+    ) {
+        return WindowVisualSafety::BrowserOpacityOnly;
+    }
+
+    if matches!(process_name.as_str(), "wezterm-gui") {
+        return WindowVisualSafety::SkipVisualEmphasis;
+    }
+
+    WindowVisualSafety::SafeFullEmphasis
+}
+
+fn normalize_process_name(process_name: Option<&str>) -> Option<String> {
+    let process_name = process_name?.trim();
+    if process_name.is_empty() {
+        return None;
+    }
+
+    let lowered = process_name.to_ascii_lowercase();
+    Some(
+        lowered
+            .strip_suffix(".exe")
+            .unwrap_or(lowered.as_str())
+            .to_string(),
     )
+}
+
+fn normalize_class_name(class_name: &str) -> Option<String> {
+    let class_name = class_name.trim();
+    if class_name.is_empty() {
+        return None;
+    }
+
+    Some(class_name.to_ascii_lowercase())
 }
 
 const fn rgb_color(red: u8, green: u8, blue: u8) -> u32 {
@@ -1401,11 +1965,12 @@ fn normalize_reason_token(value: &str) -> String {
 mod tests {
     use flowtile_config_rules::WindowRuleDecision;
     use flowtile_domain::{
-        CorrelationId, DomainEvent, NavigationScope, Rect, ResizeEdge, RuntimeMode,
-        WidthSemantics, WindowLayer,
+        CorrelationId, DomainEvent, NavigationScope, Rect, ResizeEdge, RuntimeMode, WidthSemantics,
+        WindowLayer,
     };
     use flowtile_windows_adapter::{
         ApplyOperation, PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot,
+        WindowOpacityMode,
     };
 
     use crate::CoreDaemonRuntime;
@@ -1730,6 +2295,7 @@ mod tests {
                     previous_focused_hwnd: Some(100),
                     animate_window_switch: true,
                     animate_tiled_geometry: false,
+                    refresh_visual_emphasis: false,
                 },
             )
             .expect("apply plan should be computed");
@@ -1904,6 +2470,7 @@ mod tests {
                     previous_focused_hwnd: Some(100),
                     animate_window_switch: true,
                     animate_tiled_geometry: false,
+                    refresh_visual_emphasis: false,
                 },
             )
             .expect("apply plan should be computed");
@@ -1977,6 +2544,7 @@ mod tests {
                     previous_focused_hwnd: Some(100),
                     animate_window_switch: true,
                     animate_tiled_geometry: false,
+                    refresh_visual_emphasis: false,
                 },
             )
             .expect("apply plan should be computed");
@@ -1992,11 +2560,91 @@ mod tests {
 
         assert_eq!(
             previous_focus.visual_emphasis,
-            Some(build_visual_emphasis(false, Some("notepad")))
+            Some(build_visual_emphasis(
+                false,
+                Some("notepad"),
+                "Notepad",
+                "notes"
+            ))
         );
         assert_eq!(
             new_focus.visual_emphasis,
-            Some(build_visual_emphasis(true, Some("notepad")))
+            Some(build_visual_emphasis(
+                true,
+                Some("notepad"),
+                "Notepad",
+                "notes"
+            ))
+        );
+    }
+
+    #[test]
+    fn refresh_visual_emphasis_context_updates_inactive_browser_without_geometry_change() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "PowerShell".to_string(),
+                    class_name: "CASCADIA_HOSTING_WINDOW_CLASS".to_string(),
+                    process_id: 4242,
+                    process_name: Some("WindowsTerminal".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Example page".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 4343,
+                    process_name: Some("msedge".to_string()),
+                    rect: Rect::new(420, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+
+        let planned_operations = runtime
+            .plan_apply_operations_with_context(
+                &snapshot,
+                ApplyPlanContext {
+                    previous_focused_hwnd: Some(100),
+                    animate_window_switch: false,
+                    animate_tiled_geometry: false,
+                    refresh_visual_emphasis: true,
+                },
+            )
+            .expect("apply plan should be computed");
+
+        let edge_operation = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .expect("inactive browser operation should exist");
+        assert_eq!(
+            edge_operation.visual_emphasis,
+            Some(build_visual_emphasis(
+                false,
+                Some("msedge"),
+                "Chrome_WidgetWin_1",
+                "Example page"
+            ))
         );
     }
 
@@ -2114,19 +2762,502 @@ mod tests {
     }
 
     #[test]
-    fn chromium_windows_degrade_inactive_opacity_to_avoid_layered_alpha_artifacts() {
+    fn strip_movement_log_keeps_negative_delta_when_window_moves_left() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = sample_snapshot(Rect::new(120, 40, 420, 900));
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+
+        let logs = runtime.describe_strip_movements(
+            &snapshot,
+            &[ApplyOperation {
+                hwnd: 100,
+                rect: Rect::new(16, 40, 420, 900),
+                apply_geometry: true,
+                activate: false,
+                suppress_visual_gap: true,
+                window_switch_animation: None,
+                visual_emphasis: None,
+            }],
+        );
+
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("delta=(-104,0 0x0)"));
+    }
+
+    #[test]
+    fn chromium_windows_use_inactive_opacity_only_to_avoid_composited_surface_regressions() {
+        let inactive_edge = build_visual_emphasis(
+            false,
+            Some("msedge.exe"),
+            "Chrome_WidgetWin_1",
+            "Example page",
+        );
+        assert_eq!(inactive_edge.opacity_alpha, Some(208));
         assert_eq!(
-            build_visual_emphasis(false, Some("msedge.exe")).opacity_alpha,
-            255
+            inactive_edge.opacity_mode,
+            WindowOpacityMode::BrowserSurrogate
+        );
+        assert!(!inactive_edge.force_clear_layered_style);
+        assert!(inactive_edge.disable_visual_effects);
+        assert_eq!(inactive_edge.border_color_rgb, None);
+        assert!(!inactive_edge.rounded_corners);
+        assert!(super::visual_emphasis_has_effect(&inactive_edge));
+
+        let active_chrome =
+            build_visual_emphasis(true, Some("chrome"), "Chrome_WidgetWin_1", "Example page");
+        assert_eq!(active_chrome.opacity_alpha, None);
+        assert_eq!(
+            active_chrome.opacity_mode,
+            WindowOpacityMode::BrowserSurrogate
+        );
+        assert!(active_chrome.force_clear_layered_style);
+        assert!(active_chrome.disable_visual_effects);
+        assert_eq!(active_chrome.border_color_rgb, None);
+        assert!(!active_chrome.rounded_corners);
+        assert!(super::visual_emphasis_has_effect(&active_chrome));
+
+        assert_eq!(
+            build_visual_emphasis(
+                false,
+                Some("WindowsTerminal.exe"),
+                "CASCADIA_HOSTING_WINDOW_CLASS",
+                "PowerShell",
+            )
+            .opacity_alpha,
+            Some(208)
+        );
+        assert!(!super::visual_emphasis_has_effect(&build_visual_emphasis(
+            false,
+            Some("WezTerm-gui.exe"),
+            "org.wezfurlong.wezterm",
+            "WezTerm",
+        )));
+        assert_eq!(
+            build_visual_emphasis(false, Some("notepad.exe"), "Notepad", "notes").opacity_alpha,
+            Some(208)
         );
         assert_eq!(
-            build_visual_emphasis(false, Some("chrome.exe")).opacity_alpha,
-            255
+            build_visual_emphasis(false, Some("notepad.exe"), "Notepad", "notes").opacity_mode,
+            WindowOpacityMode::DirectLayered
+        );
+        assert!(
+            !build_visual_emphasis(false, Some("notepad.exe"), "Notepad", "notes")
+                .force_clear_layered_style
+        );
+        assert!(
+            !build_visual_emphasis(false, Some("notepad"), "Notepad", "notes")
+                .disable_visual_effects
         );
         assert_eq!(
-            build_visual_emphasis(false, Some("notepad.exe")).opacity_alpha,
-            208
+            build_visual_emphasis(true, Some("notepad.exe"), "Notepad", "notes").opacity_alpha,
+            None
         );
+    }
+
+    #[test]
+    fn active_chromium_windows_clear_layered_style_without_border_or_corners() {
+        let emphasis = build_visual_emphasis(
+            true,
+            Some("msedge.exe"),
+            "Chrome_WidgetWin_1",
+            "Example page",
+        );
+        assert!(super::visual_emphasis_has_effect(&emphasis));
+        assert!(emphasis.force_clear_layered_style);
+        assert!(emphasis.disable_visual_effects);
+        assert_eq!(emphasis.opacity_alpha, None);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.border_color_rgb, None);
+        assert!(!emphasis.rounded_corners);
+    }
+
+    #[test]
+    fn active_safe_window_requests_full_opacity_cleanup_before_border_effects() {
+        let emphasis = build_visual_emphasis(true, Some("notepad.exe"), "Notepad", "notes");
+        assert!(emphasis.force_clear_layered_style);
+        assert!(!emphasis.disable_visual_effects);
+        assert_eq!(emphasis.opacity_alpha, None);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::DirectLayered);
+        assert!(emphasis.border_color_rgb.is_some());
+        assert!(emphasis.rounded_corners);
+    }
+
+    #[test]
+    fn inactive_chromium_windows_use_opacity_only_visual_emphasis() {
+        let emphasis = build_visual_emphasis(
+            false,
+            Some("msedge.exe"),
+            "Chrome_WidgetWin_1",
+            "Example page",
+        );
+        assert_eq!(emphasis.opacity_alpha, Some(208));
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert!(!emphasis.force_clear_layered_style);
+        assert!(emphasis.disable_visual_effects);
+        assert_eq!(emphasis.border_color_rgb, None);
+        assert!(!emphasis.rounded_corners);
+        assert!(super::visual_emphasis_has_effect(&emphasis));
+    }
+
+    #[test]
+    fn inactive_new_tab_browser_windows_use_opacity_only_visual_emphasis() {
+        let emphasis = build_visual_emphasis(
+            false,
+            Some("msedge.exe"),
+            "Chrome_WidgetWin_1",
+            "Новая вкладка — Личный: Microsoft Edge",
+        );
+        assert_eq!(emphasis.opacity_alpha, Some(208));
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert!(!emphasis.force_clear_layered_style);
+        assert!(emphasis.disable_visual_effects);
+        assert_eq!(emphasis.border_color_rgb, None);
+        assert!(!emphasis.rounded_corners);
+        assert!(super::visual_emphasis_has_effect(&emphasis));
+    }
+
+    #[test]
+    fn chromium_like_class_without_browser_process_still_uses_opacity_only_visual_emphasis() {
+        let emphasis = build_visual_emphasis(
+            false,
+            Some("Code.exe"),
+            "Chrome_WidgetWin_1",
+            "Visual Studio Code",
+        );
+        assert!(!emphasis.force_clear_layered_style);
+        assert!(emphasis.disable_visual_effects);
+        assert_eq!(emphasis.opacity_alpha, Some(208));
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.border_color_rgb, None);
+        assert!(super::visual_emphasis_has_effect(&emphasis));
+    }
+
+    #[test]
+    fn chromium_like_class_without_process_name_still_uses_opacity_only_visual_emphasis() {
+        let emphasis = build_visual_emphasis(false, None, "Chrome_WidgetWin_1", "Microsoft Edge");
+        assert_eq!(emphasis.opacity_alpha, Some(208));
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert!(!emphasis.force_clear_layered_style);
+        assert!(emphasis.disable_visual_effects);
+        assert_eq!(emphasis.border_color_rgb, None);
+        assert!(!emphasis.rounded_corners);
+        assert!(super::visual_emphasis_has_effect(&emphasis));
+    }
+
+    #[test]
+    fn unknown_window_metadata_skips_visual_emphasis_until_discovery_settles() {
+        let emphasis = build_visual_emphasis(false, None, "", "");
+        assert_eq!(emphasis.opacity_alpha, None);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::DirectLayered);
+        assert!(!emphasis.force_clear_layered_style);
+        assert!(emphasis.disable_visual_effects);
+        assert_eq!(emphasis.border_color_rgb, None);
+        assert!(!emphasis.rounded_corners);
+        assert!(!super::visual_emphasis_has_effect(&emphasis));
+    }
+
+    #[test]
+    fn chromium_windows_skip_gapless_visual_policy_during_geometry_apply() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "PowerShell".to_string(),
+                    class_name: "CASCADIA_HOSTING_WINDOW_CLASS".to_string(),
+                    process_id: 4242,
+                    process_name: Some("WindowsTerminal".to_string()),
+                    rect: Rect::new(0, 0, 1180, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Example page".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 4343,
+                    process_name: Some("msedge".to_string()),
+                    rect: Rect::new(0, 0, 1180, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        let planned_operations = runtime
+            .plan_apply_operations(&snapshot)
+            .expect("apply plan should be computed");
+
+        let terminal_operation = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 100)
+            .expect("terminal operation should exist");
+        let edge_operation = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .expect("edge operation should exist");
+
+        assert!(terminal_operation.suppress_visual_gap);
+        assert!(!edge_operation.suppress_visual_gap);
+        assert!(edge_operation.apply_geometry);
+    }
+
+    #[test]
+    fn chromium_windows_keep_window_switch_animation_during_geometry_apply() {
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "PowerShell".to_string(),
+                    class_name: "CASCADIA_HOSTING_WINDOW_CLASS".to_string(),
+                    process_id: 4242,
+                    process_name: Some("WindowsTerminal".to_string()),
+                    rect: Rect::new(0, 0, 1180, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Example page".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 4343,
+                    process_name: Some("msedge".to_string()),
+                    rect: Rect::new(0, 0, 1180, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        let planned_operations = runtime
+            .plan_apply_operations_with_context(
+                &snapshot,
+                ApplyPlanContext {
+                    previous_focused_hwnd: Some(100),
+                    animate_window_switch: true,
+                    animate_tiled_geometry: true,
+                    refresh_visual_emphasis: false,
+                },
+            )
+            .expect("apply plan should be computed");
+
+        let terminal_operation = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 100)
+            .expect("terminal operation should exist");
+        let edge_operation = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .expect("edge operation should exist");
+
+        assert!(terminal_operation.window_switch_animation.is_some());
+        assert!(edge_operation.apply_geometry);
+        assert!(edge_operation.window_switch_animation.is_some());
+    }
+
+    #[test]
+    fn validation_filter_for_snapshot_skips_chromium_geometry_retry() {
+        let runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(101),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![PlatformWindowSnapshot {
+                hwnd: 101,
+                title: "Example page".to_string(),
+                class_name: "Chrome_WidgetWin_1".to_string(),
+                process_id: 4343,
+                process_name: Some("msedge".to_string()),
+                rect: Rect::new(0, 0, 1180, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            }],
+        };
+
+        let filtered = runtime.filter_validatable_operations_for_snapshot(
+            &snapshot,
+            vec![ApplyOperation {
+                hwnd: 101,
+                rect: Rect::new(16, 16, 1000, 900),
+                apply_geometry: true,
+                activate: false,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
+                visual_emphasis: None,
+            }],
+        );
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn validation_filter_for_snapshot_keeps_browser_activation_retry_but_drops_geometry_retry() {
+        let runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(101),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![PlatformWindowSnapshot {
+                hwnd: 101,
+                title: "Example page".to_string(),
+                class_name: "Chrome_WidgetWin_1".to_string(),
+                process_id: 4343,
+                process_name: Some("msedge".to_string()),
+                rect: Rect::new(0, 0, 1180, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            }],
+        };
+
+        let filtered = runtime.filter_validatable_operations_for_snapshot(
+            &snapshot,
+            vec![ApplyOperation {
+                hwnd: 101,
+                rect: Rect::new(16, 16, 1000, 900),
+                apply_geometry: true,
+                activate: true,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
+                visual_emphasis: Some(build_visual_emphasis(
+                    true,
+                    Some("msedge"),
+                    "Chrome_WidgetWin_1",
+                    "Example page",
+                )),
+            }],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert!(!filtered[0].apply_geometry);
+        assert!(filtered[0].activate);
+    }
+
+    #[test]
+    fn validation_filter_for_snapshot_keeps_safe_window_geometry_retry() {
+        let runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "notes".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(0, 0, 1180, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            }],
+        };
+
+        let filtered = runtime.filter_validatable_operations_for_snapshot(
+            &snapshot,
+            vec![ApplyOperation {
+                hwnd: 100,
+                rect: Rect::new(16, 16, 1000, 900),
+                apply_geometry: true,
+                activate: false,
+                suppress_visual_gap: true,
+                window_switch_animation: None,
+                visual_emphasis: None,
+            }],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].hwnd, 100);
+    }
+
+    #[test]
+    fn validation_filter_ignores_non_observable_browser_visual_only_operation() {
+        let runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let filtered = runtime.filter_validatable_operations(vec![ApplyOperation {
+            hwnd: 100,
+            rect: Rect::new(0, 0, 400, 900),
+            apply_geometry: false,
+            activate: false,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
+            visual_emphasis: Some(build_visual_emphasis(
+                true,
+                Some("msedge.exe"),
+                "Chrome_WidgetWin_1",
+                "Example page",
+            )),
+        }]);
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn validation_filter_ignores_non_observable_visual_emphasis_only_operation() {
+        let runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        let filtered = runtime.filter_validatable_operations(vec![ApplyOperation {
+            hwnd: 100,
+            rect: Rect::new(0, 0, 400, 900),
+            apply_geometry: false,
+            activate: false,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
+            visual_emphasis: Some(build_visual_emphasis(
+                true,
+                Some("notepad.exe"),
+                "Notepad",
+                "notes",
+            )),
+        }]);
+
+        assert!(filtered.is_empty());
     }
 
     fn sample_snapshot(window_rect: Rect) -> PlatformSnapshot {

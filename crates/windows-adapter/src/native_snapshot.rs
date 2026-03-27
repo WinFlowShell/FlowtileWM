@@ -20,10 +20,10 @@ use windows_sys::Win32::{
     UI::{
         HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
         WindowsAndMessaging::{
-            EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetShellWindow,
-            GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindowVisible, MONITORINFOF_PRIMARY,
-            WS_EX_TOOLWINDOW,
+            EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow,
+            GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+            GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+            MONITORINFOF_PRIMARY, WS_CAPTION, WS_EX_TOOLWINDOW, WS_POPUP, WS_THICKFRAME,
         },
     },
 };
@@ -35,6 +35,18 @@ use flowtile_domain::Rect as DomainRect;
 
 const CLASS_FILTER_CORE_WINDOW: &str = "Windows.UI.Core.CoreWindow";
 const DEFAULT_DPI: u32 = 96;
+const TRANSIENT_POPUP_MAX_WIDTH_PX: u32 = 480;
+const TRANSIENT_POPUP_MAX_HEIGHT_PX: u32 = 360;
+const ANCHORED_TRANSIENT_MAX_WIDTH_RATIO: f32 = 0.6;
+const ANCHORED_TRANSIENT_MAX_HEIGHT_RATIO: f32 = 0.4;
+const ANCHORED_TRANSIENT_MAX_AREA_RATIO: f32 = 0.25;
+const EMBEDDED_PANEL_MAX_WIDTH_RATIO: f32 = 0.8;
+const EMBEDDED_PANEL_MAX_HEIGHT_RATIO: f32 = 0.9;
+const EMBEDDED_PANEL_MAX_AREA_RATIO: f32 = 0.5;
+const ANCHORED_TRANSIENT_EDGE_PROXIMITY_PX: i32 = 96;
+const TRANSIENT_SURFACE_MAX_WIDTH_PX: u32 = 720;
+const TRANSIENT_SURFACE_MAX_HEIGHT_PX: u32 = 180;
+const TRANSIENT_SURFACE_MAX_AREA_PX: u32 = 120_000;
 const SHELL_OVERLAY_PROCESS_SCREEN_CLIPPING_HOST: &str = "screenclippinghost";
 const SHELL_OVERLAY_PROCESS_SHELL_EXPERIENCE_HOST: &str = "shellexperiencehost";
 const SHELL_OVERLAY_PROCESS_START_MENU_EXPERIENCE_HOST: &str = "startmenuexperiencehost";
@@ -42,6 +54,7 @@ const SHELL_OVERLAY_PROCESS_SEARCH_HOST: &str = "searchhost";
 const SHELL_OVERLAY_PROCESS_SEARCH_APP: &str = "searchapp";
 const SHELL_OVERLAY_PROCESS_TEXT_INPUT_HOST: &str = "textinputhost";
 const SHELL_OVERLAY_PROCESS_LOCK_APP: &str = "lockapp";
+const SHELL_OVERLAY_PROCESS_SNIPPING_TOOL: &str = "snippingtool";
 pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
     dpi::ensure_current_thread_per_monitor_v2("native-scan").map_err(|message| {
         WindowsAdapterError::RuntimeFailed {
@@ -102,6 +115,7 @@ pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
         monitors: monitor_context.monitors,
         windows: window_context.windows,
     };
+    filter_embedded_transient_windows(&mut snapshot);
     snapshot.sort_for_stability();
     Ok(snapshot)
 }
@@ -117,6 +131,7 @@ pub(crate) fn refresh_window(snapshot: &mut PlatformSnapshot, hwnd_raw: u64) -> 
     if let Some(window) = capture_window_snapshot(hwnd, foreground_hwnd) {
         upsert_monitor(snapshot, &window.monitor_binding);
         upsert_window(snapshot, window);
+        filter_embedded_transient_windows(snapshot);
     } else {
         remove_window(snapshot, hwnd_raw);
     }
@@ -258,6 +273,10 @@ fn capture_window_snapshot(
         return None;
     }
 
+    if is_small_popup_candidate(window_handle, rect) {
+        return None;
+    }
+
     let (_, monitor) = describe_monitor_for_window(window_handle)?;
     let title = query_window_title(window_handle);
     let class_name = query_window_class(window_handle);
@@ -292,7 +311,7 @@ fn is_transient_shell_overlay(class_name: &str, title: &str, process_name: Optio
         return true;
     }
 
-    let process_name = process_name.unwrap_or_default().to_ascii_lowercase();
+    let process_name = normalized_process_name(process_name).unwrap_or_default();
     if matches!(
         process_name.as_str(),
         SHELL_OVERLAY_PROCESS_SCREEN_CLIPPING_HOST
@@ -302,12 +321,16 @@ fn is_transient_shell_overlay(class_name: &str, title: &str, process_name: Optio
             | SHELL_OVERLAY_PROCESS_SEARCH_APP
             | SHELL_OVERLAY_PROCESS_TEXT_INPUT_HOST
             | SHELL_OVERLAY_PROCESS_LOCK_APP
+            | SHELL_OVERLAY_PROCESS_SNIPPING_TOOL
     ) {
         return true;
     }
 
     let title = title.to_ascii_lowercase();
-    title.contains("task switching") || title.contains("task view")
+    title.contains("task switching")
+        || title.contains("task view")
+        || title.contains("панель инструментов записи")
+        || title.contains("ножницы")
 }
 
 fn is_real_user_window(window_handle: HWND) -> bool {
@@ -339,7 +362,249 @@ fn is_real_user_window(window_handle: HWND) -> bool {
         // SAFETY: `GetWindowLongPtrW` reads the window extended style.
         unsafe { GetWindowLongPtrW(window_handle, GWL_EXSTYLE) as u32 }
     };
-    (ex_style & WS_EX_TOOLWINDOW) == 0
+    if (ex_style & WS_EX_TOOLWINDOW) != 0 {
+        return false;
+    }
+
+    let style = {
+        // SAFETY: `GetWindowLongPtrW` reads the regular style flags for the same validated HWND.
+        unsafe { GetWindowLongPtrW(window_handle, GWL_STYLE) as u32 }
+    };
+    !looks_like_transient_popup_window(style)
+}
+
+fn looks_like_transient_popup_window(style: u32) -> bool {
+    let has_popup = (style & WS_POPUP) != 0;
+    let has_caption = (style & WS_CAPTION) != 0;
+    let has_thickframe = (style & WS_THICKFRAME) != 0;
+
+    has_popup && !has_caption && !has_thickframe
+}
+
+fn is_small_popup_candidate(window_handle: HWND, rect: DomainRect) -> bool {
+    let style = {
+        // SAFETY: `GetWindowLongPtrW` reads the regular style flags for the validated HWND.
+        unsafe { GetWindowLongPtrW(window_handle, GWL_STYLE) as u32 }
+    };
+    if !looks_like_transient_popup_window(style) {
+        return false;
+    }
+
+    rect.width <= TRANSIENT_POPUP_MAX_WIDTH_PX && rect.height <= TRANSIENT_POPUP_MAX_HEIGHT_PX
+}
+
+fn filter_embedded_transient_windows(snapshot: &mut PlatformSnapshot) {
+    let transient_hwnds = snapshot
+        .windows
+        .iter()
+        .filter(|candidate| is_process_anchored_transient_candidate(snapshot, candidate))
+        .map(|window| window.hwnd)
+        .collect::<HashSet<_>>();
+
+    if transient_hwnds.is_empty() {
+        return;
+    }
+
+    snapshot
+        .windows
+        .retain(|window| !transient_hwnds.contains(&window.hwnd));
+}
+
+fn is_process_anchored_transient_candidate(
+    snapshot: &PlatformSnapshot,
+    candidate: &PlatformWindowSnapshot,
+) -> bool {
+    if candidate.is_focused {
+        return false;
+    }
+    if candidate.title.trim().is_empty() {
+        return snapshot.windows.iter().any(|container| {
+            if container.hwnd == candidate.hwnd
+                || container.monitor_binding != candidate.monitor_binding
+                || !same_application_family(container, candidate)
+                || container.rect.width < candidate.rect.width
+                || container.rect.height < candidate.rect.height
+                || !embedded_panel_ratio_ok(container.rect, candidate.rect)
+            {
+                return false;
+            }
+
+            rect_contains(container.rect, candidate.rect)
+                || rects_overlap(container.rect, candidate.rect)
+        });
+    }
+    if has_engine_internal_surface_signature(candidate) {
+        return snapshot.windows.iter().any(|container| {
+            if container.hwnd == candidate.hwnd
+                || container.monitor_binding != candidate.monitor_binding
+                || !same_application_family(container, candidate)
+                || container.rect.width < candidate.rect.width
+                || container.rect.height < candidate.rect.height
+            {
+                return false;
+            }
+
+            rect_contains(container.rect, candidate.rect)
+                || rects_overlap(container.rect, candidate.rect)
+        });
+    }
+    let has_transient_signature = has_transient_surface_signature(candidate);
+    if !has_transient_signature {
+        return false;
+    }
+
+    snapshot.windows.iter().any(|container| {
+        if container.hwnd == candidate.hwnd
+            || container.monitor_binding != candidate.monitor_binding
+            || !same_application_family(container, candidate)
+            || container.rect.width < candidate.rect.width
+            || container.rect.height < candidate.rect.height
+            || !anchored_transient_ratio_ok(container.rect, candidate.rect)
+        {
+            return false;
+        }
+
+        rect_contains(container.rect, candidate.rect)
+            || rects_overlap(container.rect, candidate.rect)
+            || rects_are_proximate(
+                container.rect,
+                candidate.rect,
+                ANCHORED_TRANSIENT_EDGE_PROXIMITY_PX,
+            )
+    })
+}
+
+fn has_transient_surface_signature(candidate: &PlatformWindowSnapshot) -> bool {
+    let empty_title = candidate.title.trim().is_empty();
+    let compact_height = candidate.rect.height <= 96;
+    let compact_surface = candidate.rect.height <= TRANSIENT_SURFACE_MAX_HEIGHT_PX
+        && candidate.rect.width <= TRANSIENT_SURFACE_MAX_WIDTH_PX
+        && candidate.rect.width.saturating_mul(candidate.rect.height)
+            <= TRANSIENT_SURFACE_MAX_AREA_PX;
+
+    compact_surface && (empty_title || compact_height)
+}
+
+fn has_engine_internal_surface_signature(candidate: &PlatformWindowSnapshot) -> bool {
+    let Some(process_name) = normalized_process_name(candidate.process_name.as_deref()) else {
+        return false;
+    };
+    if !matches!(
+        process_name.as_str(),
+        "msedge" | "chrome" | "brave" | "opera" | "vivaldi" | "chromium" | "firefox"
+    ) {
+        return false;
+    }
+
+    let title = candidate.title.trim().to_ascii_lowercase();
+    matches!(title.as_str(), "chrome legacy window")
+}
+
+fn same_application_family(
+    container: &PlatformWindowSnapshot,
+    candidate: &PlatformWindowSnapshot,
+) -> bool {
+    if container.process_id == candidate.process_id {
+        return true;
+    }
+
+    let Some(container_name) = normalized_process_name(container.process_name.as_deref()) else {
+        return false;
+    };
+    let Some(candidate_name) = normalized_process_name(candidate.process_name.as_deref()) else {
+        return false;
+    };
+
+    container_name == candidate_name
+}
+
+fn normalized_process_name(process_name: Option<&str>) -> Option<String> {
+    let process_name = process_name?.trim();
+    if process_name.is_empty() {
+        return None;
+    }
+
+    let lowered = process_name.to_ascii_lowercase();
+    Some(
+        lowered
+            .strip_suffix(".exe")
+            .unwrap_or(lowered.as_str())
+            .to_string(),
+    )
+}
+
+fn rect_contains(outer: DomainRect, inner: DomainRect) -> bool {
+    let outer_right = outer
+        .x
+        .saturating_add(outer.width.min(i32::MAX as u32) as i32);
+    let outer_bottom = outer
+        .y
+        .saturating_add(outer.height.min(i32::MAX as u32) as i32);
+    let inner_right = inner
+        .x
+        .saturating_add(inner.width.min(i32::MAX as u32) as i32);
+    let inner_bottom = inner
+        .y
+        .saturating_add(inner.height.min(i32::MAX as u32) as i32);
+
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner_right <= outer_right
+        && inner_bottom <= outer_bottom
+}
+
+fn anchored_transient_ratio_ok(container: DomainRect, candidate: DomainRect) -> bool {
+    let width_ratio = candidate.width as f32 / container.width.max(1) as f32;
+    let height_ratio = candidate.height as f32 / container.height.max(1) as f32;
+    let candidate_area = candidate.width as f32 * candidate.height as f32;
+    let container_area = container.width.max(1) as f32 * container.height.max(1) as f32;
+    let area_ratio = candidate_area / container_area;
+
+    width_ratio <= ANCHORED_TRANSIENT_MAX_WIDTH_RATIO
+        && height_ratio <= ANCHORED_TRANSIENT_MAX_HEIGHT_RATIO
+        && area_ratio <= ANCHORED_TRANSIENT_MAX_AREA_RATIO
+}
+
+fn embedded_panel_ratio_ok(container: DomainRect, candidate: DomainRect) -> bool {
+    let width_ratio = candidate.width as f32 / container.width.max(1) as f32;
+    let height_ratio = candidate.height as f32 / container.height.max(1) as f32;
+    let candidate_area = candidate.width as f32 * candidate.height as f32;
+    let container_area = container.width.max(1) as f32 * container.height.max(1) as f32;
+    let area_ratio = candidate_area / container_area;
+
+    width_ratio <= EMBEDDED_PANEL_MAX_WIDTH_RATIO
+        && height_ratio <= EMBEDDED_PANEL_MAX_HEIGHT_RATIO
+        && area_ratio <= EMBEDDED_PANEL_MAX_AREA_RATIO
+}
+
+fn rects_overlap(left: DomainRect, right: DomainRect) -> bool {
+    let left_right = left
+        .x
+        .saturating_add(left.width.min(i32::MAX as u32) as i32);
+    let left_bottom = left
+        .y
+        .saturating_add(left.height.min(i32::MAX as u32) as i32);
+    let right_right = right
+        .x
+        .saturating_add(right.width.min(i32::MAX as u32) as i32);
+    let right_bottom = right
+        .y
+        .saturating_add(right.height.min(i32::MAX as u32) as i32);
+
+    left.x < right_right && left_right > right.x && left.y < right_bottom && left_bottom > right.y
+}
+
+fn rects_are_proximate(left: DomainRect, right: DomainRect, threshold_px: i32) -> bool {
+    let expanded_left = DomainRect::new(
+        left.x.saturating_sub(threshold_px),
+        left.y.saturating_sub(threshold_px),
+        left.width
+            .saturating_add((threshold_px.max(0) as u32).saturating_mul(2)),
+        left.height
+            .saturating_add((threshold_px.max(0) as u32).saturating_mul(2)),
+    );
+
+    rects_overlap(expanded_left, right)
 }
 
 fn is_window_cloaked(window_handle: HWND) -> bool {
@@ -448,8 +713,15 @@ fn query_window_title(window_handle: HWND) -> String {
 #[cfg(test)]
 mod tests {
     use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_POPUP, WS_THICKFRAME};
 
-    use super::{is_transient_shell_overlay, visible_frame_is_compatible};
+    use super::{
+        PlatformSnapshot, PlatformWindowSnapshot, TRANSIENT_POPUP_MAX_HEIGHT_PX,
+        TRANSIENT_POPUP_MAX_WIDTH_PX, anchored_transient_ratio_ok, embedded_panel_ratio_ok,
+        filter_embedded_transient_windows, is_transient_shell_overlay,
+        looks_like_transient_popup_window, visible_frame_is_compatible,
+    };
+    use flowtile_domain::Rect as DomainRect;
 
     #[test]
     fn visible_frame_is_rejected_when_it_escapes_outer_rect() {
@@ -485,6 +757,11 @@ mod tests {
             "Screen clip",
             Some("ScreenClippingHost"),
         ));
+        assert!(is_transient_shell_overlay(
+            "Microsoft.UI.Content.DesktopChildSiteBridge",
+            "Панель инструментов записи",
+            Some("SnippingTool.exe"),
+        ));
     }
 
     #[test]
@@ -494,6 +771,322 @@ mod tests {
             "notes.txt - Notepad",
             Some("notepad"),
         ));
+    }
+
+    #[test]
+    fn popup_without_caption_or_thickframe_is_not_treated_as_real_user_window() {
+        assert!(looks_like_transient_popup_window(WS_POPUP));
+    }
+
+    #[test]
+    fn overlapped_or_resizable_window_is_not_treated_as_transient_popup() {
+        assert!(!looks_like_transient_popup_window(WS_POPUP | WS_CAPTION));
+        assert!(!looks_like_transient_popup_window(WS_POPUP | WS_THICKFRAME));
+    }
+
+    #[test]
+    fn transient_popup_size_thresholds_stay_conservative() {
+        let popup_rect = DomainRect::new(
+            0,
+            0,
+            TRANSIENT_POPUP_MAX_WIDTH_PX,
+            TRANSIENT_POPUP_MAX_HEIGHT_PX,
+        );
+        assert!(popup_rect.width <= TRANSIENT_POPUP_MAX_WIDTH_PX);
+        assert!(popup_rect.height <= TRANSIENT_POPUP_MAX_HEIGHT_PX);
+    }
+
+    #[test]
+    fn popup_with_caption_is_not_classified_as_small_transient_fast_path() {
+        assert!(!looks_like_transient_popup_window(WS_POPUP | WS_CAPTION));
+    }
+
+    #[test]
+    fn anchored_transient_ratio_detects_small_surface_inside_parent() {
+        assert!(anchored_transient_ratio_ok(
+            DomainRect::new(0, 0, 1200, 800),
+            DomainRect::new(300, 200, 320, 180),
+        ));
+        assert!(!anchored_transient_ratio_ok(
+            DomainRect::new(0, 0, 1200, 800),
+            DomainRect::new(100, 100, 1100, 700),
+        ));
+    }
+
+    #[test]
+    fn embedded_panel_ratio_detects_medium_popup_inside_parent() {
+        assert!(embedded_panel_ratio_ok(
+            DomainRect::new(0, 0, 1888, 988),
+            DomainRect::new(49, 150, 567, 650),
+        ));
+        assert!(!embedded_panel_ratio_ok(
+            DomainRect::new(0, 0, 1888, 988),
+            DomainRect::new(0, 0, 1700, 960),
+        ));
+    }
+
+    #[test]
+    fn embedded_transient_window_is_removed_from_snapshot() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(0, 0, 1200, 800),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(250, 180, 320, 180),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].hwnd, 100);
+    }
+
+    #[test]
+    fn titled_compact_window_is_not_removed_as_transient() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(0, 0, 1200, 800),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Downloads".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(250, 180, 320, 180),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 2);
+    }
+
+    #[test]
+    fn anchored_transient_window_outside_parent_edge_is_removed_from_snapshot() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(0, 0, 1200, 800),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(1180, 240, 380, 40),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].hwnd, 100);
+    }
+
+    #[test]
+    fn anchored_transient_window_from_sibling_process_is_removed_from_snapshot() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge.exe".to_string()),
+                    rect: DomainRect::new(0, 0, 1200, 800),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 43,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(1180, 240, 380, 40),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].hwnd, 100);
+    }
+
+    #[test]
+    fn nearby_large_window_of_same_process_is_not_removed_as_transient() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(0, 0, 1200, 800),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 102,
+                    title: "Second window".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(1220, 0, 900, 760),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 2);
+    }
+
+    #[test]
+    fn chromium_engine_internal_legacy_window_is_removed_from_snapshot() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(0, 0, 1888, 988),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Chrome Legacy Window".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(69, 117, 1830, 882),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].hwnd, 100);
+    }
+
+    #[test]
+    fn empty_title_browser_profile_panel_is_removed_from_snapshot() {
+        let mut snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: Vec::new(),
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Main".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 42,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(16, 16, 1888, 988),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 43,
+                    process_name: Some("msedge".to_string()),
+                    rect: DomainRect::new(49, 150, 567, 650),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+
+        filter_embedded_transient_windows(&mut snapshot);
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].hwnd, 100);
     }
 }
 

@@ -8,11 +8,11 @@ mod ids;
 mod model;
 
 pub use events::{
-    ColumnWidthPointerPayload, ColumnWidthResizePayload,
-    ConfigReloadFailedPayload, ConfigReloadRequestedPayload, ConfigReloadSucceededPayload,
-    DomainEvent, DomainEventName, DomainEventPayload, EventCategory, EventSource, FocusBehavior,
-    FocusCommandPayload, NavigationScope, OverviewCommandPayload, RulesUpdatedPayload,
-    StripScrollPayload, WindowCommandPayload, WindowDestroyedPayload, WindowDiscoveredPayload,
+    ColumnWidthPointerPayload, ColumnWidthResizePayload, ConfigReloadFailedPayload,
+    ConfigReloadRequestedPayload, ConfigReloadSucceededPayload, DomainEvent, DomainEventName,
+    DomainEventPayload, EventCategory, EventSource, FocusBehavior, FocusCommandPayload,
+    NavigationScope, OverviewCommandPayload, RulesUpdatedPayload, StripScrollPayload,
+    WindowCommandPayload, WindowDestroyedPayload, WindowDiscoveredPayload,
     WindowFocusObservedPayload, WindowPlacement,
 };
 pub use geometry::{Point, Rect, Size};
@@ -21,8 +21,8 @@ pub use model::{
     BindControlMode, CapturePolicy, Column, ColumnMode, ConfigProjection, DiagnosticsSummary,
     EdgeInsets, FloatingLayer, FocusOrigin, FocusState, LayoutSpacing, LayoutState, MaximizedState,
     Monitor, OverviewState, ResizeEdge, RestoreTarget, RuntimeMode, RuntimeState, ScrollingStrip,
-    StripLayoutMode, TopologyRole, WidthSemantics, WindowClassification, WindowLayer, WindowNode,
-    WidthResizeSession, WmState, Workspace, WorkspaceSet, all_column_modes,
+    StripLayoutMode, TopologyRole, WidthResizeSession, WidthSemantics, WindowClassification,
+    WindowLayer, WindowNode, WmState, Workspace, WorkspaceSet, all_column_modes,
 };
 
 pub const VERSION_LINE: &str = "v.1.0.0";

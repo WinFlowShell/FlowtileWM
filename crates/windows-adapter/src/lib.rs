@@ -24,7 +24,7 @@ mod native_snapshot;
 
 pub const PRIMARY_DISCOVERY_API: &str = "SetWinEventHook";
 pub const FALLBACK_DISCOVERY_PATH: &str = "full-window-scan";
-pub const TILED_VISUAL_OVERLAP_X_PX: i32 = 1;
+pub const TILED_VISUAL_OVERLAP_X_PX: i32 = 0;
 pub const WINDOW_SWITCH_ANIMATION_DURATION_MS: u16 = 90;
 pub const WINDOW_SWITCH_ANIMATION_FRAME_COUNT: u8 = 6;
 #[cfg(windows)]
@@ -198,9 +198,25 @@ pub struct WindowSwitchAnimation {
     pub frame_count: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowOpacityMode {
+    #[default]
+    DirectLayered,
+    BrowserSurrogate,
+    OverlayDim,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WindowVisualEmphasis {
-    pub opacity_alpha: u8,
+    #[serde(default)]
+    pub opacity_alpha: Option<u8>,
+    #[serde(default)]
+    pub opacity_mode: WindowOpacityMode,
+    #[serde(default)]
+    pub force_clear_layered_style: bool,
+    #[serde(default)]
+    pub disable_visual_effects: bool,
     #[serde(default)]
     pub border_color_rgb: Option<u32>,
     pub border_thickness_px: u8,
@@ -562,7 +578,7 @@ mod tests {
     #[test]
     fn tiled_overlap_tolerance_accepts_gapless_compensation() {
         assert!(!needs_tiled_gapless_geometry_apply(
-            Rect::new(99, 0, 400, 600),
+            Rect::new(100, 0, 400, 600),
             Rect::new(100, 0, 400, 600),
         ));
     }
@@ -570,7 +586,7 @@ mod tests {
     #[test]
     fn tiled_overlap_tolerance_accepts_right_side_slack_after_shift() {
         assert!(!needs_tiled_gapless_geometry_apply(
-            Rect::new(99, 0, 402, 600),
+            Rect::new(100, 0, 400, 600),
             Rect::new(100, 0, 400, 600),
         ));
     }
@@ -578,7 +594,7 @@ mod tests {
     #[test]
     fn tiled_overlap_tolerance_rejects_missing_left_shift() {
         assert!(needs_tiled_gapless_geometry_apply(
-            Rect::new(100, 0, 400, 600),
+            Rect::new(101, 0, 400, 600),
             Rect::new(100, 0, 400, 600),
         ));
     }

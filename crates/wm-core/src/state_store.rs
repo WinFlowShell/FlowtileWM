@@ -701,8 +701,8 @@ impl StateStore {
             ))?;
         let viewport = self.workspace_tiled_viewport(workspace_id)?;
         let initial_width = self.column_target_width_bounds(column_id, workspace_id)?.1;
-        let (target_width, clamped_preview_rect, anchor_x, current_pointer_x) =
-            self.compute_width_resize_metrics(
+        let (target_width, clamped_preview_rect, anchor_x, current_pointer_x) = self
+            .compute_width_resize_metrics(
                 payload.edge,
                 column_rect,
                 initial_width,
@@ -734,8 +734,8 @@ impl StateStore {
             return Ok(None);
         };
         let viewport = self.workspace_tiled_viewport(session.workspace_id)?;
-        let (target_width, clamped_preview_rect, anchor_x, current_pointer_x) =
-            self.compute_width_resize_metrics(
+        let (target_width, clamped_preview_rect, anchor_x, current_pointer_x) = self
+            .compute_width_resize_metrics(
                 session.anchor_edge,
                 session.initial_column_rect,
                 session.initial_width,
@@ -919,11 +919,11 @@ impl StateStore {
 
     fn active_tiled_width_target(&self) -> Result<(WorkspaceId, WindowId, ColumnId), CoreError> {
         let workspace_id = self.active_workspace_id_for_commands()?;
-        let window_id = self
-            .focused_window_in_workspace(workspace_id)
-            .ok_or(CoreError::InvalidEvent(
-                "width command requires an active tiled window",
-            ))?;
+        let window_id =
+            self.focused_window_in_workspace(workspace_id)
+                .ok_or(CoreError::InvalidEvent(
+                    "width command requires an active tiled window",
+                ))?;
         let window = self
             .state
             .windows
@@ -968,7 +968,9 @@ impl StateStore {
         let max_width = viewport.width.max(1);
         let min_width = (max_width / 6).max(1);
         let initial_left = initial_column_rect.x;
-        let initial_right = initial_column_rect.x.saturating_add(initial_column_rect.width as i32);
+        let initial_right = initial_column_rect
+            .x
+            .saturating_add(initial_column_rect.width as i32);
 
         let (min_pointer_x, max_pointer_x, anchor_x) = match edge {
             ResizeEdge::Right => (
@@ -1472,89 +1474,77 @@ impl StateStore {
         Ok(total_width)
     }
 
-    fn column_bounds_in_workspace(
-        &self,
-        workspace_id: WorkspaceId,
-        target_column_id: ColumnId,
-    ) -> Result<Option<(i32, i32, i32)>, CoreError> {
-        let workspace = self
-            .state
-            .workspaces
-            .get(&workspace_id)
-            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        let viewport = self.workspace_tiled_viewport(workspace_id)?;
-        let mut column_left = 0_i32;
-        let column_gap = self.state.config_projection.layout_spacing.column_gap;
-
-        for (index, column_id) in workspace.strip.ordered_column_ids.iter().enumerate() {
-            let column = self
-                .state
-                .layout
-                .columns
-                .get(column_id)
-                .ok_or(CoreError::UnknownColumn(*column_id))?;
-            let column_width = self
-                .resolve_column_width(column, viewport.width)
-                .min(i32::MAX as u32) as i32;
-            let column_right = column_left.saturating_add(column_width);
-
-            if *column_id == target_column_id {
-                return Ok(Some((column_left, column_right, column_width)));
-            }
-
-            column_left = column_right.saturating_add(
-                if index + 1 < workspace.strip.ordered_column_ids.len() {
-                    column_gap.min(i32::MAX as u32) as i32
-                } else {
-                    0
-                },
-            );
-        }
-
-        Ok(None)
-    }
-
     fn reveal_column_in_workspace(
         &mut self,
         workspace_id: WorkspaceId,
         target_column_id: ColumnId,
         _previous_column_id: Option<ColumnId>,
     ) -> Result<(), CoreError> {
+        let projection = recompute_workspace(&self.state, workspace_id)?;
+        let viewport_left = projection.viewport.x;
+        let viewport_width = projection.viewport.width.min(i32::MAX as u32) as i32;
+        let viewport_right = projection
+            .viewport
+            .x
+            .saturating_add(projection.viewport.width.min(i32::MAX as u32) as i32);
         let workspace = self
             .state
             .workspaces
             .get(&workspace_id)
             .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        let viewport_width = self
-            .workspace_tiled_viewport(workspace_id)?
-            .width
-            .min(i32::MAX as u32) as i32;
-        let visible_left = workspace.strip.scroll_offset;
-        let visible_right = visible_left.saturating_add(viewport_width);
         let is_single_column_workspace = workspace.strip.ordered_column_ids.len() == 1;
-        let Some((column_left, column_right, column_width)) =
-            self.column_bounds_in_workspace(workspace_id, target_column_id)?
-        else {
+        let target_bounds = projection
+            .window_geometries
+            .iter()
+            .filter(|geometry| {
+                self.state
+                    .windows
+                    .get(&geometry.window_id)
+                    .is_some_and(|window| window.column_id == Some(target_column_id))
+            })
+            .fold(None, |acc: Option<(i32, i32)>, geometry| {
+                let left = geometry.rect.x;
+                let right = geometry
+                    .rect
+                    .x
+                    .saturating_add(geometry.rect.width.min(i32::MAX as u32) as i32);
+                Some(match acc {
+                    Some((current_left, current_right)) => {
+                        (current_left.min(left), current_right.max(right))
+                    }
+                    None => (left, right),
+                })
+            });
+        let Some((column_left, column_right)) = target_bounds else {
             return Ok(());
         };
+        let column_width = column_right.saturating_sub(column_left);
+        let visible_left = viewport_left;
+        let visible_right = viewport_right;
         let should_center_target = column_width < viewport_width && is_single_column_workspace;
         let max_scroll_offset = self.max_scroll_offset(workspace_id)?;
         let desired_scroll_offset = if should_center_target {
             column_left
                 .saturating_add(column_width / 2)
-                .saturating_sub(viewport_width / 2)
+                .saturating_sub(projection.viewport.width.min(i32::MAX as u32) as i32 / 2)
                 .clamp(0, max_scroll_offset)
-        } else if column_width >= viewport_width || column_left < visible_left {
-            column_left
+        } else if column_left < visible_left {
+            workspace
+                .strip
+                .scroll_offset
+                .saturating_add(column_left.saturating_sub(visible_left))
         } else if column_right > visible_right {
-            column_right.saturating_sub(viewport_width)
+            workspace
+                .strip
+                .scroll_offset
+                .saturating_add(column_right.saturating_sub(visible_right))
         } else {
-            visible_left
+            workspace.strip.scroll_offset
         };
         let desired_scroll_offset = desired_scroll_offset.clamp(0, max_scroll_offset);
         self.apply_scroll_delta(
             workspace_id,
-            desired_scroll_offset.saturating_sub(visible_left),
+            desired_scroll_offset.saturating_sub(workspace.strip.scroll_offset),
         )?;
 
         Ok(())

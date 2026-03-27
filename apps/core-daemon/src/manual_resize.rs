@@ -11,30 +11,30 @@ use std::{
 };
 
 use flowtile_domain::{Rect, ResizeEdge};
-use flowtile_wm_core::{ActiveTiledResizeTarget, CoreDaemonRuntime, RuntimeCycleReport, RuntimeError};
+use flowtile_wm_core::{
+    ActiveTiledResizeTarget, CoreDaemonRuntime, RuntimeCycleReport, RuntimeError,
+};
 
 use crate::hotkeys::is_super_held_by_low_level_runtime;
 
 #[cfg(not(windows))]
-compile_error!("flowtile-core-daemon manual resize runtime currently supports only Windows builds.");
+compile_error!(
+    "flowtile-core-daemon manual resize runtime currently supports only Windows builds."
+);
 
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, POINT},
     Graphics::Gdi::{CreateSolidBrush, DeleteObject, HBRUSH},
-    System::{
-        LibraryLoader::GetModuleHandleW,
-        Threading::GetCurrentThreadId,
-    },
+    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::WindowsAndMessaging::{
-            CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-            GetCursorPos, GetMessageW, GetWindowRect, HWND_TOPMOST, MSG, MSLLHOOKSTRUCT,
-            PM_REMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW,
-            SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos,
-            SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL,
-            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_QUIT, WNDCLASSW,
-            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_EX_TRANSPARENT, WS_POPUP,
+        CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GetCursorPos, GetMessageW, GetWindowRect, HWND_TOPMOST, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
+        PeekMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow,
+        TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_QUIT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     },
 };
 
@@ -277,13 +277,11 @@ impl ResizePreviewOverlay {
     }
 
     fn show(&mut self, rect: Rect) -> Result<(), ManualResizeError> {
-        self.sender
-            .send(OverlayCommand::Show(rect))
-            .map_err(|_| {
-                ManualResizeError::Platform(
-                    "column-width preview overlay is no longer available".to_string(),
-                )
-            })
+        self.sender.send(OverlayCommand::Show(rect)).map_err(|_| {
+            ManualResizeError::Platform(
+                "column-width preview overlay is no longer available".to_string(),
+            )
+        })
     }
 
     fn hide(&mut self) -> Result<(), ManualResizeError> {
@@ -591,8 +589,9 @@ fn run_resize_mouse_hook_thread(
         let mut runtimes = match mouse_hook_runtimes().lock() {
             Ok(runtimes) => runtimes,
             Err(_) => {
-                let _ = startup_sender
-                    .send(Err("manual resize mouse hook registry is poisoned".to_string()));
+                let _ = startup_sender.send(Err(
+                    "manual resize mouse hook registry is poisoned".to_string()
+                ));
                 return;
             }
         };
@@ -626,11 +625,7 @@ fn unregister_mouse_hook_runtime(thread_id: u32) {
     }
 }
 
-unsafe extern "system" fn low_level_mouse_proc(
-    code: i32,
-    wparam: usize,
-    lparam: isize,
-) -> isize {
+unsafe extern "system" fn low_level_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     if code < 0 || lparam == 0 {
         return unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) };
     }
@@ -687,9 +682,9 @@ unsafe extern "system" fn low_level_mouse_proc(
         WM_LBUTTONUP | WM_NCLBUTTONUP => {
             if state.drag_intercepted {
                 state.drag_intercepted = false;
-                let _ = state
-                    .event_sender
-                    .send(MouseHookEvent::Release { pointer_x: pointer.x });
+                let _ = state.event_sender.send(MouseHookEvent::Release {
+                    pointer_x: pointer.x,
+                });
                 return 1;
             }
         }

@@ -14,6 +14,8 @@ $helperBuildDir = Join-Path $repoRoot "tmp\touchpad-helper-build"
 $runDir = Join-Path $repoRoot "tmp\touchpad-dev-run"
 $daemonExe = Join-Path $daemonTargetDir "debug\flowtile-core-daemon.exe"
 $helperDll = Join-Path $helperBuildDir "flowtile-touchpad-helper.dll"
+$daemonStdout = Join-Path $runDir "daemon.stdout.log"
+$daemonRuntimeLog = Join-Path $runDir "daemon.runtime.log"
 $helperStdout = Join-Path $runDir "helper.stdout.log"
 $helperStderr = Join-Path $runDir "helper.stderr.log"
 $helperTouchpadLog = Join-Path $runDir "touchpad-helper.log"
@@ -95,7 +97,7 @@ if ($NoStart) {
     return
 }
 
-Remove-Item $helperStdout, $helperStderr, $helperTouchpadLog -ErrorAction SilentlyContinue
+Remove-Item $daemonStdout, $daemonRuntimeLog, $helperStdout, $helperStderr, $helperTouchpadLog -ErrorAction SilentlyContinue
 
 [string[]]$daemonArguments = if ($DryRunWatch) {
     @("watch", "--dry-run", "--poll-only")
@@ -132,22 +134,32 @@ Write-Host "Helper stdout: $helperStdout"
 Write-Host "Helper stderr: $helperStderr"
 Write-Host "Helper touchpad log: $helperTouchpadLog"
 Write-Host ""
-Write-Host "Starting flowtile-core-daemon in the current console..."
+Write-Host "Daemon stdout log: $daemonStdout"
+Write-Host "Daemon runtime log: $daemonRuntimeLog"
+Write-Host ""
+Write-Host "Starting flowtile-core-daemon in the current console and saving logs to files..."
 Write-Host "Stop with Ctrl+C. The helper will be stopped automatically."
 
 Push-Location $repoRoot
+$previousEarlyLogPath = $env:FLOWTILE_EARLY_LOG_PATH
 try {
-    & $daemonExe @daemonArguments
-    $daemonExitCode = $LASTEXITCODE
-    if ($null -eq $daemonExitCode) {
+    $env:FLOWTILE_EARLY_LOG_PATH = $daemonRuntimeLog
+    & $daemonExe @daemonArguments 2>&1 | Tee-Object -FilePath $daemonStdout
+    if ($null -ne $LASTEXITCODE) {
+        $daemonExitCode = $LASTEXITCODE
+    } else {
         $daemonExitCode = 0
     }
-
     if ($daemonExitCode -ne 0) {
         throw "flowtile-core-daemon exited with code $daemonExitCode."
     }
 }
 finally {
+    if ($null -ne $previousEarlyLogPath) {
+        $env:FLOWTILE_EARLY_LOG_PATH = $previousEarlyLogPath
+    } else {
+        Remove-Item Env:FLOWTILE_EARLY_LOG_PATH -ErrorAction SilentlyContinue
+    }
     Pop-Location
     if ($null -ne $helper -and -not $helper.HasExited) {
         Stop-Process -Id $helper.Id -Force -ErrorAction SilentlyContinue

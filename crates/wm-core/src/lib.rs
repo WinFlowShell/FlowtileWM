@@ -144,6 +144,9 @@ pub struct RuntimeCycleReport {
     pub management_enabled: bool,
     pub dry_run: bool,
     pub degraded_reasons: Vec<String>,
+    pub strip_movement_logs: Vec<String>,
+    pub window_trace_logs: Vec<String>,
+    pub validation_trace_logs: Vec<String>,
 }
 
 impl RuntimeCycleReport {
@@ -186,6 +189,27 @@ impl RuntimeCycleReport {
                 self.degraded_reasons.join(", ")
             ));
         }
+        if !self.strip_movement_logs.is_empty() {
+            lines.push(format!(
+                "strip movements: {}",
+                self.strip_movement_logs.len()
+            ));
+            lines.extend(self.strip_movement_logs.iter().cloned());
+        }
+        if !self.window_trace_logs.is_empty() {
+            lines.push(format!(
+                "window trace entries: {}",
+                self.window_trace_logs.len()
+            ));
+            lines.extend(self.window_trace_logs.iter().cloned());
+        }
+        if !self.validation_trace_logs.is_empty() {
+            lines.push(format!(
+                "validation trace entries: {}",
+                self.validation_trace_logs.len()
+            ));
+            lines.extend(self.validation_trace_logs.iter().cloned());
+        }
 
         lines
     }
@@ -199,6 +223,7 @@ pub struct CoreDaemonRuntime {
     last_valid_config: LoadedConfig,
     last_snapshot: Option<PlatformSnapshot>,
     pending_focus_claim: Option<PendingFocusClaim>,
+    pending_geometry_settle_until: Option<Instant>,
     management_enabled: bool,
     consecutive_desync_cycles: u32,
     next_correlation_id: u64,
