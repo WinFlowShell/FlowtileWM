@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     ffi::c_void,
     mem::{size_of, zeroed},
     path::Path,
+    sync::OnceLock,
 };
 
 use windows_sys::Win32::{
@@ -55,6 +57,16 @@ const SHELL_OVERLAY_PROCESS_SEARCH_APP: &str = "searchapp";
 const SHELL_OVERLAY_PROCESS_TEXT_INPUT_HOST: &str = "textinputhost";
 const SHELL_OVERLAY_PROCESS_LOCK_APP: &str = "lockapp";
 const SHELL_OVERLAY_PROCESS_SNIPPING_TOOL: &str = "snippingtool";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ShellLayoutOverrides {
+    use_monitor_bounds: bool,
+    reserved_top_px: u32,
+    reserved_right_px: u32,
+    reserved_bottom_px: u32,
+    reserved_left_px: u32,
+}
+
 pub(crate) fn scan_snapshot() -> Result<PlatformSnapshot, WindowsAdapterError> {
     dpi::ensure_current_thread_per_monitor_v2("native-scan").map_err(|message| {
         WindowsAdapterError::RuntimeFailed {
@@ -1152,17 +1164,72 @@ fn describe_monitor(monitor_handle: HMONITOR) -> Option<PlatformMonitorSnapshot>
         dpi_y = DEFAULT_DPI;
     }
 
+    let shell_layout = shell_layout_overrides();
+    let base_rect = if shell_layout.use_monitor_bounds {
+        win32_rect_to_domain_rect(info.monitorInfo.rcMonitor)
+    } else {
+        win32_rect_to_domain_rect(info.monitorInfo.rcWork)
+    };
+
     Some(PlatformMonitorSnapshot {
         binding: wide_array_to_string(&info.szDevice),
-        work_area_rect: DomainRect::new(
-            info.monitorInfo.rcWork.left,
-            info.monitorInfo.rcWork.top,
-            (info.monitorInfo.rcWork.right - info.monitorInfo.rcWork.left).max(0) as u32,
-            (info.monitorInfo.rcWork.bottom - info.monitorInfo.rcWork.top).max(0) as u32,
+        work_area_rect: inset_domain_rect(
+            base_rect,
+            shell_layout.reserved_left_px,
+            shell_layout.reserved_top_px,
+            shell_layout.reserved_right_px,
+            shell_layout.reserved_bottom_px,
         ),
         dpi: dpi_x.max(dpi_y),
         is_primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
     })
+}
+
+fn shell_layout_overrides() -> &'static ShellLayoutOverrides {
+    static OVERRIDES: OnceLock<ShellLayoutOverrides> = OnceLock::new();
+    OVERRIDES.get_or_init(|| ShellLayoutOverrides {
+        use_monitor_bounds: env_flag("FLOWSHELL_USE_MONITOR_BOUNDS"),
+        reserved_top_px: env_u32("FLOWSHELL_RESERVED_TOP_PX"),
+        reserved_right_px: env_u32("FLOWSHELL_RESERVED_RIGHT_PX"),
+        reserved_bottom_px: env_u32("FLOWSHELL_RESERVED_BOTTOM_PX"),
+        reserved_left_px: env_u32("FLOWSHELL_RESERVED_LEFT_PX"),
+    })
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "True"))
+}
+
+fn env_u32(name: &str) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn win32_rect_to_domain_rect(rect: RECT) -> DomainRect {
+    DomainRect::new(
+        rect.left,
+        rect.top,
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    )
+}
+
+fn inset_domain_rect(rect: DomainRect, left: u32, top: u32, right: u32, bottom: u32) -> DomainRect {
+    let horizontal = left.saturating_add(right);
+    let vertical = top.saturating_add(bottom);
+    let offset_x = i32::try_from(left).unwrap_or(i32::MAX);
+    let offset_y = i32::try_from(top).unwrap_or(i32::MAX);
+
+    DomainRect::new(
+        rect.x.saturating_add(offset_x),
+        rect.y.saturating_add(offset_y),
+        rect.width.saturating_sub(horizontal),
+        rect.height.saturating_sub(vertical),
+    )
 }
 
 fn query_process_id(window_handle: HWND) -> u32 {

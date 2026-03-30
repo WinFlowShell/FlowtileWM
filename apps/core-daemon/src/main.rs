@@ -4,9 +4,13 @@ mod diag;
 mod hotkeys;
 mod ipc;
 mod manual_resize;
+mod overview_surface;
 mod projection;
+mod tab_indicator;
+mod terminal;
 mod touchpad;
 mod watch;
+mod window_actions;
 
 use std::{env, process::ExitCode};
 

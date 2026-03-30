@@ -25,7 +25,7 @@ pub use model::{
     WindowLayer, WindowNode, WmState, Workspace, WorkspaceSet, all_column_modes,
 };
 
-pub const VERSION_LINE: &str = "v.0.0.17";
+pub const VERSION_LINE: &str = "v.0.0.19";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct StateVersion(u64);

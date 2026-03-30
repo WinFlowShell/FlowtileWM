@@ -11,7 +11,9 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+    System::{
+        LibraryLoader::GetModuleHandleW, Shutdown::LockWorkStation, Threading::GetCurrentThreadId,
+    },
     UI::{
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -26,8 +28,11 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::control::{ControlMessage, WatchCommand};
 use crate::diag::write_runtime_log;
+use crate::{
+    control::{ControlMessage, WatchCommand},
+    overview_surface::lower_overview_surface_for_shell_overlay,
+};
 
 use super::native::{NativeHotkeyRegistration, last_error_message};
 
@@ -37,6 +42,8 @@ static SUPER_HELD: AtomicBool = AtomicBool::new(false);
 
 const LOW_LEVEL_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(180);
 const LOW_LEVEL_REPEAT_INTERVAL: Duration = Duration::from_millis(45);
+const LOCK_WORKSTATION_KEY: u32 = b'L' as u32;
+const START_MENU_TRANSFER_KEY: u32 = b'S' as u32;
 
 struct LowLevelHotkeyRuntime {
     command_sender: Sender<ControlMessage>,
@@ -66,7 +73,10 @@ impl LowLevelHotkeyRuntime {
             Err(_) => (HookDecision::default(), None),
         };
 
-        if let Some(action) = decision.replay {
+        if let Some(action) = decision.replay.clone() {
+            if replay_action_needs_shell_screenshot_escape(&action) {
+                lower_overview_surface_for_shell_overlay();
+            }
             replay_action(action);
         }
         self.sync_repeat_loop(repeat_command);
@@ -118,6 +128,7 @@ struct LowLevelHotkeyState {
     pressed_keys: HashSet<u32>,
     active_trigger: Option<ActiveLowLevelTrigger>,
     pending_win_prefix: Option<PendingWinPrefix>,
+    suppressed_held_keys: HashSet<u32>,
     suppressed_key_releases: HashSet<u32>,
 }
 
@@ -128,6 +139,7 @@ impl LowLevelHotkeyState {
             pressed_keys: HashSet::new(),
             active_trigger: None,
             pending_win_prefix: None,
+            suppressed_held_keys: HashSet::new(),
             suppressed_key_releases: HashSet::new(),
         }
     }
@@ -150,6 +162,14 @@ impl LowLevelHotkeyState {
 
             if let Some(decision) = self.handle_pending_win_key_down(vk, inserted) {
                 return decision;
+            }
+
+            if !inserted && self.suppressed_held_keys.contains(&vk) {
+                return HookDecision {
+                    command: None,
+                    suppress: true,
+                    replay: None,
+                };
             }
 
             if let Some(active) = &self.active_trigger
@@ -186,6 +206,7 @@ impl LowLevelHotkeyState {
                 .active_trigger
                 .as_ref()
                 .is_some_and(|active| active.primary_key == vk)
+                || self.suppressed_held_keys.remove(&vk)
                 || self.suppressed_key_releases.remove(&vk);
             self.pressed_keys.remove(&vk);
 
@@ -212,6 +233,15 @@ impl LowLevelHotkeyState {
         HookDecision::default()
     }
 
+    fn reset(&mut self) {
+        self.pressed_keys.clear();
+        self.active_trigger = None;
+        self.pending_win_prefix = None;
+        self.suppressed_held_keys.clear();
+        self.suppressed_key_releases.clear();
+        SUPER_HELD.store(false, Ordering::Relaxed);
+    }
+
     fn repeat_command_while_held(&self) -> Option<WatchCommand> {
         self.active_trigger
             .as_ref()
@@ -228,15 +258,24 @@ impl LowLevelHotkeyState {
                 });
             }
 
-            if active_modifier_mask(&self.pressed_keys) == MOD_WIN
-                && let Some((command, required_modifiers, repeat_while_held)) =
-                    self.find_pure_win_registration(vk).map(|registration| {
-                        (
-                            registration.command,
-                            registration.required_modifiers,
-                            registration.command.repeats_while_held(),
-                        )
-                    })
+            if is_pending_modifier_vk(vk) {
+                return Some(HookDecision {
+                    command: None,
+                    suppress: true,
+                    replay: None,
+                });
+            }
+
+            let active_modifiers = active_modifier_mask(&self.pressed_keys);
+            if let Some((command, required_modifiers, repeat_while_held)) = self
+                .find_registration(vk, active_modifiers)
+                .map(|registration| {
+                    (
+                        registration.command,
+                        registration.required_modifiers,
+                        registration.command.repeats_while_held(),
+                    )
+                })
             {
                 self.pending_win_prefix = None;
                 self.active_trigger = Some(ActiveLowLevelTrigger {
@@ -245,7 +284,7 @@ impl LowLevelHotkeyState {
                     required_modifiers,
                     repeat_while_held,
                 });
-                self.suppressed_key_releases.insert(pending.win_vk);
+                self.suppress_pending_modifier_releases(pending.win_vk);
                 return Some(HookDecision {
                     command: Some(command),
                     suppress: true,
@@ -253,12 +292,39 @@ impl LowLevelHotkeyState {
                 });
             }
 
+            if active_modifiers == MOD_WIN && is_start_menu_transfer_key(vk) {
+                self.pending_win_prefix = None;
+                self.suppressed_held_keys.insert(vk);
+                self.suppressed_key_releases.insert(vk);
+                self.suppressed_key_releases.insert(pending.win_vk);
+                return Some(HookDecision {
+                    command: None,
+                    suppress: true,
+                    replay: Some(ReplayAction::WinTap {
+                        win_vk: pending.win_vk,
+                    }),
+                });
+            }
+
+            if active_modifiers == MOD_WIN && is_lock_workstation_key(vk) {
+                self.reset();
+                return Some(HookDecision {
+                    command: None,
+                    suppress: true,
+                    replay: Some(ReplayAction::LockWorkstation),
+                });
+            }
+
             self.pending_win_prefix = None;
+            self.suppressed_held_keys.insert(vk);
+            self.suppressed_key_releases.insert(vk);
+            self.suppress_pending_modifier_releases(pending.win_vk);
             return Some(HookDecision {
                 command: None,
                 suppress: true,
                 replay: Some(ReplayAction::ReplayWinChord {
                     win_vk: pending.win_vk,
+                    modifier_vks: pending_modifier_vks(&self.pressed_keys, pending.win_vk),
                     key_vk: vk,
                 }),
             });
@@ -282,17 +348,22 @@ impl LowLevelHotkeyState {
     }
 
     fn handle_pending_win_key_up(&mut self, vk: u32) -> Option<HookDecision> {
-        if self
-            .pending_win_prefix
-            .as_ref()
-            .is_some_and(|pending| pending.win_vk == vk)
-        {
-            self.pending_win_prefix = None;
-            return Some(HookDecision {
-                command: None,
-                suppress: true,
-                replay: Some(ReplayAction::WinTap { win_vk: vk }),
-            });
+        if let Some(pending) = self.pending_win_prefix {
+            if pending.win_vk == vk {
+                self.pending_win_prefix = None;
+                return Some(HookDecision {
+                    command: None,
+                    suppress: true,
+                    replay: None,
+                });
+            }
+            if is_pending_modifier_vk(vk) {
+                return Some(HookDecision {
+                    command: None,
+                    suppress: true,
+                    replay: None,
+                });
+            }
         }
 
         None
@@ -304,10 +375,26 @@ impl LowLevelHotkeyState {
             .any(|registration| registration.required_modifiers == MOD_WIN)
     }
 
-    fn find_pure_win_registration(&self, key: u32) -> Option<&NativeHotkeyRegistration> {
+    fn find_registration(
+        &self,
+        key: u32,
+        required_modifiers: u32,
+    ) -> Option<&NativeHotkeyRegistration> {
         self.fallback_registrations.iter().find(|registration| {
-            registration.required_modifiers == MOD_WIN && registration.key == key
+            registration.required_modifiers == required_modifiers && registration.key == key
         })
+    }
+
+    fn suppress_pending_modifier_releases(&mut self, win_vk: u32) {
+        self.suppressed_key_releases.insert(win_vk);
+        for key in self
+            .pressed_keys
+            .iter()
+            .copied()
+            .filter(|key| *key != win_vk && is_pending_modifier_vk(*key))
+        {
+            self.suppressed_key_releases.insert(key);
+        }
     }
 }
 
@@ -328,13 +415,20 @@ struct PendingWinPrefix {
     win_vk: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ReplayAction {
-    WinTap { win_vk: u32 },
-    ReplayWinChord { win_vk: u32, key_vk: u32 },
+    LockWorkstation,
+    WinTap {
+        win_vk: u32,
+    },
+    ReplayWinChord {
+        win_vk: u32,
+        modifier_vks: Vec<u32>,
+        key_vk: u32,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct HookDecision {
     command: Option<WatchCommand>,
     suppress: bool,
@@ -402,14 +496,49 @@ fn lookup_low_level_runtime(thread_id: u32) -> Option<Arc<LowLevelHotkeyRuntime>
 
 fn replay_action(action: ReplayAction) {
     match action {
+        ReplayAction::LockWorkstation => {
+            lock_workstation();
+        }
         ReplayAction::WinTap { win_vk } => {
             send_virtual_key(win_vk, false);
             send_virtual_key(win_vk, true);
         }
-        ReplayAction::ReplayWinChord { win_vk, key_vk } => {
+        ReplayAction::ReplayWinChord {
+            win_vk,
+            modifier_vks,
+            key_vk,
+        } => {
             send_virtual_key(win_vk, false);
+            for &modifier_vk in &modifier_vks {
+                send_virtual_key(modifier_vk, false);
+            }
             send_virtual_key(key_vk, false);
+            send_virtual_key(key_vk, true);
+            for &modifier_vk in modifier_vks.iter().rev() {
+                send_virtual_key(modifier_vk, true);
+            }
+            send_virtual_key(win_vk, true);
         }
+    }
+}
+
+fn replay_action_needs_shell_screenshot_escape(action: &ReplayAction) -> bool {
+    match action {
+        ReplayAction::LockWorkstation | ReplayAction::WinTap { .. } => false,
+        ReplayAction::ReplayWinChord {
+            modifier_vks,
+            key_vk,
+            ..
+        } => is_shell_screenshot_overlay_chord(modifier_vks, *key_vk),
+    }
+}
+
+fn lock_workstation() {
+    if unsafe { LockWorkStation() } == 0 {
+        write_runtime_log(format!(
+            "hotkey: lock-workstation-failed error={}",
+            last_error_message("LockWorkStation")
+        ));
     }
 }
 
@@ -569,6 +698,34 @@ fn is_win_vk(vk: u32) -> bool {
     vk == u32::from(VK_LWIN) || vk == u32::from(VK_RWIN)
 }
 
+fn is_pending_modifier_vk(vk: u32) -> bool {
+    is_shift_vk(vk) || is_control_vk(vk) || is_alt_vk(vk)
+}
+
+fn is_start_menu_transfer_key(vk: u32) -> bool {
+    vk == START_MENU_TRANSFER_KEY
+}
+
+fn is_lock_workstation_key(vk: u32) -> bool {
+    vk == LOCK_WORKSTATION_KEY
+}
+
+fn is_shell_screenshot_overlay_chord(modifier_vks: &[u32], key_vk: u32) -> bool {
+    key_vk == START_MENU_TRANSFER_KEY
+        && !modifier_vks.is_empty()
+        && modifier_vks.iter().all(|vk| is_shift_vk(*vk))
+}
+
+fn pending_modifier_vks(pressed_keys: &HashSet<u32>, win_vk: u32) -> Vec<u32> {
+    let mut modifiers = pressed_keys
+        .iter()
+        .copied()
+        .filter(|key| *key != win_vk && is_pending_modifier_vk(*key))
+        .collect::<Vec<_>>();
+    modifiers.sort_unstable();
+    modifiers
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -582,7 +739,10 @@ mod tests {
 
     use crate::control::{ControlMessage, WatchCommand};
 
-    use super::{ActiveRepeatLoop, HookDecision, LowLevelHotkeyState, ReplayAction};
+    use super::{
+        ActiveRepeatLoop, HookDecision, LowLevelHotkeyState, ReplayAction,
+        replay_action_needs_shell_screenshot_escape,
+    };
     use crate::hotkeys::native::NativeHotkeyRegistration;
 
     #[test]
@@ -944,6 +1104,138 @@ mod tests {
     }
 
     #[test]
+    fn pure_win_tab_chord_toggles_overview_without_shell_leakage() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+Tab".to_string(),
+            command: WatchCommand::ToggleOverview,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: 0x09,
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(0x09, WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::ToggleOverview),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(0x09, WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pure_win_t_chord_opens_terminal_without_shell_leakage() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+T".to_string(),
+            command: WatchCommand::OpenTerminal,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'T'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'T'), WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::OpenTerminal),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'T'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pure_win_q_chord_closes_window_without_shell_leakage() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+Q".to_string(),
+            command: WatchCommand::CloseWindow,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'Q'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'Q'), WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::CloseWindow),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'Q'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
     fn unmatched_pure_win_key_replays_prefix_back_to_shell() {
         let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
             trigger: "Win+H".to_string(),
@@ -968,12 +1260,57 @@ mod tests {
                 suppress: true,
                 replay: Some(ReplayAction::ReplayWinChord {
                     win_vk: u32::from(VK_LWIN),
+                    modifier_vks: Vec::new(),
                     key_vk: u32::from(b'E'),
                 }),
             }
         );
         assert_eq!(
             state.handle_key_event(u32::from(b'E'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn win_l_locks_workstation_without_replaying_or_leaking_stale_super_state() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+H".to_string(),
+            command: WatchCommand::FocusPrev,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'H'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'L'), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: Some(ReplayAction::LockWorkstation),
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'C'), WM_KEYDOWN, false),
             HookDecision::default()
         );
         assert_eq!(
@@ -983,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_win_tap_replays_start_keypath() {
+    fn standalone_win_tap_is_swallowed_when_pure_win_bindings_are_active() {
         let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
             trigger: "Win+H".to_string(),
             command: WatchCommand::FocusPrev,
@@ -1005,9 +1342,263 @@ mod tests {
             HookDecision {
                 command: None,
                 suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn win_shift_s_replays_full_modifier_chord_instead_of_start_transfer() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+H".to_string(),
+            command: WatchCommand::FocusPrev,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'H'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LSHIFT), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: Some(ReplayAction::ReplayWinChord {
+                    win_vk: u32::from(VK_LWIN),
+                    modifier_vks: vec![u32::from(VK_LSHIFT)],
+                    key_vk: u32::from(b'S'),
+                }),
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LSHIFT), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_win_prefix_keeps_modifier_until_exact_binding_matches() {
+        let mut state = LowLevelHotkeyState::new(vec![
+            NativeHotkeyRegistration {
+                trigger: "Win+H".to_string(),
+                command: WatchCommand::FocusPrev,
+                register_modifiers: MOD_WIN,
+                required_modifiers: MOD_WIN,
+                key: u32::from(b'H'),
+            },
+            NativeHotkeyRegistration {
+                trigger: "Win+Ctrl+L".to_string(),
+                command: WatchCommand::ScrollRight,
+                register_modifiers: MOD_CONTROL | MOD_WIN | MOD_NOREPEAT,
+                required_modifiers: MOD_CONTROL | MOD_WIN,
+                key: u32::from(b'L'),
+            },
+        ]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LCONTROL), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'L'), WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::ScrollRight),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'L'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LCONTROL), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn shell_screenshot_replay_requests_overview_escape() {
+        assert!(replay_action_needs_shell_screenshot_escape(
+            &ReplayAction::ReplayWinChord {
+                win_vk: u32::from(VK_LWIN),
+                modifier_vks: vec![u32::from(VK_LSHIFT)],
+                key_vk: u32::from(b'S'),
+            }
+        ));
+        assert!(!replay_action_needs_shell_screenshot_escape(
+            &ReplayAction::ReplayWinChord {
+                win_vk: u32::from(VK_LWIN),
+                modifier_vks: vec![u32::from(VK_LSHIFT)],
+                key_vk: u32::from(b'D'),
+            }
+        ));
+        assert!(!replay_action_needs_shell_screenshot_escape(
+            &ReplayAction::ReplayWinChord {
+                win_vk: u32::from(VK_LWIN),
+                modifier_vks: vec![u32::from(VK_LCONTROL)],
+                key_vk: u32::from(b'S'),
+            }
+        ));
+    }
+
+    #[test]
+    fn win_s_transfers_to_start_menu_without_search_leakage() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+H".to_string(),
+            command: WatchCommand::FocusPrev,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'H'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
                 replay: Some(ReplayAction::WinTap {
                     win_vk: u32::from(VK_LWIN),
                 }),
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn configured_pure_win_s_binding_takes_precedence_over_start_menu_transfer() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+S".to_string(),
+            command: WatchCommand::FocusPrev,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'S'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::FocusPrev),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'S'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
             }
         );
     }

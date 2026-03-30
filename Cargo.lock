@@ -38,6 +38,7 @@ dependencies = [
  "flowtile-config-rules",
  "flowtile-domain",
  "flowtile-ipc",
+ "flowtile-layout-engine",
  "flowtile-windows-adapter",
  "flowtile-wm-core",
  "serde",

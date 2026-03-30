@@ -5,6 +5,10 @@ use flowtile_ipc::{IpcRequest, IpcResponse};
 #[derive(Clone, Debug)]
 pub(crate) enum ControlMessage {
     Watch(WatchCommand),
+    OverviewActivateWindow {
+        raw_hwnd: u64,
+    },
+    OverviewDismiss,
     IpcRequest {
         request: IpcRequest,
         response_sender: mpsc::Sender<IpcResponse>,
@@ -36,6 +40,8 @@ pub(crate) enum WatchCommand {
     OpenOverview,
     CloseOverview,
     ToggleOverview,
+    OpenTerminal,
+    CloseWindow,
     ReloadConfig,
     Snapshot,
     Unwind,
@@ -66,6 +72,8 @@ impl WatchCommand {
             "open-overview" => Some(Self::OpenOverview),
             "close-overview" => Some(Self::CloseOverview),
             "toggle-overview" => Some(Self::ToggleOverview),
+            "open-terminal" => Some(Self::OpenTerminal),
+            "close-window" => Some(Self::CloseWindow),
             "reload-config" => Some(Self::ReloadConfig),
             "disable-management-and-unwind" => Some(Self::Unwind),
             _ => None,
@@ -102,6 +110,8 @@ impl WatchCommand {
             "open-overview" | "overview-open" => Some(Self::OpenOverview),
             "close-overview" | "overview-close" => Some(Self::CloseOverview),
             "toggle-overview" | "overview" => Some(Self::ToggleOverview),
+            "open-terminal" | "terminal" => Some(Self::OpenTerminal),
+            "close-window" | "window-close" => Some(Self::CloseWindow),
             "reload-config" | "reload" => Some(Self::ReloadConfig),
             "snapshot" => Some(Self::Snapshot),
             "unwind" => Some(Self::Unwind),
@@ -137,6 +147,8 @@ impl WatchCommand {
             Self::OpenOverview => "open-overview",
             Self::CloseOverview => "close-overview",
             Self::ToggleOverview => "toggle-overview",
+            Self::OpenTerminal => "open-terminal",
+            Self::CloseWindow => "close-window",
             Self::ReloadConfig => "reload-config",
             Self::Snapshot => "snapshot",
             Self::Unwind => "disable-management-and-unwind",
@@ -168,7 +180,12 @@ impl WatchCommand {
             Self::CloseOverview => Some("close_overview"),
             Self::ToggleOverview => Some("toggle_overview"),
             Self::ReloadConfig => Some("reload_config"),
-            Self::Snapshot | Self::Unwind | Self::Rescan | Self::Quit => None,
+            Self::OpenTerminal
+            | Self::CloseWindow
+            | Self::Snapshot
+            | Self::Unwind
+            | Self::Rescan
+            | Self::Quit => None,
         }
     }
 

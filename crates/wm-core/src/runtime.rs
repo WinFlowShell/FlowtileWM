@@ -858,8 +858,9 @@ impl CoreDaemonRuntime {
             .filter(|window| window.is_managed)
             .and_then(|window| window.current_hwnd_binding);
         let actual_focused_hwnd = snapshot.actual_foreground_hwnd();
+        let overview_is_open = self.store.state().overview.is_open;
         let allow_activation_reassert =
-            self.should_attempt_activation_reassert(actual_focused_hwnd);
+            !overview_is_open && self.should_attempt_activation_reassert(actual_focused_hwnd);
         let mut operations = Vec::new();
 
         for workspace in self.store.state().workspaces.values() {
@@ -899,10 +900,11 @@ impl CoreDaemonRuntime {
                     != desired_focused_hwnd
                     && (apply_plan_context.previous_focused_hwnd == Some(hwnd)
                         || desired_focused_hwnd == Some(hwnd));
-                let visual_emphasis = (needs_geometry
-                    || activate
-                    || active_state_changed
-                    || apply_plan_context.refresh_visual_emphasis)
+                let visual_emphasis = (!overview_is_open
+                    && (needs_geometry
+                        || activate
+                        || active_state_changed
+                        || apply_plan_context.refresh_visual_emphasis))
                     .then(|| {
                         build_visual_emphasis(
                             desired_focused_hwnd == Some(hwnd),
@@ -1894,7 +1896,7 @@ fn build_visual_emphasis(
         },
         WindowVisualSafety::BrowserOpacityOnly => WindowVisualEmphasis {
             opacity_alpha: inactive_window_opacity_alpha(is_active_window),
-            opacity_mode: WindowOpacityMode::BrowserSurrogate,
+            opacity_mode: WindowOpacityMode::OverlayDim,
             force_clear_layered_style: is_active_window,
             disable_visual_effects: true,
             border_color_rgb: None,
@@ -2964,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn chromium_windows_use_inactive_opacity_only_to_avoid_composited_surface_regressions() {
+    fn chromium_windows_use_overlay_dim_only_to_avoid_composited_surface_regressions() {
         let inactive_edge = build_visual_emphasis(
             false,
             Some("msedge.exe"),
@@ -2972,10 +2974,7 @@ mod tests {
             "Example page",
         );
         assert_eq!(inactive_edge.opacity_alpha, Some(208));
-        assert_eq!(
-            inactive_edge.opacity_mode,
-            WindowOpacityMode::BrowserSurrogate
-        );
+        assert_eq!(inactive_edge.opacity_mode, WindowOpacityMode::OverlayDim);
         assert!(!inactive_edge.force_clear_layered_style);
         assert!(inactive_edge.disable_visual_effects);
         assert_eq!(inactive_edge.border_color_rgb, None);
@@ -2985,10 +2984,7 @@ mod tests {
         let active_chrome =
             build_visual_emphasis(true, Some("chrome"), "Chrome_WidgetWin_1", "Example page");
         assert_eq!(active_chrome.opacity_alpha, None);
-        assert_eq!(
-            active_chrome.opacity_mode,
-            WindowOpacityMode::BrowserSurrogate
-        );
+        assert_eq!(active_chrome.opacity_mode, WindowOpacityMode::OverlayDim);
         assert!(active_chrome.force_clear_layered_style);
         assert!(active_chrome.disable_visual_effects);
         assert_eq!(active_chrome.border_color_rgb, None);
@@ -3045,7 +3041,7 @@ mod tests {
         assert!(emphasis.force_clear_layered_style);
         assert!(emphasis.disable_visual_effects);
         assert_eq!(emphasis.opacity_alpha, None);
-        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::OverlayDim);
         assert_eq!(emphasis.border_color_rgb, None);
         assert!(!emphasis.rounded_corners);
     }
@@ -3062,7 +3058,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_chromium_windows_use_opacity_only_visual_emphasis() {
+    fn inactive_chromium_windows_use_overlay_dim_visual_emphasis() {
         let emphasis = build_visual_emphasis(
             false,
             Some("msedge.exe"),
@@ -3070,7 +3066,7 @@ mod tests {
             "Example page",
         );
         assert_eq!(emphasis.opacity_alpha, Some(208));
-        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::OverlayDim);
         assert!(!emphasis.force_clear_layered_style);
         assert!(emphasis.disable_visual_effects);
         assert_eq!(emphasis.border_color_rgb, None);
@@ -3079,7 +3075,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_new_tab_browser_windows_use_opacity_only_visual_emphasis() {
+    fn inactive_new_tab_browser_windows_use_overlay_dim_visual_emphasis() {
         let emphasis = build_visual_emphasis(
             false,
             Some("msedge.exe"),
@@ -3087,7 +3083,7 @@ mod tests {
             "Новая вкладка — Личный: Microsoft Edge",
         );
         assert_eq!(emphasis.opacity_alpha, Some(208));
-        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::OverlayDim);
         assert!(!emphasis.force_clear_layered_style);
         assert!(emphasis.disable_visual_effects);
         assert_eq!(emphasis.border_color_rgb, None);
@@ -3096,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn chromium_like_class_without_browser_process_still_uses_opacity_only_visual_emphasis() {
+    fn chromium_like_class_without_browser_process_still_uses_overlay_dim_visual_emphasis() {
         let emphasis = build_visual_emphasis(
             false,
             Some("Code.exe"),
@@ -3106,16 +3102,16 @@ mod tests {
         assert!(!emphasis.force_clear_layered_style);
         assert!(emphasis.disable_visual_effects);
         assert_eq!(emphasis.opacity_alpha, Some(208));
-        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::OverlayDim);
         assert_eq!(emphasis.border_color_rgb, None);
         assert!(super::visual_emphasis_has_effect(&emphasis));
     }
 
     #[test]
-    fn chromium_like_class_without_process_name_still_uses_opacity_only_visual_emphasis() {
+    fn chromium_like_class_without_process_name_still_uses_overlay_dim_visual_emphasis() {
         let emphasis = build_visual_emphasis(false, None, "Chrome_WidgetWin_1", "Microsoft Edge");
         assert_eq!(emphasis.opacity_alpha, Some(208));
-        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::BrowserSurrogate);
+        assert_eq!(emphasis.opacity_mode, WindowOpacityMode::OverlayDim);
         assert!(!emphasis.force_clear_layered_style);
         assert!(emphasis.disable_visual_effects);
         assert_eq!(emphasis.border_color_rgb, None);
@@ -3572,6 +3568,149 @@ mod tests {
 
         assert!(operation.apply_geometry);
         assert!(operation.window_switch_animation.is_some());
+    }
+
+    #[test]
+    fn overview_open_suppresses_live_activation_and_visual_emphasis() {
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Microsoft Edge".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 4343,
+                    process_name: Some("msedge".to_string()),
+                    rect: Rect::new(420, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::open_overview(CorrelationId::new(2), None))
+            .expect("open overview should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(3),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus navigation should succeed");
+
+        let apply_plan_context =
+            runtime.build_apply_plan_context(Some(100), Some(101), "manual-focus-next", true);
+        let planned_operations = runtime
+            .plan_apply_operations_with_context(&snapshot, apply_plan_context)
+            .expect("apply plan should be computed");
+
+        assert!(
+            !planned_operations
+                .iter()
+                .any(|operation| operation.activate),
+            "overview should suppress live activation while it is open"
+        );
+        assert!(
+            planned_operations
+                .iter()
+                .all(|operation| operation.visual_emphasis.is_none()),
+            "overview should suppress live visual emphasis while it is open"
+        );
+    }
+
+    #[test]
+    fn closing_overview_restores_activation_for_new_focus() {
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Microsoft Edge".to_string(),
+                    class_name: "Chrome_WidgetWin_1".to_string(),
+                    process_id: 4343,
+                    process_name: Some("msedge".to_string()),
+                    rect: Rect::new(420, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(snapshot.clone(), true)
+            .expect("initial sync should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::open_overview(CorrelationId::new(2), None))
+            .expect("open overview should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::focus_next(
+                CorrelationId::new(3),
+                NavigationScope::WorkspaceStrip,
+            ))
+            .expect("focus navigation should succeed");
+        runtime
+            .store
+            .dispatch(DomainEvent::close_overview(CorrelationId::new(4), None))
+            .expect("close overview should succeed");
+
+        let apply_plan_context =
+            runtime.build_apply_plan_context(Some(100), Some(101), "manual-close-overview", true);
+        let planned_operations = runtime
+            .plan_apply_operations_with_context(&snapshot, apply_plan_context)
+            .expect("apply plan should be computed");
+        let edge_operation = planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .expect("new focused edge window should be planned");
+
+        assert!(edge_operation.activate);
     }
 
     fn sample_snapshot(window_rect: Rect) -> PlatformSnapshot {

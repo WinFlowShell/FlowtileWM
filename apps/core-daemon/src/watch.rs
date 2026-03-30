@@ -17,10 +17,14 @@ use crate::{
     hotkeys::{HotkeyListener, HotkeyListenerError, ensure_bind_control_mode_supported},
     ipc,
     manual_resize::{ManualResizeController, ManualResizeError},
+    overview_surface::OverviewSurfaceController,
+    tab_indicator::TabIndicatorController,
+    terminal::open_default_terminal,
     touchpad::{
         TouchpadListener, TouchpadListenerError, assess_touchpad_override,
         ensure_touchpad_override_supported,
     },
+    window_actions::{activate_window, close_window},
 };
 
 const CONTROL_RESPONSE_SLICE_MS: u64 = 16;
@@ -114,6 +118,28 @@ pub(crate) fn run_watch(
             return ExitCode::from(1);
         }
     };
+    let mut tab_indicator = match TabIndicatorController::spawn() {
+        Ok(controller) => {
+            write_runtime_log("watch: tab-indicator-started");
+            Some(controller)
+        }
+        Err(error) => {
+            write_runtime_log(format!("watch: tab-indicator-start-error={error}"));
+            eprintln!("tab indicator surface failed to start: {error}");
+            None
+        }
+    };
+    let mut overview_surface = match OverviewSurfaceController::spawn(control_sender.clone()) {
+        Ok(controller) => {
+            write_runtime_log("watch: overview-surface-started");
+            Some(controller)
+        }
+        Err(error) => {
+            write_runtime_log(format!("watch: overview-surface-start-error={error}"));
+            eprintln!("overview surface failed to start: {error}");
+            None
+        }
+    };
     spawn_stdin_listener(control_sender.clone());
     write_runtime_log("watch: stdin-listener-started");
 
@@ -148,7 +174,7 @@ pub(crate) fn run_watch(
         ipc.command_pipe_name, ipc.event_stream_pipe_name
     );
     println!(
-        "stdin commands: focus-next, focus-prev, focus-workspace-up, focus-workspace-down, scroll-left, scroll-right, move-workspace-up, move-workspace-down, move-workspace-to-monitor-next, move-workspace-to-monitor-previous, move-column-to-workspace-up, move-column-to-workspace-down, cycle-column-width, toggle-floating, toggle-tabbed, toggle-maximized, toggle-fullscreen, open-overview, close-overview, toggle-overview, reload-config, snapshot, unwind, rescan, quit"
+        "stdin commands: focus-next, focus-prev, focus-workspace-up, focus-workspace-down, scroll-left, scroll-right, move-workspace-up, move-workspace-down, move-workspace-to-monitor-next, move-workspace-to-monitor-previous, move-column-to-workspace-up, move-column-to-workspace-down, cycle-column-width, toggle-floating, toggle-tabbed, toggle-maximized, toggle-fullscreen, open-overview, close-overview, toggle-overview, open-terminal, close-window, reload-config, snapshot, unwind, rescan, quit"
     );
 
     let mut completed_iterations = 0_u64;
@@ -161,6 +187,7 @@ pub(crate) fn run_watch(
     let observer_wait_slice = poll_interval.min(control_response_slice);
     let mut next_poll_deadline = Instant::now();
     write_runtime_log("watch: entering-main-loop");
+    sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
 
     if let Some(live_observer) = observer.as_mut() {
         match live_observer.recv_timeout(Duration::from_millis(interval_ms.max(5_000))) {
@@ -200,6 +227,8 @@ pub(crate) fn run_watch(
     }
 
     loop {
+        sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+
         while let Ok(message) = control_receiver.try_recv() {
             match message {
                 ControlMessage::Watch(command) => match command {
@@ -684,6 +713,31 @@ pub(crate) fn run_watch(
                             return ExitCode::from(1);
                         }
                     },
+                    WatchCommand::OpenTerminal => match open_default_terminal() {
+                        Ok(()) => {
+                            write_runtime_log("watch: open-terminal-ok");
+                            println!("manual command: open-terminal");
+                        }
+                        Err(error) => {
+                            write_runtime_log(format!("watch: open-terminal-error={error}"));
+                            eprintln!("open terminal failed: {error}");
+                        }
+                    },
+                    WatchCommand::CloseWindow => match focused_managed_hwnd(&runtime)
+                        .ok_or_else(|| {
+                            "no focused managed window is currently bound to an HWND".to_string()
+                        })
+                        .and_then(close_window)
+                    {
+                        Ok(()) => {
+                            write_runtime_log("watch: close-window-ok");
+                            println!("manual command: close-window");
+                        }
+                        Err(error) => {
+                            write_runtime_log(format!("watch: close-window-error={error}"));
+                            eprintln!("close window failed: {error}");
+                        }
+                    },
                     WatchCommand::ReloadConfig => match runtime.reload_config(dry_run) {
                         Ok(report) => {
                             hotkey_listener = match start_hotkey_listener(&runtime, &control_sender)
@@ -761,6 +815,90 @@ pub(crate) fn run_watch(
                         return ExitCode::SUCCESS;
                     }
                 },
+                ControlMessage::OverviewActivateWindow { raw_hwnd } => {
+                    if !overview_activation_target_is_valid(runtime.state(), raw_hwnd) {
+                        write_runtime_log(format!(
+                            "watch: overview-activate-window-ignored hwnd={raw_hwnd}"
+                        ));
+                        continue;
+                    }
+
+                    match runtime.dispatch_command(
+                        DomainEvent::close_overview(
+                            next_manual_correlation_id(&mut manual_correlation_id),
+                            None,
+                        ),
+                        dry_run,
+                        "overview-click-close-overview",
+                    ) {
+                        Ok(report) => {
+                            println!("overview action: activate-window");
+                            print_iteration(completed_iterations + 1, &report);
+                            completed_iterations += 1;
+                            maybe_broadcast_state(
+                                &runtime,
+                                &mut event_subscribers,
+                                &mut stream_version,
+                                &mut last_streamed_state_version,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("{error:?}");
+                            return ExitCode::from(1);
+                        }
+                    }
+
+                    sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+
+                    if dry_run {
+                        write_runtime_log(format!(
+                            "watch: overview-activate-window-dry-run hwnd={raw_hwnd}"
+                        ));
+                    } else if let Err(error) = activate_window(raw_hwnd) {
+                        write_runtime_log(format!(
+                            "watch: overview-activate-window-error hwnd={raw_hwnd} error={error}"
+                        ));
+                        eprintln!("overview click activation failed: {error}");
+                    } else {
+                        write_runtime_log(format!(
+                            "watch: overview-activate-window-ok hwnd={raw_hwnd}"
+                        ));
+                    }
+                }
+                ControlMessage::OverviewDismiss => {
+                    if !runtime.state().overview.is_open {
+                        write_runtime_log("watch: overview-dismiss-ignored");
+                        continue;
+                    }
+
+                    match runtime.dispatch_command(
+                        DomainEvent::close_overview(
+                            next_manual_correlation_id(&mut manual_correlation_id),
+                            None,
+                        ),
+                        dry_run,
+                        "overview-dismiss-close-overview",
+                    ) {
+                        Ok(report) => {
+                            println!("overview action: dismiss");
+                            print_iteration(completed_iterations + 1, &report);
+                            completed_iterations += 1;
+                            maybe_broadcast_state(
+                                &runtime,
+                                &mut event_subscribers,
+                                &mut stream_version,
+                                &mut last_streamed_state_version,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("{error:?}");
+                            return ExitCode::from(1);
+                        }
+                    }
+
+                    sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+                    write_runtime_log("watch: overview-dismiss-ok");
+                }
                 ControlMessage::IpcRequest {
                     request,
                     response_sender,
@@ -953,6 +1091,32 @@ fn maybe_broadcast_state(
     *last_streamed_state_version = current_state_version;
 }
 
+fn sync_visual_surfaces(
+    runtime: &CoreDaemonRuntime,
+    tab_indicator: &mut Option<TabIndicatorController>,
+    overview_surface: &mut Option<OverviewSurfaceController>,
+) {
+    if let Some(controller) = tab_indicator.as_mut()
+        && let Err(error) = controller.sync(runtime)
+    {
+        log_visual_surface_error("tab-indicator", &error);
+        *tab_indicator = None;
+    }
+
+    if let Some(controller) = overview_surface.as_mut()
+        && let Err(error) = controller.sync(runtime)
+    {
+        log_visual_surface_error("overview-surface", &error);
+        *overview_surface = None;
+    }
+}
+
+fn log_visual_surface_error(kind: &str, error: &impl std::fmt::Display) {
+    let message = format!("{kind} degraded: {error}");
+    write_runtime_log(format!("watch: {message}"));
+    eprintln!("{message}");
+}
+
 fn print_iteration(iteration: u64, report: &RuntimeCycleReport) {
     println!("iteration {iteration}");
     print_report(report);
@@ -1014,6 +1178,36 @@ fn next_manual_correlation_id(counter: &mut u64) -> CorrelationId {
     correlation_id
 }
 
+fn focused_managed_hwnd(runtime: &CoreDaemonRuntime) -> Option<u64> {
+    runtime
+        .state()
+        .focus
+        .focused_window_id
+        .and_then(|window_id| runtime.state().windows.get(&window_id))
+        .and_then(|window| window.current_hwnd_binding)
+}
+
+fn overview_activation_target_is_valid(state: &flowtile_domain::WmState, raw_hwnd: u64) -> bool {
+    if raw_hwnd == 0 || !state.overview.is_open {
+        return false;
+    }
+
+    let Some(monitor_id) = state.overview.monitor_id else {
+        return false;
+    };
+
+    state.windows.values().any(|window| {
+        if !window.is_managed || window.current_hwnd_binding != Some(raw_hwnd) {
+            return false;
+        }
+
+        state
+            .workspaces
+            .get(&window.workspace_id)
+            .is_some_and(|workspace| workspace.monitor_id == monitor_id)
+    })
+}
+
 fn start_hotkey_listener(
     runtime: &CoreDaemonRuntime,
     command_sender: &mpsc::Sender<ControlMessage>,
@@ -1052,5 +1246,96 @@ fn touchpad_watch_status(
         "enabled"
     } else {
         assess_touchpad_override(config).summary_label()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flowtile_domain::{
+        Rect, RuntimeMode, Size, WindowClassification, WindowLayer, WindowNode, WmState,
+    };
+
+    use super::overview_activation_target_is_valid;
+
+    #[test]
+    fn overview_activation_target_must_be_managed_on_the_open_monitor() {
+        let mut state = WmState::new(RuntimeMode::WmOnly);
+        let overview_monitor_id = state.add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+        let other_monitor_id = state.add_monitor(Rect::new(1600, 0, 1600, 900), 96, false);
+
+        let overview_workspace_id = state
+            .active_workspace_id_for_monitor(overview_monitor_id)
+            .expect("overview monitor workspace should exist");
+        let other_workspace_id = state
+            .active_workspace_id_for_monitor(other_monitor_id)
+            .expect("other monitor workspace should exist");
+
+        let overview_window_id = state.allocate_window_id();
+        state.windows.insert(
+            overview_window_id,
+            WindowNode {
+                id: overview_window_id,
+                current_hwnd_binding: Some(100),
+                classification: WindowClassification::Application,
+                layer: WindowLayer::Tiled,
+                workspace_id: overview_workspace_id,
+                column_id: None,
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(0, 0, 800, 600),
+                desired_size: Size::default(),
+            },
+        );
+
+        let unmanaged_window_id = state.allocate_window_id();
+        state.windows.insert(
+            unmanaged_window_id,
+            WindowNode {
+                id: unmanaged_window_id,
+                current_hwnd_binding: Some(200),
+                classification: WindowClassification::Application,
+                layer: WindowLayer::Tiled,
+                workspace_id: overview_workspace_id,
+                column_id: None,
+                is_managed: false,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(0, 0, 800, 600),
+                desired_size: Size::default(),
+            },
+        );
+
+        let other_monitor_window_id = state.allocate_window_id();
+        state.windows.insert(
+            other_monitor_window_id,
+            WindowNode {
+                id: other_monitor_window_id,
+                current_hwnd_binding: Some(300),
+                classification: WindowClassification::Application,
+                layer: WindowLayer::Tiled,
+                workspace_id: other_workspace_id,
+                column_id: None,
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(1600, 0, 800, 600),
+                desired_size: Size::default(),
+            },
+        );
+
+        state.overview.is_open = true;
+        state.overview.monitor_id = Some(overview_monitor_id);
+
+        assert!(overview_activation_target_is_valid(&state, 100));
+        assert!(!overview_activation_target_is_valid(&state, 0));
+        assert!(!overview_activation_target_is_valid(&state, 200));
+        assert!(!overview_activation_target_is_valid(&state, 300));
+
+        state.overview.is_open = false;
+        assert!(!overview_activation_target_is_valid(&state, 100));
     }
 }

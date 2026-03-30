@@ -473,10 +473,15 @@ fn apply_visual_emphasis_for_operation(operation: &ApplyOperation) -> Result<(),
     let Some(visual_emphasis) = &operation.visual_emphasis else {
         return Ok(());
     };
+    let effective_visual_emphasis = normalized_visual_emphasis(visual_emphasis);
     let hwnd = hwnd_from_raw(operation.hwnd)?;
     let tracked_hwnd = hwnd as isize;
-    let desired_visual_state = AppliedVisualState::from(visual_emphasis);
-    apply_window_browser_visual_surface(operation.hwnd, operation.rect, visual_emphasis)?;
+    let desired_visual_state = AppliedVisualState::from(&effective_visual_emphasis);
+    apply_window_browser_visual_surface(
+        operation.hwnd,
+        operation.rect,
+        &effective_visual_emphasis,
+    )?;
     let ex_style = query_window_ex_style(hwnd)?;
     let currently_layered = style_has_layered(ex_style);
     let wm_tracked_layered = layered_hwnds()
@@ -491,7 +496,7 @@ fn apply_visual_emphasis_for_operation(operation: &ApplyOperation) -> Result<(),
             should_skip_visual_write(
                 *state,
                 desired_visual_state,
-                visual_emphasis.force_clear_layered_style,
+                effective_visual_emphasis.force_clear_layered_style,
                 wm_tracked_layered,
                 currently_layered,
             )
@@ -502,23 +507,36 @@ fn apply_visual_emphasis_for_operation(operation: &ApplyOperation) -> Result<(),
     apply_window_opacity(
         hwnd,
         ex_style,
-        direct_layered_opacity_alpha(visual_emphasis),
-        visual_emphasis.force_clear_layered_style,
+        direct_layered_opacity_alpha(&effective_visual_emphasis),
+        effective_visual_emphasis.force_clear_layered_style,
     )?;
-    if visual_emphasis.disable_visual_effects {
+    if effective_visual_emphasis.disable_visual_effects {
         applied_visual_states()
             .lock()
             .expect("visual state registry lock should not be poisoned")
             .insert(tracked_hwnd, desired_visual_state);
         return Ok(());
     }
-    apply_window_corners(hwnd, visual_emphasis);
-    apply_window_border(hwnd, visual_emphasis);
+    apply_window_corners(hwnd, &effective_visual_emphasis);
+    apply_window_border(hwnd, &effective_visual_emphasis);
     applied_visual_states()
         .lock()
         .expect("visual state registry lock should not be poisoned")
         .insert(tracked_hwnd, desired_visual_state);
     Ok(())
+}
+
+fn normalized_visual_emphasis(visual_emphasis: &WindowVisualEmphasis) -> WindowVisualEmphasis {
+    if visual_emphasis.opacity_mode != WindowOpacityMode::BrowserSurrogate {
+        return visual_emphasis.clone();
+    }
+
+    // Chromium-class surrogate rendering already proved unstable on live Edge surfaces.
+    // Normalize any stale or externally supplied surrogate request to the safer overlay path
+    // before we touch HWND visual state, so first-frame startup cannot regress back to it.
+    let mut normalized = visual_emphasis.clone();
+    normalized.opacity_mode = WindowOpacityMode::OverlayDim;
+    normalized
 }
 
 fn sync_browser_visual_surfaces_for_animation_frame(
@@ -2043,8 +2061,8 @@ mod tests {
 
     use super::{
         AppliedVisualState, FrameInsets, browser_surrogate_alpha, direct_layered_opacity_alpha,
-        ease_out_cubic, frame_insets, interpolate_rect, overlay_dim_alpha,
-        overlay_dim_alpha_from_window_opacity, should_clear_layered_style,
+        ease_out_cubic, frame_insets, interpolate_rect, normalized_visual_emphasis,
+        overlay_dim_alpha, overlay_dim_alpha_from_window_opacity, should_clear_layered_style,
         should_refresh_after_layered_enable, should_skip_visual_write, source_relative_rect,
         uses_window_switch_animation, visible_frame_is_compatible,
     };
@@ -2198,6 +2216,26 @@ mod tests {
         assert_eq!(direct_layered_opacity_alpha(&emphasis), None);
         assert_eq!(browser_surrogate_alpha(&emphasis), Some(208));
         assert_eq!(overlay_dim_alpha(&emphasis), None);
+    }
+
+    #[test]
+    fn browser_surrogate_requests_are_normalized_to_overlay_dim() {
+        let emphasis = WindowVisualEmphasis {
+            opacity_alpha: Some(208),
+            opacity_mode: WindowOpacityMode::BrowserSurrogate,
+            force_clear_layered_style: false,
+            disable_visual_effects: true,
+            border_color_rgb: None,
+            border_thickness_px: 3,
+            rounded_corners: false,
+        };
+
+        let normalized = normalized_visual_emphasis(&emphasis);
+
+        assert_eq!(normalized.opacity_mode, WindowOpacityMode::OverlayDim);
+        assert_eq!(normalized.opacity_alpha, Some(208));
+        assert_eq!(browser_surrogate_alpha(&normalized), None);
+        assert_eq!(overlay_dim_alpha(&normalized), Some(47));
     }
 
     #[test]
