@@ -1972,6 +1972,119 @@ mod tests {
     }
 
     #[test]
+    fn targeted_column_move_can_transfer_column_into_explicit_workspace() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+
+        let window_a =
+            discover_tiled_window(&mut store, 1, monitor_id, 100, Rect::new(0, 0, 420, 900));
+        let window_b =
+            discover_tiled_window(&mut store, 2, monitor_id, 101, Rect::new(420, 0, 360, 900));
+        let source_column_id = store
+            .state()
+            .windows
+            .get(&window_a)
+            .and_then(|window| window.column_id)
+            .expect("window A should belong to a tiled column");
+        let target_workspace_id = ordered_workspace_ids_for_monitor(store.state(), monitor_id)[1];
+
+        store
+            .dispatch(DomainEvent::move_column_to_workspace_target(
+                CorrelationId::new(3),
+                source_column_id,
+                target_workspace_id,
+                None,
+            ))
+            .expect("targeted column move should succeed");
+
+        let ordered_workspace_ids = ordered_workspace_ids_for_monitor(store.state(), monitor_id);
+        assert_eq!(ordered_workspace_ids.len(), 3);
+        assert_eq!(
+            store.state().active_workspace_id_for_monitor(monitor_id),
+            Some(target_workspace_id)
+        );
+        assert_eq!(store.state().focus.focused_window_id, Some(window_a));
+        assert_eq!(
+            store
+                .state()
+                .windows
+                .get(&window_a)
+                .expect("window A should exist")
+                .workspace_id,
+            target_workspace_id
+        );
+        assert_eq!(
+            store
+                .state()
+                .windows
+                .get(&window_b)
+                .expect("window B should exist")
+                .workspace_id,
+            ordered_workspace_ids[0]
+        );
+    }
+
+    #[test]
+    fn targeted_column_move_reorders_column_within_same_workspace() {
+        let mut store = StateStore::new(RuntimeMode::WmOnly);
+        let monitor_id = store
+            .state_mut()
+            .add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+
+        let window_a =
+            discover_tiled_window(&mut store, 1, monitor_id, 100, Rect::new(0, 0, 320, 900));
+        let window_b =
+            discover_tiled_window(&mut store, 2, monitor_id, 101, Rect::new(320, 0, 320, 900));
+        let window_c =
+            discover_tiled_window(&mut store, 3, monitor_id, 102, Rect::new(640, 0, 320, 900));
+        let workspace_id = store
+            .state()
+            .active_workspace_id_for_monitor(monitor_id)
+            .expect("active workspace should exist");
+        let column_a = store
+            .state()
+            .windows
+            .get(&window_a)
+            .and_then(|window| window.column_id)
+            .expect("window A should belong to a tiled column");
+        let column_b = store
+            .state()
+            .windows
+            .get(&window_b)
+            .and_then(|window| window.column_id)
+            .expect("window B should belong to a tiled column");
+        let column_c = store
+            .state()
+            .windows
+            .get(&window_c)
+            .and_then(|window| window.column_id)
+            .expect("window C should belong to a tiled column");
+
+        store
+            .dispatch(DomainEvent::move_column_to_workspace_target(
+                CorrelationId::new(4),
+                column_a,
+                workspace_id,
+                Some(column_b),
+            ))
+            .expect("targeted column reorder should succeed");
+
+        let ordered_columns = store
+            .state()
+            .workspaces
+            .get(&workspace_id)
+            .expect("workspace should exist")
+            .strip
+            .ordered_column_ids
+            .clone();
+        assert_eq!(ordered_columns, vec![column_b, column_a, column_c]);
+        assert_eq!(store.state().focus.focused_window_id, Some(window_a));
+        assert_eq!(store.state().focus.focused_column_id, Some(column_a));
+    }
+
+    #[test]
     fn empty_workspace_in_middle_collapses_after_column_move() {
         let mut store = StateStore::new(RuntimeMode::WmOnly);
         let monitor_id = store

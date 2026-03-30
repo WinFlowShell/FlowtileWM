@@ -101,6 +101,9 @@ impl StateStore {
             DomainEventPayload::CmdMoveColumnToWorkspaceDown(payload) => {
                 self.handle_move_column_to_workspace(true, payload)
             }
+            DomainEventPayload::CmdMoveColumnToWorkspaceTarget(payload) => {
+                self.handle_move_column_to_workspace_target(payload)
+            }
             DomainEventPayload::CmdToggleFloating(payload) => self.handle_toggle_floating(payload),
             DomainEventPayload::CmdToggleTabbed(payload) => self.handle_toggle_tabbed(payload),
             DomainEventPayload::CmdToggleMaximized(payload) => {
@@ -677,15 +680,83 @@ impl StateStore {
         if target_workspace_id == source_workspace_id {
             return Ok(Some(source_workspace_id));
         }
+        self.move_column_to_workspace_target_internal(column_id, target_workspace_id, None)
+    }
 
+    fn handle_move_column_to_workspace_target(
+        &mut self,
+        payload: &flowtile_domain::MoveColumnToWorkspaceTargetPayload,
+    ) -> Result<Option<WorkspaceId>, CoreError> {
+        self.move_column_to_workspace_target_internal(
+            payload.source_column_id,
+            payload.target_workspace_id,
+            payload.insert_after_column_id,
+        )
+    }
+
+    fn move_column_to_workspace_target_internal(
+        &mut self,
+        source_column_id: ColumnId,
+        target_workspace_id: WorkspaceId,
+        insert_after_column_id: Option<ColumnId>,
+    ) -> Result<Option<WorkspaceId>, CoreError> {
         let moved_window_ids = self
             .state
             .layout
             .columns
-            .get(&column_id)
-            .ok_or(CoreError::UnknownColumn(column_id))?
+            .get(&source_column_id)
+            .ok_or(CoreError::UnknownColumn(source_column_id))?
             .ordered_window_ids
             .clone();
+        let source_window_id = moved_window_ids
+            .first()
+            .copied()
+            .ok_or(CoreError::InvalidEvent(
+                "move column target requires a non-empty managed tiled column",
+            ))?;
+        let source_workspace_id = self.column_workspace_id(source_column_id)?;
+        let source_monitor_id = self
+            .state
+            .workspaces
+            .get(&source_workspace_id)
+            .map(|workspace| workspace.monitor_id)
+            .ok_or(CoreError::UnknownWorkspace(source_workspace_id))?;
+        let target_monitor_id = self
+            .state
+            .workspaces
+            .get(&target_workspace_id)
+            .map(|workspace| workspace.monitor_id)
+            .ok_or(CoreError::UnknownWorkspace(target_workspace_id))?;
+        let source_workspace_set_id = self
+            .state
+            .workspace_set_id_for_monitor(source_monitor_id)
+            .ok_or(CoreError::UnknownMonitor(source_monitor_id))?;
+        let target_workspace_set_id = self
+            .state
+            .workspace_set_id_for_monitor(target_monitor_id)
+            .ok_or(CoreError::UnknownMonitor(target_monitor_id))?;
+        if source_workspace_id == target_workspace_id
+            && insert_after_column_id == Some(source_column_id)
+        {
+            return Ok(Some(target_workspace_id));
+        }
+
+        if let Some(anchor_column_id) = insert_after_column_id {
+            let anchor_workspace_id = self.column_workspace_id(anchor_column_id)?;
+            if anchor_workspace_id != target_workspace_id {
+                return Err(CoreError::InvalidEvent(
+                    "move column target anchor must belong to the target workspace",
+                ));
+            }
+        }
+
+        let focus_window_id = self
+            .state
+            .layout
+            .columns
+            .get(&source_column_id)
+            .and_then(|column| self.column_active_window(column))
+            .unwrap_or(source_window_id);
 
         {
             let source_workspace = self
@@ -696,8 +767,8 @@ impl StateStore {
             source_workspace
                 .strip
                 .ordered_column_ids
-                .retain(|candidate_column_id| *candidate_column_id != column_id);
-            if source_workspace.remembered_focused_column_id == Some(column_id) {
+                .retain(|candidate_column_id| *candidate_column_id != source_column_id);
+            if source_workspace.remembered_focused_column_id == Some(source_column_id) {
                 source_workspace.remembered_focused_column_id = None;
             }
             if source_workspace
@@ -714,34 +785,46 @@ impl StateStore {
                 .workspaces
                 .get_mut(&target_workspace_id)
                 .ok_or(CoreError::UnknownWorkspace(target_workspace_id))?;
-            if !target_workspace
+            target_workspace
                 .strip
                 .ordered_column_ids
-                .contains(&column_id)
-            {
-                target_workspace.strip.ordered_column_ids.push(column_id);
-            }
+                .retain(|candidate_column_id| *candidate_column_id != source_column_id);
+            let insert_index = insert_after_column_id
+                .and_then(|anchor_column_id| {
+                    target_workspace
+                        .strip
+                        .ordered_column_ids
+                        .iter()
+                        .position(|candidate_column_id| *candidate_column_id == anchor_column_id)
+                        .map(|index| index + 1)
+                })
+                .unwrap_or(target_workspace.strip.ordered_column_ids.len())
+                .min(target_workspace.strip.ordered_column_ids.len());
+            target_workspace
+                .strip
+                .ordered_column_ids
+                .insert(insert_index, source_column_id);
+            target_workspace.remembered_focused_column_id = Some(source_column_id);
+            target_workspace.remembered_focused_window_id = Some(focus_window_id);
         }
 
         for window_id in &moved_window_ids {
             if let Some(window) = self.state.windows.get_mut(window_id) {
                 window.workspace_id = target_workspace_id;
-                window.column_id = Some(column_id);
+                window.column_id = Some(source_column_id);
             }
         }
 
-        let target_monitor_id = self
-            .state
-            .workspaces
-            .get(&target_workspace_id)
-            .map(|workspace| workspace.monitor_id)
-            .ok_or(CoreError::UnknownWorkspace(target_workspace_id))?;
         self.activate_workspace(
             target_monitor_id,
             target_workspace_id,
             FocusOrigin::UserCommand,
         )?;
-        self.state.normalize_workspace_set(workspace_set_id);
+        self.state.normalize_workspace_set(source_workspace_set_id);
+        if target_workspace_set_id != source_workspace_set_id {
+            self.state.normalize_workspace_set(target_workspace_set_id);
+            self.sync_overview_selection(source_monitor_id);
+        }
         Ok(Some(target_workspace_id))
     }
 
@@ -1465,6 +1548,26 @@ impl StateStore {
                 .active_window_id
                 .or_else(|| column.ordered_window_ids.first().copied())
         }
+    }
+
+    fn column_workspace_id(&self, column_id: ColumnId) -> Result<WorkspaceId, CoreError> {
+        let window_id = self
+            .state
+            .layout
+            .columns
+            .get(&column_id)
+            .ok_or(CoreError::UnknownColumn(column_id))?
+            .ordered_window_ids
+            .first()
+            .copied()
+            .ok_or(CoreError::InvalidEvent(
+                "column workspace lookup requires a non-empty column",
+            ))?;
+        self.state
+            .windows
+            .get(&window_id)
+            .map(|window| window.workspace_id)
+            .ok_or(CoreError::UnknownWindow(window_id))
     }
 
     fn command_monitor_id(

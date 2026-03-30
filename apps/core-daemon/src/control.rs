@@ -1,5 +1,6 @@
 use std::sync::mpsc;
 
+use flowtile_domain::WorkspaceId;
 use flowtile_ipc::{IpcRequest, IpcResponse};
 
 #[derive(Clone, Debug)]
@@ -7,6 +8,11 @@ pub(crate) enum ControlMessage {
     Watch(WatchCommand),
     OverviewActivateWindow {
         raw_hwnd: u64,
+    },
+    OverviewMoveColumn {
+        dragged_raw_hwnd: u64,
+        target_workspace_id: WorkspaceId,
+        insert_after_raw_hwnd: Option<u64>,
     },
     OverviewDismiss,
     IpcRequest {

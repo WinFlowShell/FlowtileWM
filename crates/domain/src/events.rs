@@ -1,6 +1,7 @@
 use crate::{
-    ColumnMode, ConfigProjection, CorrelationId, FocusOrigin, MonitorId, Rect, ResizeEdge, Size,
-    StateVersion, WidthSemantics, WindowClassification, WindowId, WindowLayer,
+    ColumnId, ColumnMode, ConfigProjection, CorrelationId, FocusOrigin, MonitorId, Rect,
+    ResizeEdge, Size, StateVersion, WidthSemantics, WindowClassification, WindowId, WindowLayer,
+    WorkspaceId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +46,7 @@ pub enum DomainEventName {
     CmdMoveWorkspaceToMonitorPrevious,
     CmdMoveColumnToWorkspaceUp,
     CmdMoveColumnToWorkspaceDown,
+    CmdMoveColumnToWorkspaceTarget,
     CmdMoveWindow,
     CmdToggleFloating,
     CmdToggleTabbed,
@@ -99,6 +101,7 @@ impl DomainEventName {
             Self::CmdMoveWorkspaceToMonitorPrevious => "EVT-CMD-MOVE-WORKSPACE-TO-MONITOR-PREVIOUS",
             Self::CmdMoveColumnToWorkspaceUp => "EVT-CMD-MOVE-COLUMN-TO-WORKSPACE-UP",
             Self::CmdMoveColumnToWorkspaceDown => "EVT-CMD-MOVE-COLUMN-TO-WORKSPACE-DOWN",
+            Self::CmdMoveColumnToWorkspaceTarget => "EVT-CMD-MOVE-COLUMN-TO-WORKSPACE-TARGET",
             Self::CmdMoveWindow => "EVT-CMD-MOVE-WINDOW",
             Self::CmdToggleFloating => "EVT-CMD-TOGGLE-FLOATING",
             Self::CmdToggleTabbed => "EVT-CMD-TOGGLE-TABBED",
@@ -216,6 +219,13 @@ pub struct WorkspaceCommandPayload {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoveColumnToWorkspaceTargetPayload {
+    pub source_column_id: ColumnId,
+    pub target_workspace_id: WorkspaceId,
+    pub insert_after_column_id: Option<ColumnId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OverviewCommandPayload {
     pub monitor_id: Option<MonitorId>,
 }
@@ -274,6 +284,7 @@ pub enum DomainEventPayload {
     CmdMoveWorkspaceToMonitorPrevious(WorkspaceCommandPayload),
     CmdMoveColumnToWorkspaceUp(WorkspaceCommandPayload),
     CmdMoveColumnToWorkspaceDown(WorkspaceCommandPayload),
+    CmdMoveColumnToWorkspaceTarget(MoveColumnToWorkspaceTargetPayload),
     CmdToggleFloating(WindowCommandPayload),
     CmdToggleTabbed(WindowCommandPayload),
     CmdToggleMaximized(WindowCommandPayload),
@@ -550,6 +561,27 @@ impl DomainEvent {
             DomainEventPayload::CmdMoveColumnToWorkspaceDown(WorkspaceCommandPayload {
                 monitor_id,
             }),
+        )
+    }
+
+    pub fn move_column_to_workspace_target(
+        correlation_id: CorrelationId,
+        source_column_id: ColumnId,
+        target_workspace_id: WorkspaceId,
+        insert_after_column_id: Option<ColumnId>,
+    ) -> Self {
+        Self::new(
+            DomainEventName::CmdMoveColumnToWorkspaceTarget,
+            EventCategory::UserInputDerived,
+            EventSource::InputCommand,
+            correlation_id,
+            DomainEventPayload::CmdMoveColumnToWorkspaceTarget(
+                MoveColumnToWorkspaceTargetPayload {
+                    source_column_id,
+                    target_workspace_id,
+                    insert_after_column_id,
+                },
+            ),
         )
     }
 

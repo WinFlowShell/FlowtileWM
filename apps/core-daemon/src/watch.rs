@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flowtile_domain::{CorrelationId, DomainEvent, NavigationScope, RuntimeMode};
+use flowtile_domain::{
+    ColumnId, CorrelationId, DomainEvent, NavigationScope, RuntimeMode, WorkspaceId,
+};
 use flowtile_ipc::bootstrap as ipc_bootstrap;
 use flowtile_windows_adapter::{LiveObservationOptions, ObservationStreamError, WindowsAdapter};
 use flowtile_wm_core::{CoreDaemonRuntime, RuntimeCycleReport};
@@ -17,7 +19,7 @@ use crate::{
     hotkeys::{HotkeyListener, HotkeyListenerError, ensure_bind_control_mode_supported},
     ipc,
     manual_resize::{ManualResizeController, ManualResizeError},
-    overview_surface::OverviewSurfaceController,
+    overview_controller::OverviewSurfaceController,
     tab_indicator::TabIndicatorController,
     terminal::open_default_terminal,
     touchpad::{
@@ -187,7 +189,12 @@ pub(crate) fn run_watch(
     let observer_wait_slice = poll_interval.min(control_response_slice);
     let mut next_poll_deadline = Instant::now();
     write_runtime_log("watch: entering-main-loop");
-    sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+    sync_visual_surfaces(
+        &runtime,
+        &control_sender,
+        &mut tab_indicator,
+        &mut overview_surface,
+    );
 
     if let Some(live_observer) = observer.as_mut() {
         match live_observer.recv_timeout(Duration::from_millis(interval_ms.max(5_000))) {
@@ -227,7 +234,12 @@ pub(crate) fn run_watch(
     }
 
     loop {
-        sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+        sync_visual_surfaces(
+            &runtime,
+            &control_sender,
+            &mut tab_indicator,
+            &mut overview_surface,
+        );
 
         while let Ok(message) = control_receiver.try_recv() {
             match message {
@@ -848,7 +860,12 @@ pub(crate) fn run_watch(
                         }
                     }
 
-                    sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+                    sync_visual_surfaces(
+                        &runtime,
+                        &control_sender,
+                        &mut tab_indicator,
+                        &mut overview_surface,
+                    );
 
                     if dry_run {
                         write_runtime_log(format!(
@@ -896,8 +913,85 @@ pub(crate) fn run_watch(
                         }
                     }
 
-                    sync_visual_surfaces(&runtime, &mut tab_indicator, &mut overview_surface);
+                    sync_visual_surfaces(
+                        &runtime,
+                        &control_sender,
+                        &mut tab_indicator,
+                        &mut overview_surface,
+                    );
                     write_runtime_log("watch: overview-dismiss-ok");
+                }
+                ControlMessage::OverviewMoveColumn {
+                    dragged_raw_hwnd,
+                    target_workspace_id,
+                    insert_after_raw_hwnd,
+                } => {
+                    if !overview_workspace_target_is_valid(runtime.state(), target_workspace_id) {
+                        write_runtime_log(format!(
+                            "watch: overview-move-column-ignored invalid-target-workspace={}",
+                            target_workspace_id.get()
+                        ));
+                        continue;
+                    }
+                    let Some(source_column_id) =
+                        overview_drag_source_column_id(runtime.state(), dragged_raw_hwnd)
+                    else {
+                        write_runtime_log(format!(
+                            "watch: overview-move-column-ignored invalid-source hwnd={dragged_raw_hwnd}"
+                        ));
+                        continue;
+                    };
+                    let Some(anchor_column_id) = overview_drop_anchor_column_id(
+                        runtime.state(),
+                        target_workspace_id,
+                        insert_after_raw_hwnd,
+                    ) else {
+                        write_runtime_log(format!(
+                            "watch: overview-move-column-ignored invalid-anchor hwnd={:?}",
+                            insert_after_raw_hwnd
+                        ));
+                        continue;
+                    };
+
+                    match runtime.dispatch_command(
+                        DomainEvent::move_column_to_workspace_target(
+                            next_manual_correlation_id(&mut manual_correlation_id),
+                            source_column_id,
+                            target_workspace_id,
+                            anchor_column_id,
+                        ),
+                        dry_run,
+                        "overview-drag-drop-column",
+                    ) {
+                        Ok(report) => {
+                            println!("overview action: move-column");
+                            print_iteration(completed_iterations + 1, &report);
+                            completed_iterations += 1;
+                            maybe_broadcast_state(
+                                &runtime,
+                                &mut event_subscribers,
+                                &mut stream_version,
+                                &mut last_streamed_state_version,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("{error:?}");
+                            return ExitCode::from(1);
+                        }
+                    }
+
+                    sync_visual_surfaces(
+                        &runtime,
+                        &control_sender,
+                        &mut tab_indicator,
+                        &mut overview_surface,
+                    );
+                    write_runtime_log(format!(
+                        "watch: overview-move-column-ok column={} target_workspace={} anchor={:?}",
+                        source_column_id.get(),
+                        target_workspace_id.get(),
+                        anchor_column_id.map(|column_id| column_id.get())
+                    ));
                 }
                 ControlMessage::IpcRequest {
                     request,
@@ -1093,6 +1187,7 @@ fn maybe_broadcast_state(
 
 fn sync_visual_surfaces(
     runtime: &CoreDaemonRuntime,
+    control_sender: &mpsc::Sender<ControlMessage>,
     tab_indicator: &mut Option<TabIndicatorController>,
     overview_surface: &mut Option<OverviewSurfaceController>,
 ) {
@@ -1103,11 +1198,36 @@ fn sync_visual_surfaces(
         *tab_indicator = None;
     }
 
+    ensure_overview_surface(runtime, control_sender, overview_surface);
     if let Some(controller) = overview_surface.as_mut()
         && let Err(error) = controller.sync(runtime)
     {
         log_visual_surface_error("overview-surface", &error);
         *overview_surface = None;
+    }
+}
+
+fn ensure_overview_surface(
+    runtime: &CoreDaemonRuntime,
+    control_sender: &mpsc::Sender<ControlMessage>,
+    overview_surface: &mut Option<OverviewSurfaceController>,
+) {
+    if overview_surface.is_some()
+        || !runtime.management_enabled()
+        || runtime.state().runtime.boot_mode == RuntimeMode::SafeMode
+        || !runtime.state().overview.is_open
+    {
+        return;
+    }
+
+    match OverviewSurfaceController::spawn(control_sender.clone()) {
+        Ok(controller) => {
+            write_runtime_log("watch: overview-surface-restarted");
+            *overview_surface = Some(controller);
+        }
+        Err(error) => {
+            log_visual_surface_error("overview-surface-restart", &error);
+        }
     }
 }
 
@@ -1208,6 +1328,72 @@ fn overview_activation_target_is_valid(state: &flowtile_domain::WmState, raw_hwn
     })
 }
 
+fn overview_workspace_target_is_valid(
+    state: &flowtile_domain::WmState,
+    workspace_id: WorkspaceId,
+) -> bool {
+    if !state.overview.is_open {
+        return false;
+    }
+
+    let Some(monitor_id) = state.overview.monitor_id else {
+        return false;
+    };
+
+    state
+        .workspaces
+        .get(&workspace_id)
+        .is_some_and(|workspace| workspace.monitor_id == monitor_id)
+}
+
+fn overview_drag_source_column_id(
+    state: &flowtile_domain::WmState,
+    raw_hwnd: u64,
+) -> Option<ColumnId> {
+    let window = overview_managed_window_for_hwnd(state, raw_hwnd)?;
+    (window.layer == flowtile_domain::WindowLayer::Tiled
+        && !window.is_floating
+        && !window.is_fullscreen)
+        .then_some(window.column_id)
+        .flatten()
+}
+
+fn overview_drop_anchor_column_id(
+    state: &flowtile_domain::WmState,
+    target_workspace_id: WorkspaceId,
+    raw_hwnd: Option<u64>,
+) -> Option<Option<ColumnId>> {
+    let Some(raw_hwnd) = raw_hwnd else {
+        return Some(None);
+    };
+    let window = overview_managed_window_for_hwnd(state, raw_hwnd)?;
+    if window.workspace_id != target_workspace_id
+        || window.layer != flowtile_domain::WindowLayer::Tiled
+        || window.is_floating
+        || window.is_fullscreen
+    {
+        return None;
+    }
+    window.column_id.map(Some)
+}
+
+fn overview_managed_window_for_hwnd<'a>(
+    state: &'a flowtile_domain::WmState,
+    raw_hwnd: u64,
+) -> Option<&'a flowtile_domain::WindowNode> {
+    let monitor_id = state.overview.monitor_id?;
+    state.windows.values().find(|window| {
+        if !window.is_managed || window.current_hwnd_binding != Some(raw_hwnd) {
+            return false;
+        }
+
+        state
+            .workspaces
+            .get(&window.workspace_id)
+            .is_some_and(|workspace| workspace.monitor_id == monitor_id)
+    })
+}
+
 fn start_hotkey_listener(
     runtime: &CoreDaemonRuntime,
     command_sender: &mpsc::Sender<ControlMessage>,
@@ -1252,10 +1438,14 @@ fn touchpad_watch_status(
 #[cfg(test)]
 mod tests {
     use flowtile_domain::{
-        Rect, RuntimeMode, Size, WindowClassification, WindowLayer, WindowNode, WmState,
+        Column, ColumnMode, Rect, RuntimeMode, Size, WidthSemantics, WindowClassification,
+        WindowLayer, WindowNode, WmState,
     };
 
-    use super::overview_activation_target_is_valid;
+    use super::{
+        overview_activation_target_is_valid, overview_drag_source_column_id,
+        overview_drop_anchor_column_id, overview_workspace_target_is_valid,
+    };
 
     #[test]
     fn overview_activation_target_must_be_managed_on_the_open_monitor() {
@@ -1337,5 +1527,128 @@ mod tests {
 
         state.overview.is_open = false;
         assert!(!overview_activation_target_is_valid(&state, 100));
+    }
+
+    #[test]
+    fn overview_drag_helpers_resolve_source_column_and_anchor_within_open_monitor_scene() {
+        let mut state = WmState::new(RuntimeMode::WmOnly);
+        let monitor_id = state.add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+        let source_workspace_id = state
+            .active_workspace_id_for_monitor(monitor_id)
+            .expect("source workspace should exist");
+
+        let source_column_id = state.allocate_column_id();
+        let anchor_column_id = state.allocate_column_id();
+        state.layout.columns.insert(
+            source_column_id,
+            Column::new(
+                source_column_id,
+                ColumnMode::Normal,
+                WidthSemantics::Fixed(420),
+                Vec::new(),
+            ),
+        );
+        state.layout.columns.insert(
+            anchor_column_id,
+            Column::new(
+                anchor_column_id,
+                ColumnMode::Normal,
+                WidthSemantics::Fixed(420),
+                Vec::new(),
+            ),
+        );
+
+        let source_window_id = state.allocate_window_id();
+        state.windows.insert(
+            source_window_id,
+            WindowNode {
+                id: source_window_id,
+                current_hwnd_binding: Some(100),
+                classification: WindowClassification::Application,
+                layer: WindowLayer::Tiled,
+                workspace_id: source_workspace_id,
+                column_id: Some(source_column_id),
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(0, 0, 420, 900),
+                desired_size: Size::default(),
+            },
+        );
+        state
+            .layout
+            .columns
+            .get_mut(&source_column_id)
+            .expect("source column should exist")
+            .ordered_window_ids
+            .push(source_window_id);
+        state
+            .workspaces
+            .get_mut(&source_workspace_id)
+            .expect("source workspace should exist")
+            .strip
+            .ordered_column_ids
+            .push(source_column_id);
+        let target_workspace_id = state
+            .ensure_tail_workspace(monitor_id)
+            .expect("tail workspace should exist");
+
+        let anchor_window_id = state.allocate_window_id();
+        state.windows.insert(
+            anchor_window_id,
+            WindowNode {
+                id: anchor_window_id,
+                current_hwnd_binding: Some(200),
+                classification: WindowClassification::Application,
+                layer: WindowLayer::Tiled,
+                workspace_id: target_workspace_id,
+                column_id: Some(anchor_column_id),
+                is_managed: true,
+                is_floating: false,
+                is_fullscreen: false,
+                restore_target: None,
+                last_known_rect: Rect::new(0, 0, 420, 900),
+                desired_size: Size::default(),
+            },
+        );
+        state
+            .layout
+            .columns
+            .get_mut(&anchor_column_id)
+            .expect("anchor column should exist")
+            .ordered_window_ids
+            .push(anchor_window_id);
+        state
+            .workspaces
+            .get_mut(&target_workspace_id)
+            .expect("target workspace should exist")
+            .strip
+            .ordered_column_ids
+            .push(anchor_column_id);
+
+        state.overview.is_open = true;
+        state.overview.monitor_id = Some(monitor_id);
+
+        assert!(overview_workspace_target_is_valid(
+            &state,
+            target_workspace_id
+        ));
+        assert_eq!(
+            overview_drag_source_column_id(&state, 100),
+            Some(source_column_id)
+        );
+        assert_eq!(
+            overview_drop_anchor_column_id(&state, target_workspace_id, Some(200)),
+            Some(Some(anchor_column_id))
+        );
+        assert_eq!(
+            overview_drop_anchor_column_id(&state, target_workspace_id, None),
+            Some(None)
+        );
+        assert_eq!(
+            overview_drop_anchor_column_id(&state, source_workspace_id, Some(200)),
+            None
+        );
     }
 }

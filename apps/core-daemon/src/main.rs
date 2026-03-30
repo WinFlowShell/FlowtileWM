@@ -4,6 +4,8 @@ mod diag;
 mod hotkeys;
 mod ipc;
 mod manual_resize;
+mod overview_controller;
+mod overview_engine;
 mod overview_surface;
 mod projection;
 mod tab_indicator;
