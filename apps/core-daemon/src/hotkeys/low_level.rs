@@ -1192,6 +1192,50 @@ mod tests {
     }
 
     #[test]
+    fn pure_win_w_chord_opens_wallpaper_selector_without_shell_leakage() {
+        let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
+            trigger: "Win+W".to_string(),
+            command: WatchCommand::OpenWallpaperSelector,
+            register_modifiers: MOD_WIN,
+            required_modifiers: MOD_WIN,
+            key: u32::from(b'W'),
+        }]);
+
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYDOWN, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'W'), WM_KEYDOWN, false),
+            HookDecision {
+                command: Some(WatchCommand::OpenWallpaperSelector),
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(b'W'), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+        assert_eq!(
+            state.handle_key_event(u32::from(VK_LWIN), WM_KEYUP, false),
+            HookDecision {
+                command: None,
+                suppress: true,
+                replay: None,
+            }
+        );
+    }
+
+    #[test]
     fn pure_win_q_chord_closes_window_without_shell_leakage() {
         let mut state = LowLevelHotkeyState::new(vec![NativeHotkeyRegistration {
             trigger: "Win+Q".to_string(),

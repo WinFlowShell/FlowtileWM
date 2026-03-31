@@ -23,6 +23,7 @@ input {
   hotkey "Win+J" "focus-workspace-down"
   hotkey "Win+Tab" "toggle-overview"
   hotkey "Win+T" "open-terminal"
+  hotkey "Win+W" "open-wallpaper-selector"
   hotkey "Win+Q" "close-window"
   hotkey "Win+R" "cycle-column-width"
   hotkey "Win+Ctrl+Shift+F" "toggle-floating"
@@ -46,6 +47,15 @@ rules {
     match-title-substring "Settings"
     actions {
       layer "floating"
+    }
+  }
+
+  rule "companion-wallpaper-selector" {
+    priority 120
+    enabled true
+    match-process-name "FlowShellWallpaper.UI"
+    actions {
+      managed false
     }
   }
 }

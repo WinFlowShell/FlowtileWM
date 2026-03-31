@@ -13,13 +13,14 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 pub const PREFERRED_CONFIG_FORMAT: &str = "KDL";
 pub const FALLBACK_CONFIG_FORMAT: &str = "TOML";
 pub const DEFAULT_CONFIG_PATH: &str = "config/flowtile.kdl";
-const DEFAULT_HOTKEY_BINDINGS: [(&str, &str); 17] = [
+const DEFAULT_HOTKEY_BINDINGS: [(&str, &str); 18] = [
     ("Win+H", "focus-prev"),
     ("Win+K", "focus-next"),
     ("Win+U", "focus-workspace-up"),
     ("Win+J", "focus-workspace-down"),
     ("Win+Tab", "toggle-overview"),
     ("Win+T", "open-terminal"),
+    ("Win+W", "open-wallpaper-selector"),
     ("Win+Q", "close-window"),
     ("Win+Ctrl+PageUp", "move-workspace-up"),
     ("Win+Ctrl+PageDown", "move-workspace-down"),
@@ -1184,6 +1185,15 @@ pub fn default_config_source() -> String {
         "      layer \"floating\"".to_string(),
         "    }".to_string(),
         "  }".to_string(),
+        String::new(),
+        "  rule \"companion-wallpaper-selector\" {".to_string(),
+        "    priority 120".to_string(),
+        "    enabled true".to_string(),
+        "    match-process-name \"FlowShellWallpaper.UI\"".to_string(),
+        "    actions {".to_string(),
+        "      managed false".to_string(),
+        "    }".to_string(),
+        "  }".to_string(),
         "}".to_string(),
         String::new(),
     ]);
@@ -1224,7 +1234,7 @@ mod tests {
         assert_eq!(config.projection.strip_scroll_step, 240);
         assert_eq!(config.projection.default_column_mode, ColumnMode::Normal);
         assert_eq!(config.projection.layout_spacing, LayoutSpacing::default());
-        assert_eq!(config.hotkeys.len(), 17);
+        assert_eq!(config.hotkeys.len(), 18);
         assert_eq!(config.hotkeys, super::default_hotkeys());
         assert!(!config.touchpad.override_enabled);
         assert!(config.touchpad.gestures.is_empty());
@@ -1258,8 +1268,8 @@ mod tests {
         assert_eq!(config.projection.layout_spacing.column_gap, 12);
         assert_eq!(config.projection.layout_spacing.window_gap, 12);
         assert_eq!(config.projection.layout_spacing.floating_margin, 16);
-        assert_eq!(config.rules.len(), 2);
-        assert_eq!(config.projection.active_rule_count, 2);
+        assert_eq!(config.rules.len(), 3);
+        assert_eq!(config.projection.active_rule_count, 3);
         assert!(!config.touchpad.override_enabled);
     }
 
@@ -1341,9 +1351,38 @@ mod tests {
         assert!(source.contains("hotkey \"Win+J\" \"focus-workspace-down\""));
         assert!(source.contains("hotkey \"Win+Tab\" \"toggle-overview\""));
         assert!(source.contains("hotkey \"Win+T\" \"open-terminal\""));
+        assert!(source.contains("hotkey \"Win+W\" \"open-wallpaper-selector\""));
         assert!(source.contains("hotkey \"Win+Q\" \"close-window\""));
         assert!(!source.contains("hotkey \"Alt+K\" \"focus-next\""));
         assert!(source.contains("rule \"float-dialogs\""));
+        assert!(source.contains("rule \"companion-wallpaper-selector\""));
+        assert!(source.contains("match-process-name \"FlowShellWallpaper.UI\""));
+        assert!(source.contains("managed false"));
+    }
+
+    #[test]
+    fn default_source_marks_wallpaper_selector_as_unmanaged() {
+        let path = unique_test_path("wallpaper");
+        std::fs::create_dir_all(path.parent().expect("temp dir should exist"))
+            .expect("temp dir should be created");
+        std::fs::write(&path, default_config_source()).expect("config should be written");
+        let config = load_from_path(&path, 11).expect("default config should parse");
+
+        let decision = classify_window(
+            &config.rules,
+            &WindowRuleInput {
+                process_name: Some("FlowShellWallpaper.UI".to_string()),
+                class_name: "WinUIDesktopWin32WindowClass".to_string(),
+                title: "FlowShellWallpaper.UI".to_string(),
+            },
+            &config.projection,
+        );
+
+        assert!(!decision.managed);
+        assert_eq!(
+            decision.matched_rule_ids,
+            vec!["companion-wallpaper-selector".to_string()]
+        );
     }
 
     #[test]

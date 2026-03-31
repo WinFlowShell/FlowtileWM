@@ -127,22 +127,21 @@ fn sync_scene_thumbnails(
             let destination_window_rect = window.rect;
             let Some(clipped_rect) = intersect_rect(destination_window_rect, visible_canvas_rect)
             else {
-                if let Some(thumbnail) = surface.thumbnails.get_mut(&window.hwnd) {
-                    if thumbnail.visible {
-                        if hide_thumbnail(thumbnail.handle).is_ok() {
-                            thumbnail.visible = false;
-                            thumbnail.visible_projection = None;
-                        } else if let Some(stale_thumbnail) =
-                            surface.thumbnails.remove(&window.hwnd)
-                        {
-                            log_thumbnail_failure(
-                                surface,
-                                window.hwnd,
-                                "hide",
-                                "DwmUpdateThumbnailProperties failed while hiding preview",
-                            );
-                            let _ = unregister_thumbnail(stale_thumbnail.handle);
-                        }
+                if let Some(thumbnail) = surface.thumbnails.get_mut(&window.hwnd)
+                    && thumbnail.visible
+                {
+                    if hide_thumbnail(thumbnail.handle).is_ok() {
+                        thumbnail.visible = false;
+                        thumbnail.visible_projection = None;
+                    } else if let Some(stale_thumbnail) = surface.thumbnails.remove(&window.hwnd)
+                    {
+                        log_thumbnail_failure(
+                            surface,
+                            window.hwnd,
+                            "hide",
+                            "DwmUpdateThumbnailProperties failed while hiding preview",
+                        );
+                        let _ = unregister_thumbnail(stale_thumbnail.handle);
                     }
                 }
                 continue;

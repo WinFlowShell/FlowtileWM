@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    mem::zeroed,
     ptr::{null, null_mut},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread::{self, JoinHandle},
@@ -11,21 +10,20 @@ use flowtile_domain::{ColumnMode, Rect, WindowId, WmState};
 use flowtile_layout_engine::{LayoutError, recompute_workspace};
 use flowtile_wm_core::CoreDaemonRuntime;
 
+use crate::win32_overlay::{
+    create_layered_overlay_window, hide_overlay_window, pump_messages, register_basic_window_class,
+    rgb_color, show_overlay_window,
+};
+
 #[cfg(not(windows))]
 compile_error!("flowtile-core-daemon tab indicator surface currently supports only Windows.");
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HINSTANCE, HWND},
+    Foundation::{HINSTANCE, HWND},
     Graphics::Gdi::{CreateSolidBrush, DeleteObject, HBRUSH},
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, HWND_TOPMOST, MSG,
-        PM_REMOVE, PeekMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE,
-        SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage,
-        WM_QUIT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP,
-    },
+    UI::WindowsAndMessaging::{DestroyWindow, SW_SHOWNA},
 };
 
 const THREAD_SLICE: Duration = Duration::from_millis(16);
@@ -328,45 +326,14 @@ fn initialize_indicator_classes() -> Result<IndicatorClasses, String> {
         return Err("CreateSolidBrush failed for tab indicator classes".to_string());
     }
 
-    register_indicator_class(instance as HINSTANCE, ACTIVE_CLASS, active_brush)?;
-    register_indicator_class(instance as HINSTANCE, INACTIVE_CLASS, inactive_brush)?;
+    register_basic_window_class(instance as HINSTANCE, ACTIVE_CLASS, active_brush)?;
+    register_basic_window_class(instance as HINSTANCE, INACTIVE_CLASS, inactive_brush)?;
 
     Ok(IndicatorClasses {
         instance: instance as HINSTANCE,
         active_brush,
         inactive_brush,
     })
-}
-
-fn register_indicator_class(
-    instance: HINSTANCE,
-    class_name: &str,
-    brush: HBRUSH,
-) -> Result<(), String> {
-    let wide_class_name = widestring(class_name);
-    let window_class = WNDCLASSW {
-        style: 0,
-        lpfnWndProc: Some(DefWindowProcW),
-        hInstance: instance,
-        lpszClassName: wide_class_name.as_ptr(),
-        hbrBackground: brush,
-        ..unsafe { zeroed() }
-    };
-    let atom = {
-        // SAFETY: the class descriptor references memory that lives for the duration of the call.
-        unsafe { RegisterClassW(&window_class) }
-    };
-    if atom == 0 {
-        let error = {
-            // SAFETY: read immediately after the failed `RegisterClassW` call.
-            unsafe { GetLastError() }
-        };
-        if error != 1410 {
-            return Err(last_error_message("RegisterClassW"));
-        }
-    }
-
-    Ok(())
 }
 
 fn run_overlay_loop(
@@ -427,10 +394,7 @@ fn sync_indicator_windows(
 
     for window in windows.iter().skip(segments.len()) {
         if !window.hwnd.is_null() {
-            let _ = {
-                // SAFETY: best-effort hide for unused indicator surfaces.
-                unsafe { ShowWindow(window.hwnd, SW_HIDE) }
-            };
+            hide_overlay_window(window.hwnd);
         }
     }
 
@@ -438,117 +402,15 @@ fn sync_indicator_windows(
 }
 
 fn create_indicator_window(instance: HINSTANCE, kind: IndicatorKind) -> Result<HWND, String> {
-    let class_name = widestring(match kind {
+    let class_name = match kind {
         IndicatorKind::Active => ACTIVE_CLASS,
         IndicatorKind::Inactive => INACTIVE_CLASS,
-    });
-    let window = {
-        // SAFETY: creating a no-activate popup surface with fixed styles.
-        unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_TOPMOST
-                    | WS_EX_NOACTIVATE,
-                class_name.as_ptr(),
-                null(),
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                null_mut(),
-                null_mut(),
-                instance,
-                null_mut(),
-            )
-        }
     };
-    if window.is_null() {
-        return Err(last_error_message("CreateWindowExW"));
-    }
-
-    let layered = {
-        // SAFETY: setting constant alpha on a newly created overlay surface.
-        unsafe { SetLayeredWindowAttributes(window, 0, INDICATOR_ALPHA, 0x00000002) }
-    };
-    if layered == 0 {
-        return Err(last_error_message("SetLayeredWindowAttributes"));
-    }
-
-    Ok(window)
+    create_layered_overlay_window(instance, class_name, INDICATOR_ALPHA)
 }
 
 fn position_indicator_window(window: HWND, rect: Rect) -> Result<(), String> {
-    let width = i32::try_from(rect.width.max(1))
-        .map_err(|_| "tab indicator width overflowed".to_string())?;
-    let height = i32::try_from(rect.height.max(1))
-        .map_err(|_| "tab indicator height overflowed".to_string())?;
-    let applied = {
-        // SAFETY: `window` is a valid overlay HWND owned by the worker thread.
-        unsafe {
-            SetWindowPos(
-                window,
-                HWND_TOPMOST,
-                rect.x,
-                rect.y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        }
-    };
-    if applied == 0 {
-        return Err(last_error_message("SetWindowPos"));
-    }
-
-    let _ = {
-        // SAFETY: show the indicator without activation after geometry update.
-        unsafe { ShowWindow(window, SW_SHOWNA) }
-    };
-    Ok(())
-}
-
-fn pump_messages() -> Result<(), String> {
-    let mut message: MSG = {
-        // SAFETY: `MSG` is plain old data and valid when zero-initialized.
-        unsafe { zeroed() }
-    };
-    loop {
-        let has_message = {
-            // SAFETY: polls the current thread queue and removes available messages.
-            unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) }
-        };
-        if has_message == 0 {
-            break;
-        }
-        if message.message == WM_QUIT {
-            return Ok(());
-        }
-        let _ = {
-            // SAFETY: translate and dispatch the message that was just dequeued.
-            unsafe { TranslateMessage(&message) }
-        };
-        unsafe { DispatchMessageW(&message) };
-    }
-    Ok(())
-}
-
-fn rgb_color(red: u8, green: u8, blue: u8) -> u32 {
-    u32::from(red) | (u32::from(green) << 8) | (u32::from(blue) << 16)
-}
-
-fn widestring(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn last_error_message(api: &str) -> String {
-    let code = {
-        // SAFETY: `GetLastError` reads the current thread-local Win32 error code.
-        unsafe { GetLastError() }
-    };
-    format!("{api} failed with Win32 error {code}")
+    show_overlay_window(window, rect, SW_SHOWNA)
 }
 
 #[cfg(test)]

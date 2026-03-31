@@ -673,8 +673,8 @@ fn preview_center_distance(workspace: &WorkspaceRenderFrame, monitor_rect: Rect)
 pub(crate) fn ordered_frame_workspaces(frame: &OverviewRenderFrame) -> Vec<&WorkspaceRenderFrame> {
     let mut ordered_workspaces = frame.workspaces.iter().collect::<Vec<_>>();
     ordered_workspaces.sort_by(|left, right| {
-        preview_center_distance(*right, frame.monitor_rect)
-            .cmp(&preview_center_distance(*left, frame.monitor_rect))
+        preview_center_distance(right, frame.monitor_rect)
+            .cmp(&preview_center_distance(left, frame.monitor_rect))
             .then(left.canvas_rect.y.cmp(&right.canvas_rect.y))
     });
     ordered_workspaces

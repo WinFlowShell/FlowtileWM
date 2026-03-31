@@ -15,7 +15,13 @@ use flowtile_wm_core::{
     ActiveTiledResizeTarget, CoreDaemonRuntime, RuntimeCycleReport, RuntimeError,
 };
 
-use crate::hotkeys::is_super_held_by_low_level_runtime;
+use crate::{
+    hotkeys::is_super_held_by_low_level_runtime,
+    win32_overlay::{
+        create_layered_overlay_window, hide_overlay_window, last_error_message, pump_messages,
+        register_basic_window_class, show_overlay_window,
+    },
+};
 
 #[cfg(not(windows))]
 compile_error!(
@@ -24,17 +30,13 @@ compile_error!(
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HINSTANCE, HWND, POINT},
+    Foundation::{HINSTANCE, HWND, POINT},
     Graphics::Gdi::{CreateSolidBrush, DeleteObject, HBRUSH},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::WindowsAndMessaging::{
-        CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetCursorPos, GetMessageW, GetWindowRect, HWND_TOPMOST, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
-        PeekMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-        SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow,
-        TranslateMessage, UnhookWindowsHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_QUIT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        CallNextHookEx, DestroyWindow, GetCursorPos, GetMessageW, GetWindowRect, MSG,
+        MSLLHOOKSTRUCT, PostThreadMessageW, SW_SHOW, SetWindowsHookExW, UnhookWindowsHookEx,
+        WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_QUIT,
     },
 };
 
@@ -330,7 +332,6 @@ fn run_preview_overlay_thread(
 }
 
 fn initialize_preview_overlay() -> Result<(HWND, HBRUSH), String> {
-    let class_name = widestring(PREVIEW_WINDOW_CLASS);
     let instance = {
         // SAFETY: we query the current module handle for class registration and window creation.
         unsafe { GetModuleHandleW(null()) }
@@ -343,34 +344,16 @@ fn initialize_preview_overlay() -> Result<(HWND, HBRUSH), String> {
         return Err(last_error_message("CreateSolidBrush"));
     }
 
-    let window_class = WNDCLASSW {
-        style: 0,
-        lpfnWndProc: Some(DefWindowProcW),
-        hInstance: instance as HINSTANCE,
-        lpszClassName: class_name.as_ptr(),
-        hbrBackground: brush as HBRUSH,
-        ..unsafe { zeroed() }
-    };
-    let class_atom = {
-        // SAFETY: we pass a fully initialized class descriptor whose data outlives registration.
-        unsafe { RegisterClassW(&window_class) }
-    };
-    if class_atom == 0 {
-        let error = {
-            // SAFETY: read the Win32 error code immediately after `RegisterClassW`.
-            unsafe { GetLastError() }
-        };
-        if error != 1410 {
-            let _ = unsafe { DeleteObject(brush as _) };
-            return Err(last_error_message("RegisterClassW"));
-        }
+    if let Err(error) =
+        register_basic_window_class(instance as HINSTANCE, PREVIEW_WINDOW_CLASS, brush as HBRUSH)
+    {
+        let _ = unsafe { DeleteObject(brush as _) };
+        return Err(error);
     }
 
-    let window = create_preview_window(instance as HINSTANCE, class_name.as_ptr())?;
-    let _ = {
-        // SAFETY: best-effort hide for the preview window immediately after creation.
-        unsafe { ShowWindow(window, SW_HIDE) }
-    };
+    let window =
+        create_layered_overlay_window(instance as HINSTANCE, PREVIEW_WINDOW_CLASS, PREVIEW_ALPHA)?;
+    hide_overlay_window(window);
     Ok((window, brush))
 }
 
@@ -379,118 +362,15 @@ fn run_preview_overlay_loop(
     window: HWND,
 ) -> Result<(), String> {
     loop {
-        pump_window_messages()?;
+        pump_messages()?;
 
         match command_receiver.recv_timeout(PREVIEW_THREAD_SLICE) {
-            Ok(OverlayCommand::Show(rect)) => show_preview_window(window, rect)?,
-            Ok(OverlayCommand::Hide) => hide_preview_window(window),
+            Ok(OverlayCommand::Show(rect)) => show_overlay_window(window, rect, SW_SHOW)?,
+            Ok(OverlayCommand::Hide) => hide_overlay_window(window),
             Ok(OverlayCommand::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-    }
-
-    Ok(())
-}
-
-fn create_preview_window(instance: HINSTANCE, class_name: *const u16) -> Result<HWND, String> {
-    let window = {
-        // SAFETY: we create a top-level popup window for the preview overlay with static styles.
-        unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED
-                    | WS_EX_TRANSPARENT
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_TOPMOST
-                    | WS_EX_NOACTIVATE,
-                class_name,
-                null(),
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                null_mut(),
-                null_mut(),
-                instance,
-                null_mut(),
-            )
-        }
-    };
-    if window.is_null() {
-        return Err(last_error_message("CreateWindowExW"));
-    }
-
-    let layered = {
-        // SAFETY: we set a constant alpha on the valid preview overlay HWND.
-        unsafe { SetLayeredWindowAttributes(window, 0, PREVIEW_ALPHA, 0x00000002) }
-    };
-    if layered == 0 {
-        return Err(last_error_message("SetLayeredWindowAttributes"));
-    }
-
-    Ok(window)
-}
-
-fn show_preview_window(window: HWND, rect: Rect) -> Result<(), String> {
-    let width = i32::try_from(rect.width.max(1))
-        .map_err(|_| "preview width exceeds Win32 limits".to_string())?;
-    let height = i32::try_from(rect.height.max(1))
-        .map_err(|_| "preview height exceeds Win32 limits".to_string())?;
-    let applied = {
-        // SAFETY: `window` is the preview overlay HWND owned by this thread; coordinates are POD.
-        unsafe {
-            SetWindowPos(
-                window,
-                HWND_TOPMOST,
-                rect.x,
-                rect.y,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        }
-    };
-    if applied == 0 {
-        return Err(last_error_message("SetWindowPos"));
-    }
-
-    let _ = {
-        // SAFETY: best-effort show after geometry update for the preview overlay.
-        unsafe { ShowWindow(window, SW_SHOW) }
-    };
-    Ok(())
-}
-
-fn hide_preview_window(window: HWND) {
-    let _ = {
-        // SAFETY: best-effort hide for the preview overlay HWND owned by this thread.
-        unsafe { ShowWindow(window, SW_HIDE) }
-    };
-}
-
-fn pump_window_messages() -> Result<(), String> {
-    let mut message: MSG = {
-        // SAFETY: `MSG` is a plain Win32 structure and valid when zero-initialized.
-        unsafe { zeroed() }
-    };
-
-    loop {
-        let has_message = {
-            // SAFETY: we poll and remove messages from the current thread queue.
-            unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) }
-        };
-        if has_message == 0 {
-            break;
-        }
-        if message.message == WM_QUIT {
-            return Ok(());
-        }
-        let _ = {
-            // SAFETY: forwarding the message to Win32 translation is valid for a dequeued `MSG`.
-            unsafe { TranslateMessage(&message) }
-        };
-        unsafe { DispatchMessageW(&message) };
     }
 
     Ok(())
@@ -692,16 +572,4 @@ unsafe extern "system" fn low_level_mouse_proc(code: i32, wparam: usize, lparam:
     }
 
     unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
-}
-
-fn widestring(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn last_error_message(api: &str) -> String {
-    let code = {
-        // SAFETY: `GetLastError` reads the current thread-local Win32 error code.
-        unsafe { GetLastError() }
-    };
-    format!("{api} failed with Win32 error {code}")
 }

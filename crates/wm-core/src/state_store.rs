@@ -1,3 +1,8 @@
+mod overview;
+mod width_resize;
+mod window_modes;
+mod workspace;
+
 use flowtile_diagnostics::{layout_recomputed, transition_applied};
 use flowtile_domain::{
     Column, ColumnId, ColumnMode, DomainEvent, DomainEventPayload, FocusBehavior, FocusOrigin,
@@ -164,86 +169,93 @@ impl StateStore {
         let fullscreen_restore_index = self.fullscreen_restore_index_in_workspace(workspace_id);
         let window_id = self.state.allocate_window_id();
 
-        let target_column_id = match payload.layer {
-            WindowLayer::Floating | WindowLayer::Fullscreen => {
-                self.push_window_to_floating_layer(workspace_id, window_id)?;
-                None
-            }
-            _ => Some(match payload.placement {
-                WindowPlacement::AppendToFocusedColumn => {
-                    if let Some(column_id) = focused_column_id {
-                        let column = self
-                            .state
-                            .layout
-                            .columns
-                            .get_mut(&column_id)
-                            .ok_or(CoreError::UnknownColumn(column_id))?;
-                        column.ordered_window_ids.push(window_id);
-                        if column.active_window_id.is_none() {
-                            column.active_window_id = Some(window_id);
+        let target_column_id = if !payload.managed {
+            None
+        } else {
+            match payload.layer {
+                WindowLayer::Floating | WindowLayer::Fullscreen => {
+                    self.push_window_to_floating_layer(workspace_id, window_id)?;
+                    None
+                }
+                _ => Some(match payload.placement {
+                    WindowPlacement::AppendToFocusedColumn => {
+                        if let Some(column_id) = focused_column_id {
+                            let column = self
+                                .state
+                                .layout
+                                .columns
+                                .get_mut(&column_id)
+                                .ok_or(CoreError::UnknownColumn(column_id))?;
+                            column.ordered_window_ids.push(window_id);
+                            if column.active_window_id.is_none() {
+                                column.active_window_id = Some(window_id);
+                            }
+                            if column.mode == ColumnMode::Tabbed {
+                                column.tab_selection = Some(window_id);
+                            }
+                            column_id
+                        } else {
+                            self.insert_new_column(
+                                workspace_id,
+                                window_id,
+                                NewColumnRequest {
+                                    anchor_column_id: None,
+                                    insert_index_override: None,
+                                    before_anchor: false,
+                                    mode: ColumnMode::Normal,
+                                    width_semantics: WidthSemantics::default(),
+                                    preserve_focus_position: false,
+                                },
+                            )?
                         }
-                        if column.mode == ColumnMode::Tabbed {
-                            column.tab_selection = Some(window_id);
-                        }
-                        column_id
-                    } else {
-                        self.insert_new_column(
+                    }
+                    WindowPlacement::NewColumnAfterFocus { mode, width } => self
+                        .insert_new_column(
+                            workspace_id,
+                            window_id,
+                            NewColumnRequest {
+                                anchor_column_id: insertion_anchor_column_id,
+                                insert_index_override: insertion_anchor_column_id
+                                    .is_none()
+                                    .then_some(fullscreen_restore_index)
+                                    .flatten(),
+                                before_anchor: false,
+                                mode,
+                                width_semantics: width,
+                                preserve_focus_position: false,
+                            },
+                        )?,
+                    WindowPlacement::NewColumnBeforeFocus { mode, width } => self
+                        .insert_new_column(
+                            workspace_id,
+                            window_id,
+                            NewColumnRequest {
+                                anchor_column_id: insertion_anchor_column_id,
+                                insert_index_override: insertion_anchor_column_id
+                                    .is_none()
+                                    .then_some(fullscreen_restore_index)
+                                    .flatten(),
+                                before_anchor: true,
+                                mode,
+                                width_semantics: width,
+                                preserve_focus_position: should_preserve_current_focus,
+                            },
+                        )?,
+                    WindowPlacement::AppendToWorkspaceEnd { mode, width } => self
+                        .insert_new_column(
                             workspace_id,
                             window_id,
                             NewColumnRequest {
                                 anchor_column_id: None,
                                 insert_index_override: None,
                                 before_anchor: false,
-                                mode: ColumnMode::Normal,
-                                width_semantics: WidthSemantics::default(),
+                                mode,
+                                width_semantics: width,
                                 preserve_focus_position: false,
                             },
-                        )?
-                    }
-                }
-                WindowPlacement::NewColumnAfterFocus { mode, width } => self.insert_new_column(
-                    workspace_id,
-                    window_id,
-                    NewColumnRequest {
-                        anchor_column_id: insertion_anchor_column_id,
-                        insert_index_override: insertion_anchor_column_id
-                            .is_none()
-                            .then_some(fullscreen_restore_index)
-                            .flatten(),
-                        before_anchor: false,
-                        mode,
-                        width_semantics: width,
-                        preserve_focus_position: false,
-                    },
-                )?,
-                WindowPlacement::NewColumnBeforeFocus { mode, width } => self.insert_new_column(
-                    workspace_id,
-                    window_id,
-                    NewColumnRequest {
-                        anchor_column_id: insertion_anchor_column_id,
-                        insert_index_override: insertion_anchor_column_id
-                            .is_none()
-                            .then_some(fullscreen_restore_index)
-                            .flatten(),
-                        before_anchor: true,
-                        mode,
-                        width_semantics: width,
-                        preserve_focus_position: should_preserve_current_focus,
-                    },
-                )?,
-                WindowPlacement::AppendToWorkspaceEnd { mode, width } => self.insert_new_column(
-                    workspace_id,
-                    window_id,
-                    NewColumnRequest {
-                        anchor_column_id: None,
-                        insert_index_override: None,
-                        before_anchor: false,
-                        mode,
-                        width_semantics: width,
-                        preserve_focus_position: false,
-                    },
-                )?,
-            }),
+                        )?,
+                }),
+            }
         };
 
         self.state.windows.insert(
@@ -273,6 +285,11 @@ impl StateStore {
             && let Some(workspace_set) = self.state.workspace_sets.get_mut(&workspace_set_id)
         {
             workspace_set.active_workspace_id = workspace_id;
+        }
+
+        if !payload.managed {
+            self.state.ensure_tail_workspace(payload.monitor_id);
+            return Ok(None);
         }
 
         let previous_column_id = focused_column_id.or(insertion_anchor_column_id);
@@ -439,833 +456,6 @@ impl StateStore {
         Ok(Some(workspace_id))
     }
 
-    fn handle_focus_workspace(
-        &mut self,
-        forward: bool,
-        payload: &flowtile_domain::WorkspaceCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let monitor_id = self.command_monitor_id(payload.monitor_id)?;
-        let workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(monitor_id)
-            .ok_or(CoreError::UnknownMonitor(monitor_id))?;
-        self.state.normalize_workspace_set(workspace_set_id);
-        let ordered_workspace_ids = self
-            .state
-            .workspace_sets
-            .get(&workspace_set_id)
-            .map(|workspace_set| workspace_set.ordered_workspace_ids.clone())
-            .ok_or(CoreError::UnknownMonitor(monitor_id))?;
-        let active_workspace_id = self
-            .state
-            .active_workspace_id_for_monitor(monitor_id)
-            .ok_or(CoreError::NoActiveWorkspace(monitor_id))?;
-        let Some(active_index) = ordered_workspace_ids
-            .iter()
-            .position(|workspace_id| *workspace_id == active_workspace_id)
-        else {
-            return Err(CoreError::UnknownWorkspace(active_workspace_id));
-        };
-        let target_index = if forward {
-            active_index
-                .saturating_add(1)
-                .min(ordered_workspace_ids.len() - 1)
-        } else {
-            active_index.saturating_sub(1)
-        };
-        let target_workspace_id = ordered_workspace_ids[target_index];
-        if target_workspace_id == active_workspace_id {
-            return Ok(Some(active_workspace_id));
-        }
-
-        self.activate_workspace(monitor_id, target_workspace_id, FocusOrigin::UserCommand)?;
-        self.state.normalize_workspace_set(workspace_set_id);
-        Ok(Some(target_workspace_id))
-    }
-
-    fn handle_move_workspace_within_monitor(
-        &mut self,
-        forward: bool,
-        payload: &flowtile_domain::WorkspaceCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let monitor_id = self.command_monitor_id(payload.monitor_id)?;
-        let workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(monitor_id)
-            .ok_or(CoreError::UnknownMonitor(monitor_id))?;
-        self.state.normalize_workspace_set(workspace_set_id);
-        let active_workspace_id = self
-            .state
-            .active_workspace_id_for_monitor(monitor_id)
-            .ok_or(CoreError::NoActiveWorkspace(monitor_id))?;
-        let Some(workspace_set) = self.state.workspace_sets.get(&workspace_set_id) else {
-            return Err(CoreError::UnknownMonitor(monitor_id));
-        };
-        let Some(active_index) = workspace_set
-            .ordered_workspace_ids
-            .iter()
-            .position(|workspace_id| *workspace_id == active_workspace_id)
-        else {
-            return Err(CoreError::UnknownWorkspace(active_workspace_id));
-        };
-        let target_index = if forward {
-            active_index
-                .saturating_add(1)
-                .min(workspace_set.ordered_workspace_ids.len() - 1)
-        } else {
-            active_index.saturating_sub(1)
-        };
-        if target_index == active_index {
-            return Ok(Some(active_workspace_id));
-        }
-
-        let workspace_set = self
-            .state
-            .workspace_sets
-            .get_mut(&workspace_set_id)
-            .ok_or(CoreError::UnknownMonitor(monitor_id))?;
-        workspace_set
-            .ordered_workspace_ids
-            .swap(active_index, target_index);
-        workspace_set.active_workspace_id = active_workspace_id;
-        self.state.normalize_workspace_set(workspace_set_id);
-        self.sync_overview_selection(monitor_id);
-        Ok(Some(active_workspace_id))
-    }
-
-    fn handle_move_workspace_to_adjacent_monitor(
-        &mut self,
-        forward: bool,
-        payload: &flowtile_domain::WorkspaceCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let source_monitor_id = self.command_monitor_id(payload.monitor_id)?;
-        let target_monitor_id = self
-            .adjacent_monitor_id(source_monitor_id, forward)
-            .unwrap_or(source_monitor_id);
-        if target_monitor_id == source_monitor_id {
-            return self
-                .state
-                .active_workspace_id_for_monitor(source_monitor_id)
-                .map(Some)
-                .ok_or(CoreError::NoActiveWorkspace(source_monitor_id));
-        }
-
-        let source_workspace_id = self
-            .state
-            .active_workspace_id_for_monitor(source_monitor_id)
-            .ok_or(CoreError::NoActiveWorkspace(source_monitor_id))?;
-        let source_workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(source_monitor_id)
-            .ok_or(CoreError::UnknownMonitor(source_monitor_id))?;
-        let target_workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(target_monitor_id)
-            .ok_or(CoreError::UnknownMonitor(target_monitor_id))?;
-        self.state.normalize_workspace_set(source_workspace_set_id);
-        self.state.normalize_workspace_set(target_workspace_set_id);
-
-        {
-            let source_workspace_set = self
-                .state
-                .workspace_sets
-                .get_mut(&source_workspace_set_id)
-                .ok_or(CoreError::UnknownMonitor(source_monitor_id))?;
-            source_workspace_set
-                .ordered_workspace_ids
-                .retain(|workspace_id| *workspace_id != source_workspace_id);
-        }
-
-        let target_ordered_workspace_ids = self
-            .state
-            .workspace_sets
-            .get(&target_workspace_set_id)
-            .map(|workspace_set| workspace_set.ordered_workspace_ids.clone())
-            .ok_or(CoreError::UnknownMonitor(target_monitor_id))?;
-        let insert_index = target_ordered_workspace_ids
-            .iter()
-            .position(|workspace_id| {
-                self.state
-                    .workspaces
-                    .get(workspace_id)
-                    .is_some_and(|workspace| workspace.is_ephemeral_empty_tail)
-            })
-            .unwrap_or(target_ordered_workspace_ids.len());
-
-        {
-            let target_workspace_set = self
-                .state
-                .workspace_sets
-                .get_mut(&target_workspace_set_id)
-                .ok_or(CoreError::UnknownMonitor(target_monitor_id))?;
-            target_workspace_set
-                .ordered_workspace_ids
-                .insert(insert_index, source_workspace_id);
-            target_workspace_set.active_workspace_id = source_workspace_id;
-        }
-
-        if let Some(workspace) = self.state.workspaces.get_mut(&source_workspace_id) {
-            workspace.monitor_id = target_monitor_id;
-        }
-
-        self.state.normalize_workspace_set(source_workspace_set_id);
-        self.state.normalize_workspace_set(target_workspace_set_id);
-        self.activate_workspace(
-            target_monitor_id,
-            source_workspace_id,
-            FocusOrigin::UserCommand,
-        )?;
-        self.sync_overview_selection(source_monitor_id);
-        Ok(Some(source_workspace_id))
-    }
-
-    fn handle_move_column_to_workspace(
-        &mut self,
-        forward: bool,
-        payload: &flowtile_domain::WorkspaceCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let monitor_id = self.command_monitor_id(payload.monitor_id)?;
-        let source_workspace_id = self
-            .state
-            .active_workspace_id_for_monitor(monitor_id)
-            .ok_or(CoreError::NoActiveWorkspace(monitor_id))?;
-        let focused_window_id = self
-            .focused_window_in_workspace(source_workspace_id)
-            .ok_or(CoreError::InvalidEvent(
-                "move column to workspace requires an active managed tiled window",
-            ))?;
-        let focused_window = self
-            .state
-            .windows
-            .get(&focused_window_id)
-            .ok_or(CoreError::UnknownWindow(focused_window_id))?
-            .clone();
-        let column_id = focused_window.column_id.ok_or(CoreError::InvalidEvent(
-            "move column to workspace requires an active managed tiled column",
-        ))?;
-        if focused_window.layer != WindowLayer::Tiled
-            || focused_window.is_floating
-            || focused_window.is_fullscreen
-        {
-            return Err(CoreError::InvalidEvent(
-                "move column to workspace requires an active managed tiled window",
-            ));
-        }
-
-        let workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(monitor_id)
-            .ok_or(CoreError::UnknownMonitor(monitor_id))?;
-        self.state.normalize_workspace_set(workspace_set_id);
-        let ordered_workspace_ids = self
-            .state
-            .workspace_sets
-            .get(&workspace_set_id)
-            .map(|workspace_set| workspace_set.ordered_workspace_ids.clone())
-            .ok_or(CoreError::UnknownMonitor(monitor_id))?;
-        let Some(source_index) = ordered_workspace_ids
-            .iter()
-            .position(|workspace_id| *workspace_id == source_workspace_id)
-        else {
-            return Err(CoreError::UnknownWorkspace(source_workspace_id));
-        };
-        let target_index = if forward {
-            source_index
-                .saturating_add(1)
-                .min(ordered_workspace_ids.len() - 1)
-        } else {
-            source_index.saturating_sub(1)
-        };
-        let target_workspace_id = ordered_workspace_ids[target_index];
-        if target_workspace_id == source_workspace_id {
-            return Ok(Some(source_workspace_id));
-        }
-        self.move_column_to_workspace_target_internal(column_id, target_workspace_id, None)
-    }
-
-    fn handle_move_column_to_workspace_target(
-        &mut self,
-        payload: &flowtile_domain::MoveColumnToWorkspaceTargetPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        self.move_column_to_workspace_target_internal(
-            payload.source_column_id,
-            payload.target_workspace_id,
-            payload.insert_after_column_id,
-        )
-    }
-
-    fn move_column_to_workspace_target_internal(
-        &mut self,
-        source_column_id: ColumnId,
-        target_workspace_id: WorkspaceId,
-        insert_after_column_id: Option<ColumnId>,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let moved_window_ids = self
-            .state
-            .layout
-            .columns
-            .get(&source_column_id)
-            .ok_or(CoreError::UnknownColumn(source_column_id))?
-            .ordered_window_ids
-            .clone();
-        let source_window_id = moved_window_ids
-            .first()
-            .copied()
-            .ok_or(CoreError::InvalidEvent(
-                "move column target requires a non-empty managed tiled column",
-            ))?;
-        let source_workspace_id = self.column_workspace_id(source_column_id)?;
-        let source_monitor_id = self
-            .state
-            .workspaces
-            .get(&source_workspace_id)
-            .map(|workspace| workspace.monitor_id)
-            .ok_or(CoreError::UnknownWorkspace(source_workspace_id))?;
-        let target_monitor_id = self
-            .state
-            .workspaces
-            .get(&target_workspace_id)
-            .map(|workspace| workspace.monitor_id)
-            .ok_or(CoreError::UnknownWorkspace(target_workspace_id))?;
-        let source_workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(source_monitor_id)
-            .ok_or(CoreError::UnknownMonitor(source_monitor_id))?;
-        let target_workspace_set_id = self
-            .state
-            .workspace_set_id_for_monitor(target_monitor_id)
-            .ok_or(CoreError::UnknownMonitor(target_monitor_id))?;
-        if source_workspace_id == target_workspace_id
-            && insert_after_column_id == Some(source_column_id)
-        {
-            return Ok(Some(target_workspace_id));
-        }
-
-        if let Some(anchor_column_id) = insert_after_column_id {
-            let anchor_workspace_id = self.column_workspace_id(anchor_column_id)?;
-            if anchor_workspace_id != target_workspace_id {
-                return Err(CoreError::InvalidEvent(
-                    "move column target anchor must belong to the target workspace",
-                ));
-            }
-        }
-
-        let focus_window_id = self
-            .state
-            .layout
-            .columns
-            .get(&source_column_id)
-            .and_then(|column| self.column_active_window(column))
-            .unwrap_or(source_window_id);
-
-        {
-            let source_workspace = self
-                .state
-                .workspaces
-                .get_mut(&source_workspace_id)
-                .ok_or(CoreError::UnknownWorkspace(source_workspace_id))?;
-            source_workspace
-                .strip
-                .ordered_column_ids
-                .retain(|candidate_column_id| *candidate_column_id != source_column_id);
-            if source_workspace.remembered_focused_column_id == Some(source_column_id) {
-                source_workspace.remembered_focused_column_id = None;
-            }
-            if source_workspace
-                .remembered_focused_window_id
-                .is_some_and(|window_id| moved_window_ids.contains(&window_id))
-            {
-                source_workspace.remembered_focused_window_id = None;
-            }
-        }
-
-        {
-            let target_workspace = self
-                .state
-                .workspaces
-                .get_mut(&target_workspace_id)
-                .ok_or(CoreError::UnknownWorkspace(target_workspace_id))?;
-            target_workspace
-                .strip
-                .ordered_column_ids
-                .retain(|candidate_column_id| *candidate_column_id != source_column_id);
-            let insert_index = insert_after_column_id
-                .and_then(|anchor_column_id| {
-                    target_workspace
-                        .strip
-                        .ordered_column_ids
-                        .iter()
-                        .position(|candidate_column_id| *candidate_column_id == anchor_column_id)
-                        .map(|index| index + 1)
-                })
-                .unwrap_or(target_workspace.strip.ordered_column_ids.len())
-                .min(target_workspace.strip.ordered_column_ids.len());
-            target_workspace
-                .strip
-                .ordered_column_ids
-                .insert(insert_index, source_column_id);
-            target_workspace.remembered_focused_column_id = Some(source_column_id);
-            target_workspace.remembered_focused_window_id = Some(focus_window_id);
-        }
-
-        for window_id in &moved_window_ids {
-            if let Some(window) = self.state.windows.get_mut(window_id) {
-                window.workspace_id = target_workspace_id;
-                window.column_id = Some(source_column_id);
-            }
-        }
-
-        self.activate_workspace(
-            target_monitor_id,
-            target_workspace_id,
-            FocusOrigin::UserCommand,
-        )?;
-        self.state.normalize_workspace_set(source_workspace_set_id);
-        if target_workspace_set_id != source_workspace_set_id {
-            self.state.normalize_workspace_set(target_workspace_set_id);
-            self.sync_overview_selection(source_monitor_id);
-        }
-        Ok(Some(target_workspace_id))
-    }
-
-    fn handle_strip_scroll(
-        &mut self,
-        direction: i32,
-        payload: &flowtile_domain::StripScrollPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let workspace_id = self.active_workspace_id_for_commands()?;
-        let step = if payload.step == 0 {
-            self.state.config_projection.strip_scroll_step
-        } else {
-            payload.step
-        }
-        .min(i32::MAX as u32) as i32;
-        self.apply_scroll_delta(workspace_id, direction.saturating_mul(step))?;
-        Ok(Some(workspace_id))
-    }
-
-    fn handle_toggle_floating(
-        &mut self,
-        payload: &flowtile_domain::WindowCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let window_id = self.command_window_id(payload.window_id)?;
-        let window = self
-            .state
-            .windows
-            .get(&window_id)
-            .ok_or(CoreError::UnknownWindow(window_id))?
-            .clone();
-        let workspace_id = window.workspace_id;
-        let monitor_id = self
-            .state
-            .workspaces
-            .get(&workspace_id)
-            .map(|workspace| workspace.monitor_id)
-            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-
-        if window.layer == WindowLayer::Floating {
-            let restore_target = window.restore_target.clone().unwrap_or(RestoreTarget {
-                workspace_id,
-                column_id: self.focused_column_in_workspace(workspace_id),
-                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
-                layer: WindowLayer::Tiled,
-            });
-
-            self.detach_window_membership(window_id)?;
-            let restored_column_id = self.restore_window_to_target(
-                window_id,
-                restore_target.clone(),
-                self.state.config_projection.default_column_mode,
-                self.state.config_projection.default_column_width,
-            )?;
-            let window = self
-                .state
-                .windows
-                .get_mut(&window_id)
-                .ok_or(CoreError::UnknownWindow(window_id))?;
-            window.layer = restore_target.layer;
-            window.column_id = restored_column_id;
-            window.is_floating = false;
-            window.is_fullscreen = false;
-            window.restore_target = None;
-            let previous_column_id = self.focused_column_in_workspace(workspace_id);
-            self.set_focus_to_window(
-                monitor_id,
-                workspace_id,
-                window_id,
-                restored_column_id,
-                FocusOrigin::UserCommand,
-            )?;
-            if let Some(column_id) = restored_column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
-            }
-        } else {
-            let restore_target = RestoreTarget {
-                workspace_id,
-                column_id: window.column_id,
-                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
-                layer: window.layer,
-            };
-            self.detach_window_membership(window_id)?;
-            self.push_window_to_floating_layer(workspace_id, window_id)?;
-            let window = self
-                .state
-                .windows
-                .get_mut(&window_id)
-                .ok_or(CoreError::UnknownWindow(window_id))?;
-            window.layer = WindowLayer::Floating;
-            window.column_id = None;
-            window.is_floating = true;
-            window.is_fullscreen = false;
-            window.restore_target = Some(restore_target);
-            self.set_focus_to_window(
-                monitor_id,
-                workspace_id,
-                window_id,
-                None,
-                FocusOrigin::UserCommand,
-            )?;
-        }
-
-        self.clamp_scroll_offset(workspace_id)?;
-        Ok(Some(workspace_id))
-    }
-
-    fn handle_toggle_tabbed(
-        &mut self,
-        payload: &flowtile_domain::WindowCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let window_id = self.command_window_id(payload.window_id)?;
-        let (workspace_id, column_id) = {
-            let window = self
-                .state
-                .windows
-                .get(&window_id)
-                .ok_or(CoreError::UnknownWindow(window_id))?;
-            let Some(column_id) = window.column_id else {
-                return Ok(Some(window.workspace_id));
-            };
-            (window.workspace_id, column_id)
-        };
-
-        let column = self
-            .state
-            .layout
-            .columns
-            .get_mut(&column_id)
-            .ok_or(CoreError::UnknownColumn(column_id))?;
-        if column.mode == ColumnMode::Tabbed {
-            column.mode = ColumnMode::Normal;
-            column.tab_selection = column.ordered_window_ids.first().copied();
-        } else {
-            column.mode = ColumnMode::Tabbed;
-            column.tab_selection = Some(window_id);
-        }
-        column.active_window_id = Some(window_id);
-
-        self.reveal_column_in_workspace(
-            workspace_id,
-            column_id,
-            self.focused_column_in_workspace(workspace_id),
-        )?;
-        Ok(Some(workspace_id))
-    }
-
-    fn handle_toggle_maximized(
-        &mut self,
-        payload: &flowtile_domain::WindowCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let window_id = self.command_window_id(payload.window_id)?;
-        let (workspace_id, column_id) = {
-            let window = self
-                .state
-                .windows
-                .get(&window_id)
-                .ok_or(CoreError::UnknownWindow(window_id))?;
-            let Some(column_id) = window.column_id else {
-                return Ok(Some(window.workspace_id));
-            };
-            (window.workspace_id, column_id)
-        };
-
-        let column = self
-            .state
-            .layout
-            .columns
-            .get_mut(&column_id)
-            .ok_or(CoreError::UnknownColumn(column_id))?;
-        column.maximized_state = match column.maximized_state {
-            MaximizedState::Normal => MaximizedState::Maximized,
-            MaximizedState::Maximized => MaximizedState::Normal,
-        };
-
-        self.reveal_column_in_workspace(
-            workspace_id,
-            column_id,
-            self.focused_column_in_workspace(workspace_id),
-        )?;
-        Ok(Some(workspace_id))
-    }
-
-    fn handle_toggle_fullscreen(
-        &mut self,
-        payload: &flowtile_domain::WindowCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let window_id = self.command_window_id(payload.window_id)?;
-        let window = self
-            .state
-            .windows
-            .get(&window_id)
-            .ok_or(CoreError::UnknownWindow(window_id))?
-            .clone();
-        let workspace_id = window.workspace_id;
-        let monitor_id = self
-            .state
-            .workspaces
-            .get(&workspace_id)
-            .map(|workspace| workspace.monitor_id)
-            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-
-        if window.layer == WindowLayer::Fullscreen {
-            let restore_target = window.restore_target.clone().unwrap_or(RestoreTarget {
-                workspace_id,
-                column_id: self.focused_column_in_workspace(workspace_id),
-                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
-                layer: WindowLayer::Tiled,
-            });
-            self.detach_window_membership(window_id)?;
-            let restored_column_id = self.restore_window_to_target(
-                window_id,
-                restore_target.clone(),
-                self.state.config_projection.default_column_mode,
-                self.state.config_projection.default_column_width,
-            )?;
-            let window = self
-                .state
-                .windows
-                .get_mut(&window_id)
-                .ok_or(CoreError::UnknownWindow(window_id))?;
-            window.layer = restore_target.layer;
-            window.column_id = restored_column_id;
-            window.is_floating = restore_target.layer == WindowLayer::Floating;
-            window.is_fullscreen = false;
-            window.restore_target = None;
-            let previous_column_id = self.focused_column_in_workspace(workspace_id);
-            self.set_focus_to_window(
-                monitor_id,
-                workspace_id,
-                window_id,
-                restored_column_id,
-                FocusOrigin::UserCommand,
-            )?;
-            if let Some(column_id) = restored_column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
-            }
-        } else {
-            let restore_target = RestoreTarget {
-                workspace_id,
-                column_id: window.column_id,
-                column_index: self.column_index_in_workspace(workspace_id, window.column_id),
-                layer: window.layer,
-            };
-            self.detach_window_membership(window_id)?;
-            self.push_window_to_floating_layer(workspace_id, window_id)?;
-            let window = self
-                .state
-                .windows
-                .get_mut(&window_id)
-                .ok_or(CoreError::UnknownWindow(window_id))?;
-            window.layer = WindowLayer::Fullscreen;
-            window.column_id = None;
-            window.is_floating = false;
-            window.is_fullscreen = true;
-            window.restore_target = Some(restore_target);
-            self.set_focus_to_window(
-                monitor_id,
-                workspace_id,
-                window_id,
-                None,
-                FocusOrigin::UserCommand,
-            )?;
-        }
-
-        self.clamp_scroll_offset(workspace_id)?;
-        Ok(Some(workspace_id))
-    }
-
-    fn handle_open_overview(
-        &mut self,
-        payload: &flowtile_domain::OverviewCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let monitor_id = self.command_monitor_id(payload.monitor_id)?;
-        self.open_overview_for_monitor(monitor_id)?;
-        Ok(None)
-    }
-
-    fn handle_close_overview(
-        &mut self,
-        _payload: &flowtile_domain::OverviewCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        self.close_overview();
-        Ok(None)
-    }
-
-    fn handle_toggle_overview(
-        &mut self,
-        payload: &flowtile_domain::OverviewCommandPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let monitor_id = self.command_monitor_id(payload.monitor_id)?;
-        if self.state.overview.is_open && self.state.overview.monitor_id == Some(monitor_id) {
-            self.close_overview();
-        } else {
-            self.open_overview_for_monitor(monitor_id)?;
-        }
-        Ok(None)
-    }
-
-    fn handle_begin_column_width_resize(
-        &mut self,
-        payload: &flowtile_domain::ColumnWidthResizePayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let (workspace_id, window_id, column_id) = self.active_tiled_width_target()?;
-        let projection = recompute_workspace(&self.state, workspace_id)?;
-        let column_rect = projection
-            .window_geometries
-            .iter()
-            .find(|geometry| geometry.window_id == window_id)
-            .map(|geometry| geometry.rect)
-            .ok_or(CoreError::InvalidEvent(
-                "active tiled window is missing from layout projection",
-            ))?;
-        let viewport = self.workspace_tiled_viewport(workspace_id)?;
-        let initial_width = self.column_target_width_bounds(column_id, workspace_id)?.1;
-        let (target_width, clamped_preview_rect, anchor_x, current_pointer_x) = self
-            .compute_width_resize_metrics(
-                payload.edge,
-                column_rect,
-                initial_width,
-                viewport,
-                payload.pointer_x,
-            )?;
-
-        self.state.layout.width_resize_session = Some(WidthResizeSession {
-            workspace_id,
-            column_id,
-            window_id,
-            anchor_edge: payload.edge,
-            anchor_x,
-            current_pointer_x,
-            initial_column_rect: column_rect,
-            initial_width,
-            target_width,
-            clamped_preview_rect,
-        });
-
-        Ok(Some(workspace_id))
-    }
-
-    fn handle_update_column_width_preview(
-        &mut self,
-        payload: &flowtile_domain::ColumnWidthPointerPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let Some(session) = self.state.layout.width_resize_session.clone() else {
-            return Ok(None);
-        };
-        let viewport = self.workspace_tiled_viewport(session.workspace_id)?;
-        let (target_width, clamped_preview_rect, anchor_x, current_pointer_x) = self
-            .compute_width_resize_metrics(
-                session.anchor_edge,
-                session.initial_column_rect,
-                session.initial_width,
-                viewport,
-                payload.pointer_x,
-            )?;
-        if let Some(active_session) = self.state.layout.width_resize_session.as_mut() {
-            active_session.anchor_x = anchor_x;
-            active_session.current_pointer_x = current_pointer_x;
-            active_session.target_width = target_width;
-            active_session.clamped_preview_rect = clamped_preview_rect;
-        }
-        Ok(Some(session.workspace_id))
-    }
-
-    fn handle_commit_column_width(
-        &mut self,
-        payload: &flowtile_domain::ColumnWidthPointerPayload,
-    ) -> Result<Option<WorkspaceId>, CoreError> {
-        let Some(session) = self.state.layout.width_resize_session.clone() else {
-            return Ok(None);
-        };
-        let viewport = self.workspace_tiled_viewport(session.workspace_id)?;
-        let (target_width, _, _, _) = self.compute_width_resize_metrics(
-            session.anchor_edge,
-            session.initial_column_rect,
-            session.initial_width,
-            viewport,
-            payload.pointer_x,
-        )?;
-        let column = self
-            .state
-            .layout
-            .columns
-            .get_mut(&session.column_id)
-            .ok_or(CoreError::UnknownColumn(session.column_id))?;
-        column.width_semantics = WidthSemantics::Fixed(target_width);
-        column.maximized_state = MaximizedState::Normal;
-        if column.mode == ColumnMode::MaximizedColumn {
-            column.mode = ColumnMode::Normal;
-        }
-        self.state.layout.width_resize_session = None;
-        self.clamp_scroll_offset(session.workspace_id)?;
-        self.reveal_column_in_workspace(
-            session.workspace_id,
-            session.column_id,
-            Some(session.column_id),
-        )?;
-        Ok(Some(session.workspace_id))
-    }
-
-    fn handle_cancel_column_width_resize(&mut self) -> Result<Option<WorkspaceId>, CoreError> {
-        let workspace_id = self
-            .state
-            .layout
-            .width_resize_session
-            .as_ref()
-            .map(|session| session.workspace_id);
-        self.state.layout.width_resize_session = None;
-        Ok(workspace_id)
-    }
-
-    fn handle_cycle_column_width(&mut self) -> Result<Option<WorkspaceId>, CoreError> {
-        let (workspace_id, _window_id, column_id) = self.active_tiled_width_target()?;
-        let viewport = self.workspace_tiled_viewport(workspace_id)?;
-        let (min_width, max_width) = self.column_target_width_bounds(column_id, workspace_id)?;
-        let current_width = {
-            let column = self
-                .state
-                .layout
-                .columns
-                .get(&column_id)
-                .ok_or(CoreError::UnknownColumn(column_id))?;
-            self.resolve_column_width(column, viewport.width)
-        };
-        let next_width = self.next_cycled_column_width(current_width, min_width, max_width);
-        let column = self
-            .state
-            .layout
-            .columns
-            .get_mut(&column_id)
-            .ok_or(CoreError::UnknownColumn(column_id))?;
-        column.width_semantics = WidthSemantics::Fixed(next_width);
-        column.maximized_state = MaximizedState::Normal;
-        if column.mode == ColumnMode::MaximizedColumn {
-            column.mode = ColumnMode::Normal;
-        }
-        self.clamp_scroll_offset(workspace_id)?;
-        self.reveal_column_in_workspace(workspace_id, column_id, Some(column_id))?;
-        Ok(Some(workspace_id))
-    }
-
     fn handle_config_reload_succeeded(
         &mut self,
         payload: &flowtile_domain::ConfigReloadSucceededPayload,
@@ -1353,115 +543,6 @@ impl StateStore {
         }
 
         Ok(column_id)
-    }
-
-    fn active_tiled_width_target(&self) -> Result<(WorkspaceId, WindowId, ColumnId), CoreError> {
-        let workspace_id = self.active_workspace_id_for_commands()?;
-        let window_id =
-            self.focused_window_in_workspace(workspace_id)
-                .ok_or(CoreError::InvalidEvent(
-                    "width command requires an active tiled window",
-                ))?;
-        let window = self
-            .state
-            .windows
-            .get(&window_id)
-            .ok_or(CoreError::UnknownWindow(window_id))?;
-        let column_id = window.column_id.ok_or(CoreError::InvalidEvent(
-            "width command requires an active tiled column",
-        ))?;
-        if window.layer != WindowLayer::Tiled || window.is_floating || window.is_fullscreen {
-            return Err(CoreError::InvalidEvent(
-                "width command requires an active managed tiled window",
-            ));
-        }
-        Ok((workspace_id, window_id, column_id))
-    }
-
-    fn column_target_width_bounds(
-        &self,
-        column_id: ColumnId,
-        workspace_id: WorkspaceId,
-    ) -> Result<(u32, u32), CoreError> {
-        let viewport = self.workspace_tiled_viewport(workspace_id)?;
-        let max_width = viewport.width.max(1);
-        let min_width = (max_width / 6).max(1);
-        let _ = self
-            .state
-            .layout
-            .columns
-            .get(&column_id)
-            .ok_or(CoreError::UnknownColumn(column_id))?;
-        Ok((min_width, max_width))
-    }
-
-    fn compute_width_resize_metrics(
-        &self,
-        edge: ResizeEdge,
-        initial_column_rect: Rect,
-        initial_width: u32,
-        viewport: Rect,
-        pointer_x: i32,
-    ) -> Result<(u32, Rect, i32, i32), CoreError> {
-        let max_width = viewport.width.max(1);
-        let min_width = (max_width / 6).max(1);
-        let initial_left = initial_column_rect.x;
-        let initial_right = initial_column_rect
-            .x
-            .saturating_add(initial_column_rect.width as i32);
-
-        let (min_pointer_x, max_pointer_x, anchor_x) = match edge {
-            ResizeEdge::Right => (
-                initial_left.saturating_add(min_width as i32),
-                initial_left.saturating_add(max_width as i32),
-                initial_right,
-            ),
-            ResizeEdge::Left => (
-                initial_right.saturating_sub(max_width as i32),
-                initial_right.saturating_sub(min_width as i32),
-                initial_left,
-            ),
-        };
-        let viewport_left = viewport.x;
-        let viewport_right = viewport.x.saturating_add(viewport.width as i32);
-        let clamped_pointer_x = pointer_x
-            .clamp(min_pointer_x, max_pointer_x)
-            .clamp(viewport_left, viewport_right);
-        let target_width = match edge {
-            ResizeEdge::Right => clamped_pointer_x.saturating_sub(initial_left) as u32,
-            ResizeEdge::Left => initial_right.saturating_sub(clamped_pointer_x) as u32,
-        }
-        .clamp(min_width, max_width);
-        let preview_left = anchor_x.min(clamped_pointer_x);
-        let preview_right = anchor_x.max(clamped_pointer_x);
-        let preview_width = (preview_right.saturating_sub(preview_left) as u32).max(1);
-        let preview_rect = Rect::new(
-            preview_left,
-            viewport.y,
-            preview_width,
-            initial_column_rect.height.min(viewport.height).max(1),
-        );
-
-        let _ = initial_width;
-        Ok((target_width, preview_rect, anchor_x, clamped_pointer_x))
-    }
-
-    fn next_cycled_column_width(&self, current_width: u32, min_width: u32, max_width: u32) -> u32 {
-        let mut steps = [
-            max_width / 3,
-            max_width / 2,
-            (max_width.saturating_mul(2)) / 3,
-            max_width,
-        ]
-        .map(|width| width.clamp(min_width, max_width).max(1))
-        .to_vec();
-        steps.sort_unstable();
-        steps.dedup();
-        steps
-            .iter()
-            .copied()
-            .find(|width| *width > current_width)
-            .unwrap_or_else(|| steps[0])
     }
 
     fn focused_window_in_workspace(&self, workspace_id: WorkspaceId) -> Option<WindowId> {
@@ -1568,208 +649,6 @@ impl StateStore {
             .get(&window_id)
             .map(|window| window.workspace_id)
             .ok_or(CoreError::UnknownWindow(window_id))
-    }
-
-    fn command_monitor_id(
-        &self,
-        requested_monitor_id: Option<MonitorId>,
-    ) -> Result<MonitorId, CoreError> {
-        let monitor_id = requested_monitor_id
-            .or(self.state.focus.focused_monitor_id)
-            .or_else(|| self.state.monitors.keys().next().copied())
-            .ok_or(CoreError::InvalidEvent(
-                "workspace command requires a monitor context",
-            ))?;
-        self.state
-            .monitors
-            .contains_key(&monitor_id)
-            .then_some(monitor_id)
-            .ok_or(CoreError::UnknownMonitor(monitor_id))
-    }
-
-    fn adjacent_monitor_id(
-        &self,
-        source_monitor_id: MonitorId,
-        forward: bool,
-    ) -> Option<MonitorId> {
-        let monitor_ids = self.state.monitor_ids_in_navigation_order();
-        let source_index = monitor_ids
-            .iter()
-            .position(|monitor_id| *monitor_id == source_monitor_id)?;
-        let target_index = if forward {
-            source_index
-                .saturating_add(1)
-                .min(monitor_ids.len().saturating_sub(1))
-        } else {
-            source_index.saturating_sub(1)
-        };
-        monitor_ids.get(target_index).copied()
-    }
-
-    fn activate_workspace(
-        &mut self,
-        monitor_id: MonitorId,
-        workspace_id: WorkspaceId,
-        origin: FocusOrigin,
-    ) -> Result<(), CoreError> {
-        let previous_column_id = self.focused_column_in_workspace(workspace_id);
-        if let Some((window_id, column_id)) = self.workspace_focus_target(workspace_id)? {
-            self.set_focus_to_window(monitor_id, workspace_id, window_id, column_id, origin)?;
-            if let Some(column_id) = column_id {
-                self.reveal_column_in_workspace(workspace_id, column_id, previous_column_id)?;
-            } else {
-                self.clamp_scroll_offset(workspace_id)?;
-            }
-        } else {
-            self.set_active_workspace_without_focus(monitor_id, workspace_id, origin)?;
-            self.clamp_scroll_offset(workspace_id)?;
-        }
-        self.sync_overview_selection(monitor_id);
-        Ok(())
-    }
-
-    fn workspace_focus_target(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> Result<Option<(WindowId, Option<ColumnId>)>, CoreError> {
-        let workspace = self
-            .state
-            .workspaces
-            .get(&workspace_id)
-            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-
-        if let Some(window_id) = workspace.remembered_focused_window_id
-            && let Some(window) = self.state.windows.get(&window_id)
-            && window.workspace_id == workspace_id
-        {
-            let column_id = window
-                .column_id
-                .filter(|column_id| workspace.strip.ordered_column_ids.contains(column_id));
-            return Ok(Some((window_id, column_id)));
-        }
-
-        if let Some(column_id) = workspace.remembered_focused_column_id
-            && workspace.strip.ordered_column_ids.contains(&column_id)
-            && let Some(column) = self.state.layout.columns.get(&column_id)
-            && let Some(window_id) = self.column_active_window(column)
-        {
-            return Ok(Some((window_id, Some(column_id))));
-        }
-
-        for column_id in &workspace.strip.ordered_column_ids {
-            let column = self
-                .state
-                .layout
-                .columns
-                .get(column_id)
-                .ok_or(CoreError::UnknownColumn(*column_id))?;
-            if let Some(window_id) = self.column_active_window(column) {
-                return Ok(Some((window_id, Some(*column_id))));
-            }
-        }
-
-        Ok(workspace
-            .floating_layer
-            .ordered_window_ids
-            .first()
-            .copied()
-            .map(|window_id| (window_id, None)))
-    }
-
-    fn set_active_workspace_without_focus(
-        &mut self,
-        monitor_id: MonitorId,
-        workspace_id: WorkspaceId,
-        origin: FocusOrigin,
-    ) -> Result<(), CoreError> {
-        self.state
-            .workspaces
-            .contains_key(&workspace_id)
-            .then_some(())
-            .ok_or(CoreError::UnknownWorkspace(workspace_id))?;
-        self.state.focus.focused_monitor_id = Some(monitor_id);
-        self.state.focus.focused_window_id = None;
-        self.state.focus.focused_column_id = None;
-        self.state.focus.focus_origin = origin;
-        self.state
-            .focus
-            .active_workspace_by_monitor
-            .insert(monitor_id, workspace_id);
-
-        if let Some(workspace_set_id) = self.state.workspace_set_id_for_monitor(monitor_id)
-            && let Some(workspace_set) = self.state.workspace_sets.get_mut(&workspace_set_id)
-        {
-            workspace_set.active_workspace_id = workspace_id;
-        }
-
-        Ok(())
-    }
-
-    fn sync_overview_selection(&mut self, monitor_id: MonitorId) {
-        if !self.state.overview.is_open || self.state.overview.monitor_id != Some(monitor_id) {
-            return;
-        }
-        self.state.overview.selection = self.state.active_workspace_id_for_monitor(monitor_id);
-        self.state.overview.projection_version =
-            self.state.overview.projection_version.saturating_add(1);
-    }
-
-    fn open_overview_for_monitor(&mut self, monitor_id: MonitorId) -> Result<(), CoreError> {
-        let workspace_id = self
-            .state
-            .active_workspace_id_for_monitor(monitor_id)
-            .ok_or(CoreError::NoActiveWorkspace(monitor_id))?;
-        let overview = &mut self.state.overview;
-        let changed = !overview.is_open
-            || overview.monitor_id != Some(monitor_id)
-            || overview.selection != Some(workspace_id)
-            || overview.drag_payload.is_some();
-        overview.is_open = true;
-        overview.monitor_id = Some(monitor_id);
-        overview.selection = Some(workspace_id);
-        overview.drag_payload = None;
-        if changed {
-            overview.projection_version = overview.projection_version.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    fn close_overview(&mut self) {
-        let overview = &mut self.state.overview;
-        let changed = overview.is_open
-            || overview.monitor_id.is_some()
-            || overview.selection.is_some()
-            || overview.drag_payload.is_some();
-        overview.is_open = false;
-        overview.monitor_id = None;
-        overview.selection = None;
-        overview.drag_payload = None;
-        if changed {
-            overview.projection_version = overview.projection_version.saturating_add(1);
-        }
-    }
-
-    fn active_workspace_id_for_commands(&self) -> Result<WorkspaceId, CoreError> {
-        if let Some(monitor_id) = self.state.focus.focused_monitor_id
-            && let Some(workspace_id) = self.state.active_workspace_id_for_monitor(monitor_id)
-        {
-            return Ok(workspace_id);
-        }
-
-        self.state
-            .workspace_sets
-            .values()
-            .next()
-            .map(|workspace_set| workspace_set.active_workspace_id)
-            .ok_or(CoreError::InvalidEvent(
-                "no active workspace is available for command handling",
-            ))
-    }
-
-    fn command_window_id(&self, requested: Option<WindowId>) -> Result<WindowId, CoreError> {
-        requested
-            .or(self.state.focus.focused_window_id)
-            .ok_or(CoreError::InvalidEvent("command requires a target window"))
     }
 
     fn push_window_to_floating_layer(

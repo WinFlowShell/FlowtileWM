@@ -47,6 +47,7 @@ pub(crate) enum WatchCommand {
     CloseOverview,
     ToggleOverview,
     OpenTerminal,
+    OpenWallpaperSelector,
     CloseWindow,
     ReloadConfig,
     Snapshot,
@@ -79,6 +80,7 @@ impl WatchCommand {
             "close-overview" => Some(Self::CloseOverview),
             "toggle-overview" => Some(Self::ToggleOverview),
             "open-terminal" => Some(Self::OpenTerminal),
+            "open-wallpaper-selector" => Some(Self::OpenWallpaperSelector),
             "close-window" => Some(Self::CloseWindow),
             "reload-config" => Some(Self::ReloadConfig),
             "disable-management-and-unwind" => Some(Self::Unwind),
@@ -117,6 +119,9 @@ impl WatchCommand {
             "close-overview" | "overview-close" => Some(Self::CloseOverview),
             "toggle-overview" | "overview" => Some(Self::ToggleOverview),
             "open-terminal" | "terminal" => Some(Self::OpenTerminal),
+            "open-wallpaper-selector" | "wallpaper" | "wallpaper-selector" => {
+                Some(Self::OpenWallpaperSelector)
+            }
             "close-window" | "window-close" => Some(Self::CloseWindow),
             "reload-config" | "reload" => Some(Self::ReloadConfig),
             "snapshot" => Some(Self::Snapshot),
@@ -154,6 +159,7 @@ impl WatchCommand {
             Self::CloseOverview => "close-overview",
             Self::ToggleOverview => "toggle-overview",
             Self::OpenTerminal => "open-terminal",
+            Self::OpenWallpaperSelector => "open-wallpaper-selector",
             Self::CloseWindow => "close-window",
             Self::ReloadConfig => "reload-config",
             Self::Snapshot => "snapshot",
@@ -187,6 +193,7 @@ impl WatchCommand {
             Self::ToggleOverview => Some("toggle_overview"),
             Self::ReloadConfig => Some("reload_config"),
             Self::OpenTerminal
+            | Self::OpenWallpaperSelector
             | Self::CloseWindow
             | Self::Snapshot
             | Self::Unwind

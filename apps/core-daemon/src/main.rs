@@ -1,6 +1,7 @@
 mod cli;
 mod control;
 mod diag;
+mod flowshell_core;
 mod hotkeys;
 mod ipc;
 mod manual_resize;
@@ -12,6 +13,7 @@ mod tab_indicator;
 mod terminal;
 mod touchpad;
 mod watch;
+mod win32_overlay;
 mod window_actions;
 
 use std::{env, process::ExitCode};
