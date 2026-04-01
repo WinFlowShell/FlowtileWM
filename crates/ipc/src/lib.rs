@@ -203,6 +203,25 @@ pub struct DiagnosticsProjection {
     pub touchpad_override_detail: Option<String>,
     #[serde(default)]
     pub perf: PerfTelemetrySnapshot,
+    #[serde(default)]
+    pub surrogate_presentation: SurrogatePresentationDiagnosticsProjection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SurrogatePresentationDiagnosticsProjection {
+    pub active_hosts: usize,
+    pub show_requests: u64,
+    pub hide_requests: u64,
+    pub classifier_rejections: u64,
+    pub native_fallbacks: u64,
+    pub transient_escapes: u64,
+    pub handoff_promotions: u64,
+    pub pointer_replay_attempts: u64,
+    pub pointer_replay_successes: u64,
+    pub pointer_replay_failures: u64,
+    pub dwm_thumbnail_backend_uses: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

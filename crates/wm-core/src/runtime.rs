@@ -1,9 +1,11 @@
 mod apply_policy;
 mod config;
+mod desktop_materialization;
 mod observation;
 mod validation;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,13 +20,16 @@ use flowtile_domain::{
     MonitorId, Rect, ResizeEdge, RuntimeMode, TopologyRole, WidthSemantics, WindowId, WindowLayer,
     WindowPlacement, WmState,
 };
-use flowtile_layout_engine::{padded_tiled_viewport, recompute_workspace};
+use flowtile_layout_engine::{
+    WorkspaceLayoutProjection, padded_tiled_viewport, recompute_workspace,
+};
 use flowtile_windows_adapter::{
     ApplyBatchResult, ApplyOperation, ObservationEnvelope, ObservationKind,
     PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot, SnapshotDiff,
-    WINDOW_SWITCH_ANIMATION_DURATION_MS, WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
-    WindowSwitchAnimation, WindowsAdapter, diff_snapshots, needs_activation_apply,
-    needs_geometry_apply, needs_tiled_gapless_geometry_apply,
+    SurrogatePresentationDiagnostics, WINDOW_SWITCH_ANIMATION_DURATION_MS,
+    WINDOW_SWITCH_ANIMATION_FRAME_COUNT, WindowPresentation, WindowPresentationMode,
+    WindowSurrogateClip, WindowSwitchAnimation, WindowsAdapter, diff_snapshots,
+    needs_activation_apply, needs_geometry_apply, needs_tiled_gapless_geometry_apply,
 };
 
 use self::apply_policy::{
@@ -35,6 +40,9 @@ use self::apply_policy::{
     supports_tiled_window_switch_animation, visual_emphasis_has_effect, window_layer_name,
 };
 use self::config::workspace_path;
+use self::desktop_materialization::{
+    DesktopWindowPresentationMode, build_monitor_local_desktop_projection,
+};
 use crate::{
     CoreDaemonRuntime, RuntimeCycleReport, RuntimeError, RuntimePerfTelemetry, StateStore,
 };
@@ -192,6 +200,10 @@ impl CoreDaemonRuntime {
         PerfTelemetrySnapshot { metrics }
     }
 
+    pub fn surrogate_presentation_diagnostics(&self) -> SurrogatePresentationDiagnostics {
+        self.adapter.surrogate_presentation_diagnostics()
+    }
+
     pub fn request_emergency_unwind(&mut self, reason: &str) {
         self.management_enabled = false;
         self.push_degraded_reason(format!("emergency-unwind:{reason}"));
@@ -343,7 +355,10 @@ impl CoreDaemonRuntime {
             .windows
             .iter()
             .map(|window| (window.hwnd, window))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<HashMap<_, _>>();
+        let workspace_layouts = self.collect_workspace_layouts()?;
+        let desktop_projection =
+            build_monitor_local_desktop_projection(self.store.state(), &workspace_layouts);
         let desired_focused_hwnd = self
             .store
             .state()
@@ -358,91 +373,128 @@ impl CoreDaemonRuntime {
             !overview_is_open && self.should_attempt_activation_reassert(actual_focused_hwnd);
         let mut operations = Vec::new();
 
-        for workspace in self.store.state().workspaces.values() {
-            if self.store.state().is_workspace_empty(workspace.id) {
+        for monitor_id in self.store.state().monitor_ids_in_navigation_order() {
+            let Some(monitor_projection) = desktop_projection.monitors.get(&monitor_id) else {
                 continue;
-            }
+            };
 
-            let projection = recompute_workspace(self.store.state(), workspace.id)?;
-            for geometry in projection.window_geometries {
-                let Some(window) = self.store.state().windows.get(&geometry.window_id) else {
+            for workspace_band in &monitor_projection.workspace_bands {
+                let Some(projection) = workspace_layouts.get(&workspace_band.workspace_id) else {
                     continue;
                 };
-                if !window.is_managed {
-                    continue;
-                }
-                let Some(hwnd) = window.current_hwnd_binding else {
-                    continue;
-                };
-                let Some(actual_window) = actual_windows.get(&hwnd) else {
-                    continue;
-                };
-                let target_rect =
-                    desired_workspace_window_rect(self.store.state(), workspace, geometry.rect);
-                let needs_geometry = if geometry.layer == WindowLayer::Tiled {
-                    needs_tiled_gapless_geometry_apply(actual_window.rect, target_rect)
-                } else {
-                    needs_geometry_apply(actual_window.rect, target_rect)
-                };
-                let activate = desired_focused_hwnd
-                    .filter(|_| allow_activation_reassert)
-                    .filter(|desired_hwnd| *desired_hwnd == hwnd)
-                    .is_some_and(|desired_hwnd| {
-                        needs_activation_apply(actual_focused_hwnd, desired_hwnd)
-                            || (apply_plan_context.force_activate_focused_window && needs_geometry)
-                    });
-                let active_state_changed = apply_plan_context.previous_focused_hwnd
-                    != desired_focused_hwnd
-                    && (apply_plan_context.previous_focused_hwnd == Some(hwnd)
-                        || desired_focused_hwnd == Some(hwnd));
-                let visual_emphasis = (!overview_is_open
-                    && (needs_geometry
-                        || activate
-                        || active_state_changed
-                        || apply_plan_context.refresh_visual_emphasis))
-                    .then(|| {
-                        build_visual_emphasis(
-                            desired_focused_hwnd == Some(hwnd),
-                            actual_window.process_name.as_deref(),
-                            &actual_window.class_name,
-                            &actual_window.title,
-                        )
-                    })
-                    .filter(visual_emphasis_has_effect);
-                if needs_geometry || activate || visual_emphasis.is_some() {
-                    let window_switch_animation = ((apply_plan_context.animate_window_switch
-                        || apply_plan_context.animate_tiled_geometry)
-                        && supports_tiled_window_switch_animation(
-                            actual_window.process_name.as_deref(),
-                            &actual_window.class_name,
-                            &actual_window.title,
-                        )
-                        && geometry.layer == WindowLayer::Tiled
-                        && needs_geometry)
-                        .then_some(WindowSwitchAnimation {
-                            from_rect: actual_window.rect,
-                            duration_ms: WINDOW_SWITCH_ANIMATION_DURATION_MS,
-                            frame_count: WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
+
+                for geometry in &projection.window_geometries {
+                    let Some(window) = self.store.state().windows.get(&geometry.window_id) else {
+                        continue;
+                    };
+                    if !window.is_managed {
+                        continue;
+                    }
+                    let Some(hwnd) = window.current_hwnd_binding else {
+                        continue;
+                    };
+                    let Some(actual_window) = actual_windows.get(&hwnd) else {
+                        continue;
+                    };
+                    let Some(window_projection) =
+                        desktop_projection.windows.get(&geometry.window_id)
+                    else {
+                        continue;
+                    };
+                    let target_rect = window_projection.desktop_rect;
+                    let presentation = if overview_is_open {
+                        WindowPresentation::default()
+                    } else {
+                        presentation_from_desktop_projection(window_projection)
+                    };
+                    let needs_presentation =
+                        presentation.mode != WindowPresentationMode::NativeVisible;
+                    let needs_geometry = if geometry.layer == WindowLayer::Tiled {
+                        needs_tiled_gapless_geometry_apply(actual_window.rect, target_rect)
+                    } else {
+                        needs_geometry_apply(actual_window.rect, target_rect)
+                    };
+                    let activate = desired_focused_hwnd
+                        .filter(|_| allow_activation_reassert)
+                        .filter(|desired_hwnd| *desired_hwnd == hwnd)
+                        .is_some_and(|desired_hwnd| {
+                            needs_activation_apply(actual_focused_hwnd, desired_hwnd)
+                                || (apply_plan_context.force_activate_focused_window
+                                    && needs_geometry)
                         });
-                    operations.push(ApplyOperation {
-                        hwnd,
-                        rect: target_rect,
-                        apply_geometry: needs_geometry,
-                        activate,
-                        suppress_visual_gap: should_suppress_visual_gap(
-                            geometry.layer,
-                            actual_window.process_name.as_deref(),
-                            &actual_window.class_name,
-                            &actual_window.title,
-                        ),
-                        window_switch_animation,
-                        visual_emphasis,
-                    });
+                    let active_state_changed = apply_plan_context.previous_focused_hwnd
+                        != desired_focused_hwnd
+                        && (apply_plan_context.previous_focused_hwnd == Some(hwnd)
+                            || desired_focused_hwnd == Some(hwnd));
+                    let visual_emphasis = (!overview_is_open
+                        && !needs_presentation
+                        && (needs_geometry
+                            || activate
+                            || active_state_changed
+                            || apply_plan_context.refresh_visual_emphasis))
+                        .then(|| {
+                            build_visual_emphasis(
+                                desired_focused_hwnd == Some(hwnd),
+                                actual_window.process_name.as_deref(),
+                                &actual_window.class_name,
+                                &actual_window.title,
+                            )
+                        })
+                        .filter(visual_emphasis_has_effect);
+                    if needs_geometry || activate || visual_emphasis.is_some() || needs_presentation
+                    {
+                        let window_switch_animation = ((apply_plan_context.animate_window_switch
+                            || apply_plan_context.animate_tiled_geometry)
+                            && supports_tiled_window_switch_animation(
+                                actual_window.process_name.as_deref(),
+                                &actual_window.class_name,
+                                &actual_window.title,
+                            )
+                            && geometry.layer == WindowLayer::Tiled
+                            && needs_geometry)
+                            .then_some(WindowSwitchAnimation {
+                                from_rect: actual_window.rect,
+                                duration_ms: WINDOW_SWITCH_ANIMATION_DURATION_MS,
+                                frame_count: WINDOW_SWITCH_ANIMATION_FRAME_COUNT,
+                            });
+                        operations.push(ApplyOperation {
+                            hwnd,
+                            rect: target_rect,
+                            apply_geometry: needs_geometry,
+                            activate,
+                            suppress_visual_gap: should_suppress_visual_gap(
+                                geometry.layer,
+                                actual_window.process_name.as_deref(),
+                                &actual_window.class_name,
+                                &actual_window.title,
+                            ),
+                            window_switch_animation,
+                            visual_emphasis,
+                            presentation,
+                        });
+                    }
                 }
             }
         }
 
         Ok(operations)
+    }
+
+    fn collect_workspace_layouts(
+        &self,
+    ) -> Result<HashMap<flowtile_domain::WorkspaceId, WorkspaceLayoutProjection>, RuntimeError>
+    {
+        self.store
+            .state()
+            .workspaces
+            .values()
+            .filter(|workspace| !self.store.state().is_workspace_empty(workspace.id))
+            .map(|workspace| {
+                recompute_workspace(self.store.state(), workspace.id)
+                    .map(|projection| (workspace.id, projection))
+                    .map_err(Into::into)
+            })
+            .collect()
     }
 
     fn build_apply_plan_context(
@@ -577,53 +629,6 @@ impl CoreDaemonRuntime {
     }
 }
 
-fn desired_workspace_window_rect(
-    state: &WmState,
-    workspace: &flowtile_domain::Workspace,
-    rect: Rect,
-) -> Rect {
-    let workspace_is_active =
-        state.active_workspace_id_for_monitor(workspace.monitor_id) == Some(workspace.id);
-    if workspace_is_active {
-        return rect;
-    }
-
-    inactive_workspace_rect(state, workspace, rect)
-}
-
-fn inactive_workspace_rect(
-    state: &WmState,
-    workspace: &flowtile_domain::Workspace,
-    rect: Rect,
-) -> Rect {
-    let Some(active_workspace_id) = state.active_workspace_id_for_monitor(workspace.monitor_id)
-    else {
-        return rect;
-    };
-    let Some(active_workspace) = state.workspaces.get(&active_workspace_id) else {
-        return rect;
-    };
-
-    let active_region = active_workspace.strip.visible_region;
-    let workspace_region = workspace.strip.visible_region;
-    let active_index = active_workspace.vertical_index.min(i32::MAX as usize) as i32;
-    let workspace_index = workspace.vertical_index.min(i32::MAX as usize) as i32;
-    let relative_workspace_offset = workspace_index.saturating_sub(active_index);
-    let band_height = active_region.height.min(i32::MAX as u32) as i32;
-    let relative_x = rect.x.saturating_sub(workspace_region.x);
-    let relative_y = rect.y.saturating_sub(workspace_region.y);
-
-    Rect::new(
-        active_region.x.saturating_add(relative_x),
-        active_region
-            .y
-            .saturating_add(relative_workspace_offset.saturating_mul(band_height))
-            .saturating_add(relative_y),
-        rect.width,
-        rect.height,
-    )
-}
-
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -635,6 +640,29 @@ fn record_perf_metric<T, E>(metric: &AtomicPerfMetric, started_at: Instant, resu
     metric.record_duration(started_at.elapsed());
     if result.is_err() {
         metric.record_error();
+    }
+}
+
+fn presentation_from_desktop_projection(
+    projection: &desktop_materialization::DesktopWindowProjection,
+) -> WindowPresentation {
+    match projection.presentation_mode {
+        DesktopWindowPresentationMode::NativeVisible => WindowPresentation::default(),
+        DesktopWindowPresentationMode::NativeHidden => WindowPresentation {
+            mode: WindowPresentationMode::NativeHidden,
+            surrogate: None,
+        },
+        DesktopWindowPresentationMode::SurrogateClipped => WindowPresentation {
+            mode: WindowPresentationMode::SurrogateClipped,
+            surrogate: projection
+                .surrogate_rect
+                .zip(projection.surrogate_source_rect)
+                .map(|(destination_rect, source_rect)| WindowSurrogateClip {
+                    destination_rect,
+                    source_rect,
+                    native_visible_rect: projection.logical_desktop_rect,
+                }),
+        },
     }
 }
 

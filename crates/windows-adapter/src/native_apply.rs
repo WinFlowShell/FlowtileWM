@@ -1,6 +1,7 @@
 mod activation;
 mod browser_dim_overlay;
 mod browser_visual_surrogate;
+mod clipped_window_surrogate;
 mod visual_effects;
 mod window_geometry;
 mod window_switch_animation;
@@ -27,6 +28,12 @@ use self::{
     browser_visual_surrogate::{
         hide_browser_visual_surrogate_if_initialized, show_browser_visual_surrogate,
     },
+    clipped_window_surrogate::{
+        clipped_window_surrogate_classifier_reason, hide_clipped_window_surrogate_if_initialized,
+        record_clipped_window_surrogate_native_fallback, should_use_clipped_window_surrogate,
+        show_clipped_window_surrogate,
+        surrogate_presentation_diagnostics_snapshot as clipped_surrogate_diagnostics_snapshot,
+    },
     visual_effects::{
         AppliedVisualState, applied_visual_states, apply_window_border, apply_window_corners,
         apply_window_opacity, browser_surrogate_alpha, direct_layered_opacity_alpha, layered_hwnds,
@@ -39,7 +46,8 @@ use self::{
     },
 };
 use crate::{
-    ApplyBatchResult, ApplyFailure, ApplyOperation, WindowOpacityMode, WindowVisualEmphasis, dpi,
+    ApplyBatchResult, ApplyFailure, ApplyOperation, SurrogatePresentationDiagnostics,
+    WindowOpacityMode, WindowPresentation, WindowPresentationMode, WindowVisualEmphasis, dpi,
 };
 
 use std::convert::TryFrom;
@@ -64,7 +72,11 @@ pub(crate) fn apply_operations(operations: &[ApplyOperation]) -> ApplyBatchResul
         };
     }
 
-    let (animated_operations, direct_operations): (Vec<_>, Vec<_>) = operations
+    let normalized_operations = operations
+        .iter()
+        .map(normalize_surrogate_presentation_operation)
+        .collect::<Vec<_>>();
+    let (animated_operations, direct_operations): (Vec<_>, Vec<_>) = normalized_operations
         .iter()
         .cloned()
         .partition(uses_window_switch_animation);
@@ -79,17 +91,57 @@ pub(crate) fn apply_operations(operations: &[ApplyOperation]) -> ApplyBatchResul
     result
 }
 
+fn normalize_surrogate_presentation_operation(operation: &ApplyOperation) -> ApplyOperation {
+    if operation.presentation.mode != WindowPresentationMode::SurrogateClipped {
+        return operation.clone();
+    }
+
+    if should_use_clipped_window_surrogate(operation.hwnd) {
+        return operation.clone();
+    }
+
+    let reason = clipped_window_surrogate_classifier_reason(operation.hwnd);
+    record_clipped_window_surrogate_native_fallback(operation.hwnd, reason);
+    operation_with_native_visible_surrogate_fallback(operation).unwrap_or_else(|| operation.clone())
+}
+
+pub(crate) fn surrogate_presentation_diagnostics_snapshot() -> SurrogatePresentationDiagnostics {
+    clipped_surrogate_diagnostics_snapshot()
+}
+
+fn operation_with_native_visible_surrogate_fallback(
+    operation: &ApplyOperation,
+) -> Option<ApplyOperation> {
+    let native_visible_rect = operation
+        .presentation
+        .surrogate
+        .as_ref()?
+        .native_visible_rect;
+    let mut normalized = operation.clone();
+    normalized.rect = native_visible_rect;
+    normalized.presentation = WindowPresentation::default();
+    Some(normalized)
+}
+
 fn apply_operations_direct(operations: &[ApplyOperation]) -> ApplyBatchResult {
     if operations.is_empty() {
         return ApplyBatchResult::default();
     }
 
-    let (geometry_operations, visual_only_operations): (Vec<_>, Vec<_>) = operations
+    let (surrogate_operations, remaining_operations): (Vec<_>, Vec<_>) =
+        operations.iter().cloned().partition(|operation| {
+            operation.presentation.mode == WindowPresentationMode::SurrogateClipped
+        });
+    let (geometry_operations, visual_only_operations): (Vec<_>, Vec<_>) = remaining_operations
         .iter()
         .cloned()
         .partition(|operation| operation.apply_geometry);
 
     let mut result = ApplyBatchResult::default();
+    merge_apply_result(
+        &mut result,
+        apply_operations_individually(&surrogate_operations),
+    );
 
     if geometry_operations.is_empty() {
         merge_apply_result(
@@ -238,6 +290,7 @@ fn try_apply_window_switch_animations(operations: &[ApplyOperation]) -> Result<(
             .map(|operation| animated_frame_operation(operation, eased_progress))
             .collect::<Vec<_>>();
         try_apply_operations_batched(&frame_operations)?;
+        sync_window_presentations(&frame_operations)?;
         sync_browser_visual_surfaces_for_animation_frame(operations, &frame_operations)?;
 
         if frame_index < frame_count {
@@ -260,7 +313,11 @@ fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
         match apply_geometry(operation) {
             Ok(()) => {}
             Err(error) => {
-                if operation.activate && error.code == ERROR_ACCESS_DENIED {
+                if operation.activate
+                    && operation.presentation.mode == WindowPresentationMode::NativeVisible
+                    && error.code == ERROR_ACCESS_DENIED
+                {
+                    sync_window_presentation(operation)?;
                     apply_visual_emphasis_for_operation(operation)?;
                     activate_window(operation.hwnd).map_err(|activation_error| {
                         format!(
@@ -276,6 +333,7 @@ fn apply_operation(operation: &ApplyOperation) -> Result<(), String> {
         }
     }
 
+    sync_window_presentation(operation)?;
     apply_visual_emphasis_for_operation(operation)?;
 
     if operation.activate {
@@ -290,6 +348,15 @@ fn finalize_apply_without_animation(operations: &[ApplyOperation]) -> ApplyBatch
     let mut failures = Vec::new();
 
     for operation in operations {
+        if let Err(message) = sync_window_presentation(operation) {
+            applied = applied.saturating_sub(1);
+            failures.push(ApplyFailure {
+                hwnd: operation.hwnd,
+                message,
+            });
+            continue;
+        }
+
         if let Err(message) = apply_visual_emphasis_for_operation(operation) {
             applied = applied.saturating_sub(1);
             failures.push(ApplyFailure {
@@ -358,6 +425,36 @@ fn apply_geometry(operation: &ApplyOperation) -> Result<(), Win32ApiError> {
 
 fn apply_gapless_visual_policy(hwnd: HWND) {
     visual_effects::apply_gapless_visual_policy(hwnd);
+}
+
+fn sync_window_presentations(operations: &[ApplyOperation]) -> Result<(), String> {
+    for operation in operations {
+        sync_window_presentation(operation)?;
+    }
+
+    Ok(())
+}
+
+fn sync_window_presentation(operation: &ApplyOperation) -> Result<(), String> {
+    match operation.presentation.mode {
+        WindowPresentationMode::NativeVisible | WindowPresentationMode::NativeHidden => {
+            hide_clipped_window_surrogate_if_initialized(operation.hwnd)
+        }
+        WindowPresentationMode::SurrogateClipped => {
+            let surrogate = operation.presentation.surrogate.as_ref().ok_or_else(|| {
+                format!(
+                    "surrogate-clipped presentation for hwnd {} is missing clip metadata",
+                    operation.hwnd
+                )
+            })?;
+            show_clipped_window_surrogate(
+                operation.hwnd,
+                surrogate.destination_rect,
+                surrogate.source_rect,
+                surrogate.native_visible_rect,
+            )
+        }
+    }
 }
 
 fn apply_visual_emphasis_for_operation(operation: &ApplyOperation) -> Result<(), String> {
@@ -545,10 +642,14 @@ mod tests {
 
     use flowtile_domain::Rect;
 
-    use crate::{WindowOpacityMode, WindowSwitchAnimation, WindowVisualEmphasis};
+    use crate::{
+        WindowOpacityMode, WindowPresentation, WindowPresentationMode, WindowSurrogateClip,
+        WindowSwitchAnimation, WindowVisualEmphasis,
+    };
 
     use super::{
         browser_visual_surrogate::source_relative_rect,
+        operation_with_native_visible_surrogate_fallback,
         visual_effects::{
             AppliedVisualState, browser_surrogate_alpha, direct_layered_opacity_alpha,
             normalized_visual_emphasis, overlay_dim_alpha, overlay_dim_alpha_from_window_opacity,
@@ -617,9 +718,37 @@ mod tests {
                 frame_count: 6,
             }),
             visual_emphasis: None,
+            presentation: crate::WindowPresentation::default(),
         };
 
         assert!(uses_window_switch_animation(&operation));
+    }
+
+    #[test]
+    fn surrogate_fallback_restores_native_visible_rect_and_native_presentation() {
+        let operation = crate::ApplyOperation {
+            hwnd: 200,
+            rect: Rect::new(5000, 5000, 32, 32),
+            apply_geometry: true,
+            activate: false,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
+            visual_emphasis: None,
+            presentation: WindowPresentation {
+                mode: WindowPresentationMode::SurrogateClipped,
+                surrogate: Some(WindowSurrogateClip {
+                    destination_rect: Rect::new(928, 16, 672, 868),
+                    source_rect: Rect::new(0, 0, 672, 868),
+                    native_visible_rect: Rect::new(928, 16, 900, 868),
+                }),
+            },
+        };
+
+        let fallback = operation_with_native_visible_surrogate_fallback(&operation)
+            .expect("surrogate operation should downgrade back to native visible");
+
+        assert_eq!(fallback.rect, Rect::new(928, 16, 900, 868));
+        assert_eq!(fallback.presentation, WindowPresentation::default());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use flowtile_domain::{
 use flowtile_layout_engine::recompute_workspace;
 use flowtile_windows_adapter::{
     ApplyOperation, PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot,
-    WindowOpacityMode,
+    WindowOpacityMode, WindowPresentation, WindowPresentationMode,
 };
 
 use crate::CoreDaemonRuntime;
@@ -27,6 +27,7 @@ fn treats_focus_mismatch_without_geometry_drift_as_activation_only() {
         suppress_visual_gap: false,
         window_switch_animation: None,
         visual_emphasis: None,
+        presentation: WindowPresentation::default(),
     }];
 
     assert!(operations_are_activation_only(&snapshot, &operations));
@@ -43,6 +44,7 @@ fn does_not_treat_geometry_retry_as_activation_only() {
         suppress_visual_gap: false,
         window_switch_animation: None,
         visual_emphasis: None,
+        presentation: WindowPresentation::default(),
     }];
 
     assert!(!operations_are_activation_only(&snapshot, &operations));
@@ -58,6 +60,7 @@ fn single_window_desync_does_not_force_auto_unwind() {
         suppress_visual_gap: false,
         window_switch_animation: None,
         visual_emphasis: None,
+        presentation: WindowPresentation::default(),
     }];
 
     assert!(!should_auto_unwind_after_desync(&operations, 3));
@@ -74,6 +77,7 @@ fn multi_window_persistent_desync_can_force_auto_unwind() {
             suppress_visual_gap: false,
             window_switch_animation: None,
             visual_emphasis: None,
+            presentation: WindowPresentation::default(),
         },
         ApplyOperation {
             hwnd: 200,
@@ -83,6 +87,7 @@ fn multi_window_persistent_desync_can_force_auto_unwind() {
             suppress_visual_gap: false,
             window_switch_animation: None,
             visual_emphasis: None,
+            presentation: WindowPresentation::default(),
         },
     ];
 
@@ -445,6 +450,123 @@ fn new_managed_window_follows_active_monitor_context() {
         .expect("monitor should exist");
 
     assert_eq!(monitor.platform_binding.as_deref(), Some("\\\\.\\DISPLAY2"));
+}
+
+#[test]
+fn missing_monitor_fallback_refreshes_workspace_set_projection_to_surviving_work_area() {
+    let initial_snapshot = PlatformSnapshot {
+        foreground_hwnd: Some(100),
+        monitors: vec![
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1200, 900),
+                dpi: 96,
+                is_primary: true,
+            },
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY2".to_string(),
+                work_area_rect: Rect::new(1200, 0, 1200, 900),
+                dpi: 96,
+                is_primary: false,
+            },
+        ],
+        windows: vec![PlatformWindowSnapshot {
+            hwnd: 100,
+            title: "Window 100".to_string(),
+            class_name: "Notepad".to_string(),
+            process_id: 4242,
+            process_name: Some("notepad".to_string()),
+            rect: Rect::new(1200, 0, 420, 900),
+            monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+            is_visible: true,
+            is_focused: true,
+            management_candidate: true,
+        }],
+    };
+    let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+    runtime
+        .sync_snapshot(initial_snapshot, true)
+        .expect("initial sync should succeed");
+
+    let missing_monitor_id = runtime
+        .state()
+        .monitors
+        .iter()
+        .find_map(|(monitor_id, monitor)| {
+            (monitor.platform_binding.as_deref() == Some("\\\\.\\DISPLAY2")).then_some(*monitor_id)
+        })
+        .expect("second monitor should exist after initial sync");
+
+    let fallback_snapshot = PlatformSnapshot {
+        foreground_hwnd: Some(100),
+        monitors: vec![PlatformMonitorSnapshot {
+            binding: "\\\\.\\DISPLAY1".to_string(),
+            work_area_rect: Rect::new(0, 0, 1200, 900),
+            dpi: 96,
+            is_primary: true,
+        }],
+        windows: vec![PlatformWindowSnapshot {
+            hwnd: 100,
+            title: "Window 100".to_string(),
+            class_name: "Notepad".to_string(),
+            process_id: 4242,
+            process_name: Some("notepad".to_string()),
+            rect: Rect::new(0, 0, 420, 900),
+            monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+            is_visible: true,
+            is_focused: true,
+            management_candidate: true,
+        }],
+    };
+    runtime
+        .sync_snapshot(fallback_snapshot.clone(), true)
+        .expect("fallback sync should succeed");
+
+    let missing_monitor = runtime
+        .state()
+        .monitors
+        .get(&missing_monitor_id)
+        .expect("missing logical monitor should still exist");
+    assert_eq!(
+        missing_monitor.platform_binding.as_deref(),
+        Some("\\\\.\\DISPLAY2")
+    );
+    assert_eq!(
+        missing_monitor.work_area_rect,
+        fallback_snapshot.monitors[0].work_area_rect
+    );
+
+    let workspace_set_id = missing_monitor.workspace_set_id;
+    let workspace_ids = runtime
+        .state()
+        .workspace_sets
+        .get(&workspace_set_id)
+        .expect("workspace set should exist")
+        .ordered_workspace_ids
+        .clone();
+    assert!(!workspace_ids.is_empty());
+    for workspace_id in &workspace_ids {
+        let workspace = runtime
+            .state()
+            .workspaces
+            .get(workspace_id)
+            .expect("workspace should exist");
+        assert_eq!(workspace.monitor_id, missing_monitor_id);
+        assert_eq!(
+            workspace.strip.visible_region,
+            fallback_snapshot.monitors[0].work_area_rect
+        );
+    }
+
+    let planned_operations = runtime
+        .plan_apply_operations(&fallback_snapshot)
+        .expect("apply plan should be computed");
+    let operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 100)
+        .expect("fallback monitor window should still receive a target rect");
+    assert!(operation.rect.x < fallback_snapshot.monitors[0].work_area_rect.width as i32);
+    assert!(operation.rect.y >= fallback_snapshot.monitors[0].work_area_rect.y);
 }
 
 #[test]
@@ -1001,6 +1123,7 @@ fn strip_movement_log_keeps_negative_delta_when_window_moves_left() {
             suppress_visual_gap: true,
             window_switch_animation: None,
             visual_emphasis: None,
+            presentation: WindowPresentation::default(),
         }],
     );
 
@@ -1337,6 +1460,7 @@ fn validation_filter_for_snapshot_skips_chromium_geometry_retry() {
             suppress_visual_gap: false,
             window_switch_animation: None,
             visual_emphasis: None,
+            presentation: WindowPresentation::default(),
         }],
     );
 
@@ -1383,6 +1507,7 @@ fn validation_filter_for_snapshot_keeps_browser_activation_retry_but_drops_geome
                 "Chrome_WidgetWin_1",
                 "Example page",
             )),
+            presentation: WindowPresentation::default(),
         }],
     );
 
@@ -1426,6 +1551,7 @@ fn validation_filter_for_snapshot_keeps_safe_window_geometry_retry() {
             suppress_visual_gap: true,
             window_switch_animation: None,
             visual_emphasis: None,
+            presentation: WindowPresentation::default(),
         }],
     );
 
@@ -1449,6 +1575,7 @@ fn validation_filter_ignores_non_observable_browser_visual_only_operation() {
             "Chrome_WidgetWin_1",
             "Example page",
         )),
+        presentation: WindowPresentation::default(),
     }]);
 
     assert!(filtered.is_empty());
@@ -1470,6 +1597,7 @@ fn validation_filter_ignores_non_observable_visual_emphasis_only_operation() {
             "Notepad",
             "notes",
         )),
+        presentation: WindowPresentation::default(),
     }]);
 
     assert!(filtered.is_empty());
@@ -1560,6 +1688,495 @@ fn focus_workspace_down_moves_previous_workspace_windows_into_vertical_stack() {
         previous_local_rect
             .y
             .saturating_sub(snapshot.monitors[0].work_area_rect.height as i32)
+    );
+}
+
+#[test]
+fn workspace_switch_materialization_ignores_stale_active_visible_region_from_other_monitor() {
+    let snapshot = PlatformSnapshot {
+        foreground_hwnd: Some(100),
+        monitors: vec![
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            },
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY2".to_string(),
+                work_area_rect: Rect::new(1600, 0, 1440, 1200),
+                dpi: 96,
+                is_primary: false,
+            },
+        ],
+        windows: vec![
+            PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(0, 0, 420, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            },
+            PlatformWindowSnapshot {
+                hwnd: 200,
+                title: "Window 200".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4343,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(1600, 0, 420, 1200),
+                monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            },
+        ],
+    };
+    let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+    runtime
+        .sync_snapshot(snapshot.clone(), true)
+        .expect("initial sync should succeed");
+    let secondary_window_id = runtime
+        .find_window_id_by_hwnd(200)
+        .expect("secondary window should exist after initial sync");
+    let secondary_workspace_id = runtime
+        .state()
+        .windows
+        .get(&secondary_window_id)
+        .expect("secondary window should exist in state")
+        .workspace_id;
+    let secondary_desired_rect = recompute_workspace(runtime.state(), secondary_workspace_id)
+        .expect("secondary workspace projection should exist")
+        .window_geometries
+        .iter()
+        .find(|geometry| geometry.window_id == secondary_window_id)
+        .expect("secondary window geometry should exist")
+        .rect;
+    let mut steady_snapshot = snapshot.clone();
+    steady_snapshot.windows[1].rect = secondary_desired_rect;
+
+    let primary_monitor_id = runtime
+        .state()
+        .monitors
+        .iter()
+        .find_map(|(monitor_id, monitor)| (monitor.work_area_rect.x == 0).then_some(*monitor_id))
+        .expect("primary monitor should exist");
+    let workspace_ids = ordered_workspace_ids_for_monitor(runtime.state(), primary_monitor_id);
+    assert_eq!(workspace_ids.len(), 2);
+
+    runtime
+        .store
+        .dispatch(DomainEvent::focus_workspace_down(
+            CorrelationId::new(2),
+            Some(primary_monitor_id),
+        ))
+        .expect("focus workspace down should succeed");
+
+    if let Some(active_workspace) = runtime
+        .store
+        .state_mut()
+        .workspaces
+        .get_mut(&workspace_ids[1])
+    {
+        active_workspace.strip.visible_region = snapshot.monitors[1].work_area_rect;
+    }
+
+    let planned_operations = runtime
+        .plan_apply_operations_with_context(
+            &steady_snapshot,
+            ApplyPlanContext {
+                previous_focused_hwnd: Some(100),
+                animate_window_switch: false,
+                animate_tiled_geometry: false,
+                force_activate_focused_window: false,
+                refresh_visual_emphasis: true,
+            },
+        )
+        .expect("apply plan should be computed");
+    let operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 100)
+        .expect("previous workspace window should be moved into inactive band");
+    let previous_window_id = runtime
+        .find_window_id_by_hwnd(100)
+        .expect("previous workspace window should exist");
+    let previous_workspace_projection = recompute_workspace(runtime.state(), workspace_ids[0])
+        .expect("previous workspace projection should exist");
+    let previous_local_rect = previous_workspace_projection
+        .window_geometries
+        .iter()
+        .find(|geometry| geometry.window_id == previous_window_id)
+        .expect("previous workspace geometry should exist")
+        .rect;
+
+    assert_eq!(operation.rect.x, previous_local_rect.x);
+    assert_eq!(
+        operation.rect.y,
+        previous_local_rect
+            .y
+            .saturating_sub(snapshot.monitors[0].work_area_rect.height as i32)
+    );
+    assert!(operation.rect.x < snapshot.monitors[1].work_area_rect.x);
+}
+
+#[test]
+fn workspace_switch_on_primary_monitor_does_not_replan_secondary_monitor_geometry() {
+    let snapshot = PlatformSnapshot {
+        foreground_hwnd: Some(100),
+        monitors: vec![
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            },
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY2".to_string(),
+                work_area_rect: Rect::new(1600, 0, 1440, 1200),
+                dpi: 96,
+                is_primary: false,
+            },
+        ],
+        windows: vec![
+            PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(0, 0, 420, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            },
+            PlatformWindowSnapshot {
+                hwnd: 200,
+                title: "Window 200".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4343,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(1600, 0, 420, 1200),
+                monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            },
+        ],
+    };
+    let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+    runtime
+        .sync_snapshot(snapshot.clone(), true)
+        .expect("initial sync should succeed");
+    let secondary_window_id = runtime
+        .find_window_id_by_hwnd(200)
+        .expect("secondary window should exist after initial sync");
+    let secondary_workspace_id = runtime
+        .state()
+        .windows
+        .get(&secondary_window_id)
+        .expect("secondary window should exist in state")
+        .workspace_id;
+    let secondary_desired_rect = recompute_workspace(runtime.state(), secondary_workspace_id)
+        .expect("secondary workspace projection should exist")
+        .window_geometries
+        .iter()
+        .find(|geometry| geometry.window_id == secondary_window_id)
+        .expect("secondary window geometry should exist")
+        .rect;
+    let mut steady_snapshot = snapshot.clone();
+    steady_snapshot.windows[1].rect = secondary_desired_rect;
+
+    let primary_monitor_id = runtime
+        .state()
+        .monitors
+        .iter()
+        .find_map(|(monitor_id, monitor)| (monitor.work_area_rect.x == 0).then_some(*monitor_id))
+        .expect("primary monitor should exist");
+
+    runtime
+        .store
+        .dispatch(DomainEvent::focus_workspace_down(
+            CorrelationId::new(2),
+            Some(primary_monitor_id),
+        ))
+        .expect("focus workspace down should succeed");
+
+    let planned_operations = runtime
+        .plan_apply_operations_with_context(
+            &steady_snapshot,
+            ApplyPlanContext {
+                previous_focused_hwnd: Some(100),
+                animate_window_switch: false,
+                animate_tiled_geometry: false,
+                force_activate_focused_window: false,
+                refresh_visual_emphasis: true,
+            },
+        )
+        .expect("apply plan should be computed");
+
+    assert!(
+        planned_operations
+            .iter()
+            .any(|operation| operation.hwnd == 100),
+        "primary monitor workspace switch should still replan the previous active window"
+    );
+    let secondary_operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 200)
+        .expect("secondary monitor may still receive a visual-only refresh operation");
+    assert!(
+        !secondary_operation.apply_geometry,
+        "secondary monitor steady-state window must not receive geometry retargeting when only the primary monitor workspace changed"
+    );
+    assert_eq!(secondary_operation.rect, steady_snapshot.windows[1].rect);
+}
+
+#[test]
+fn primary_focus_navigation_reveal_does_not_geometry_retarget_secondary_monitor() {
+    let snapshot = PlatformSnapshot {
+        foreground_hwnd: Some(100),
+        monitors: vec![
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            },
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY2".to_string(),
+                work_area_rect: Rect::new(1600, 0, 1440, 1200),
+                dpi: 96,
+                is_primary: false,
+            },
+        ],
+        windows: vec![
+            PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(0, 0, 900, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            },
+            PlatformWindowSnapshot {
+                hwnd: 101,
+                title: "Window 101".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4343,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(900, 0, 900, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            },
+            PlatformWindowSnapshot {
+                hwnd: 200,
+                title: "Window 200".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4444,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(1600, 0, 420, 1200),
+                monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            },
+        ],
+    };
+    let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+    runtime
+        .sync_snapshot(snapshot.clone(), true)
+        .expect("initial sync should succeed");
+    let secondary_window_id = runtime
+        .find_window_id_by_hwnd(200)
+        .expect("secondary window should exist after initial sync");
+    let secondary_workspace_id = runtime
+        .state()
+        .windows
+        .get(&secondary_window_id)
+        .expect("secondary window should exist in state")
+        .workspace_id;
+    let secondary_desired_rect = recompute_workspace(runtime.state(), secondary_workspace_id)
+        .expect("secondary workspace projection should exist")
+        .window_geometries
+        .iter()
+        .find(|geometry| geometry.window_id == secondary_window_id)
+        .expect("secondary window geometry should exist")
+        .rect;
+    let mut steady_snapshot = snapshot.clone();
+    steady_snapshot.windows[2].rect = secondary_desired_rect;
+
+    runtime
+        .store
+        .dispatch(DomainEvent::focus_next(
+            CorrelationId::new(2),
+            NavigationScope::WorkspaceStrip,
+        ))
+        .expect("focus navigation should succeed");
+
+    let planned_operations = runtime
+        .plan_apply_operations_with_context(
+            &steady_snapshot,
+            ApplyPlanContext {
+                previous_focused_hwnd: Some(100),
+                animate_window_switch: false,
+                animate_tiled_geometry: false,
+                force_activate_focused_window: false,
+                refresh_visual_emphasis: true,
+            },
+        )
+        .expect("apply plan should be computed");
+
+    let primary_reveal_operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 101)
+        .expect("primary monitor next column should receive an operation");
+    assert!(
+        primary_reveal_operation.apply_geometry,
+        "focus navigation on the primary monitor should still drive reveal geometry there"
+    );
+
+    let secondary_operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 200)
+        .expect("secondary monitor may still receive a visual-only refresh operation");
+    assert!(
+        !secondary_operation.apply_geometry,
+        "secondary monitor steady-state window must not receive geometry retargeting from primary focus navigation reveal"
+    );
+    assert_eq!(secondary_operation.rect, steady_snapshot.windows[2].rect);
+}
+
+#[test]
+fn primary_strip_overflow_is_not_materialized_inside_secondary_monitor_work_area() {
+    let snapshot = PlatformSnapshot {
+        foreground_hwnd: Some(100),
+        monitors: vec![
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            },
+            PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY2".to_string(),
+                work_area_rect: Rect::new(1600, 0, 1440, 1200),
+                dpi: 96,
+                is_primary: false,
+            },
+        ],
+        windows: vec![
+            PlatformWindowSnapshot {
+                hwnd: 100,
+                title: "Window 100".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4242,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(0, 0, 900, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: true,
+                management_candidate: true,
+            },
+            PlatformWindowSnapshot {
+                hwnd: 101,
+                title: "Window 101".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4343,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(900, 0, 900, 900),
+                monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            },
+            PlatformWindowSnapshot {
+                hwnd: 200,
+                title: "Window 200".to_string(),
+                class_name: "Notepad".to_string(),
+                process_id: 4444,
+                process_name: Some("notepad".to_string()),
+                rect: Rect::new(1600, 0, 420, 1200),
+                monitor_binding: "\\\\.\\DISPLAY2".to_string(),
+                is_visible: true,
+                is_focused: false,
+                management_candidate: true,
+            },
+        ],
+    };
+    let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+    runtime
+        .sync_snapshot(snapshot.clone(), true)
+        .expect("initial sync should succeed");
+
+    let planned_operations = runtime
+        .plan_apply_operations(&snapshot)
+        .expect("apply plan should be computed");
+    let overflow_operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 101)
+        .expect("overflowing primary strip window should still receive a target rect");
+    let secondary_work_area = snapshot.monitors[1].work_area_rect;
+    let overflow_right = overflow_operation
+        .rect
+        .x
+        .saturating_add(overflow_operation.rect.width as i32);
+    let secondary_right = secondary_work_area
+        .x
+        .saturating_add(secondary_work_area.width as i32);
+
+    assert!(
+        overflow_right <= secondary_work_area.x || overflow_operation.rect.x >= secondary_right,
+        "primary monitor strip overflow must not become visible inside the secondary monitor work area"
+    );
+    assert_eq!(
+        overflow_operation.presentation.mode,
+        WindowPresentationMode::SurrogateClipped
+    );
+    assert_eq!(
+        overflow_operation
+            .presentation
+            .surrogate
+            .as_ref()
+            .expect("spill operation should expose surrogate clip")
+            .destination_rect,
+        Rect::new(928, 16, 672, 868)
+    );
+    assert_eq!(
+        overflow_operation
+            .presentation
+            .surrogate
+            .as_ref()
+            .expect("spill operation should expose surrogate clip")
+            .source_rect,
+        Rect::new(0, 0, 672, 868)
+    );
+    assert_eq!(
+        overflow_operation
+            .presentation
+            .surrogate
+            .as_ref()
+            .expect("spill operation should expose surrogate clip")
+            .native_visible_rect,
+        Rect::new(928, 16, 900, 868)
+    );
+    let active_operation = planned_operations
+        .iter()
+        .find(|operation| operation.hwnd == 100)
+        .expect("active primary window should still receive an operation");
+    assert_eq!(
+        active_operation.presentation.mode,
+        WindowPresentationMode::NativeVisible
     );
 }
 

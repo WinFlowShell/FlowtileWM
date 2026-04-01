@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use flowtile_domain::{FocusOrigin, WindowClassification, WindowLayer};
 use flowtile_ipc::{
     ConfigProjection, DiagnosticsProjection, FocusProjection, InsetsProjection, OutputProjection,
-    OverviewProjection, RectProjection, SnapshotProjection, WindowProjection, WorkspaceProjection,
+    OverviewProjection, RectProjection, SnapshotProjection,
+    SurrogatePresentationDiagnosticsProjection, WindowProjection, WorkspaceProjection,
 };
 use flowtile_windows_adapter::PlatformWindowSnapshot;
 use flowtile_wm_core::CoreDaemonRuntime;
@@ -14,6 +15,7 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
     let state = runtime.state();
     let touchpad = assess_touchpad_override(runtime.touchpad_config());
     let perf = runtime.perf_snapshot();
+    let surrogate_presentation = runtime.surrogate_presentation_diagnostics();
     let metadata_by_hwnd = runtime
         .last_snapshot()
         .map(|snapshot| {
@@ -178,6 +180,20 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
             touchpad_override_status: touchpad.summary_label().to_string(),
             touchpad_override_detail: touchpad.detail.clone(),
             perf,
+            surrogate_presentation: SurrogatePresentationDiagnosticsProjection {
+                active_hosts: surrogate_presentation.active_hosts,
+                show_requests: surrogate_presentation.show_requests,
+                hide_requests: surrogate_presentation.hide_requests,
+                classifier_rejections: surrogate_presentation.classifier_rejections,
+                native_fallbacks: surrogate_presentation.native_fallbacks,
+                transient_escapes: surrogate_presentation.transient_escapes,
+                handoff_promotions: surrogate_presentation.handoff_promotions,
+                pointer_replay_attempts: surrogate_presentation.pointer_replay_attempts,
+                pointer_replay_successes: surrogate_presentation.pointer_replay_successes,
+                pointer_replay_failures: surrogate_presentation.pointer_replay_failures,
+                dwm_thumbnail_backend_uses: surrogate_presentation.dwm_thumbnail_backend_uses,
+                last_event: surrogate_presentation.last_event,
+            },
         },
         config: ConfigProjection {
             config_version: state.config_projection.config_version,

@@ -228,6 +228,47 @@ pub struct WindowVisualEmphasis {
     pub rounded_corners: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowPresentationMode {
+    #[default]
+    NativeVisible,
+    NativeHidden,
+    SurrogateClipped,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WindowSurrogateClip {
+    pub destination_rect: Rect,
+    pub source_rect: Rect,
+    pub native_visible_rect: Rect,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WindowPresentation {
+    #[serde(default)]
+    pub mode: WindowPresentationMode,
+    #[serde(default)]
+    pub surrogate: Option<WindowSurrogateClip>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SurrogatePresentationDiagnostics {
+    pub active_hosts: usize,
+    pub show_requests: u64,
+    pub hide_requests: u64,
+    pub classifier_rejections: u64,
+    pub native_fallbacks: u64,
+    pub transient_escapes: u64,
+    pub handoff_promotions: u64,
+    pub pointer_replay_attempts: u64,
+    pub pointer_replay_successes: u64,
+    pub pointer_replay_failures: u64,
+    pub dwm_thumbnail_backend_uses: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApplyOperation {
     pub hwnd: u64,
@@ -242,6 +283,8 @@ pub struct ApplyOperation {
     pub window_switch_animation: Option<WindowSwitchAnimation>,
     #[serde(default)]
     pub visual_emphasis: Option<WindowVisualEmphasis>,
+    #[serde(default)]
+    pub presentation: WindowPresentation,
 }
 
 #[allow(dead_code)]
@@ -451,6 +494,10 @@ impl WindowsAdapter {
 
     pub fn perf_snapshot(&self) -> PerfTelemetrySnapshot {
         self.perf.snapshot()
+    }
+
+    pub fn surrogate_presentation_diagnostics(&self) -> SurrogatePresentationDiagnostics {
+        native_apply::surrogate_presentation_diagnostics_snapshot()
     }
 
     pub fn scan_snapshot(&self) -> Result<PlatformSnapshot, WindowsAdapterError> {

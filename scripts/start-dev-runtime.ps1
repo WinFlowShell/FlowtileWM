@@ -4,6 +4,7 @@ param(
     [switch]$NoStopExisting,
     [switch]$DryRunWatch,
     [switch]$NoDiagnosticsCollectors,
+    [switch]$EnableSurrogateDiagnostics,
     [ValidateRange(500, 60000)]
     [int]$DiagnosticsSampleIntervalMs = 2000
 )
@@ -223,6 +224,7 @@ Write-Host "  diagnostics samples: $diagnosticsSamplesLog"
 Write-Host "  perf samples: $perfSamplesLog"
 Write-Host "  state snapshots: $stateSnapshotsLog"
 Write-Host "  collector runtime: $collectorRuntimeLog"
+Write-Host "  surrogate diagnostics: $EnableSurrogateDiagnostics"
 
 if ($NoStart) {
     return
@@ -295,6 +297,7 @@ $daemon = Start-Process `
     -Environment @{
         FLOWTILE_EARLY_LOG_PATH = $daemonRuntimeLog
         FLOWTILE_TOUCHPAD_DUMP_PATH = $touchpadDumpLog
+        FLOWTILE_CLIPPED_WINDOW_SURROGATE_DIAGNOSTICS = if ($EnableSurrogateDiagnostics) { "1" } else { "0" }
         RUST_BACKTRACE = "1"
     } `
     -PassThru
@@ -320,6 +323,7 @@ Write-JsonFile -Path $sessionMetadataPath -Value @{
     repo_root = $repoRoot
     dry_run_watch = [bool]$DryRunWatch
     diagnostics_collectors_enabled = -not $NoDiagnosticsCollectors
+    surrogate_diagnostics_enabled = [bool]$EnableSurrogateDiagnostics
     diagnostics_sample_interval_ms = $DiagnosticsSampleIntervalMs
     executables = @{
         daemon = $daemonExe

@@ -358,23 +358,7 @@ impl CoreDaemonRuntime {
                     };
                     monitor.workspace_set_id
                 };
-
-                let workspace_ids = self
-                    .store
-                    .state()
-                    .workspace_sets
-                    .get(&workspace_set_id)
-                    .map(|workspace_set| workspace_set.ordered_workspace_ids.clone())
-                    .unwrap_or_default();
-
-                for workspace_id in workspace_ids {
-                    if let Some(workspace) =
-                        self.store.state_mut().workspaces.get_mut(&workspace_id)
-                    {
-                        workspace.monitor_id = monitor_id;
-                        workspace.strip.visible_region = monitor_snapshot.work_area_rect;
-                    }
-                }
+                self.refresh_workspace_set_monitor_projection(workspace_set_id);
             } else {
                 let monitor_id = self.store.state_mut().add_monitor(
                     monitor_snapshot.work_area_rect,
@@ -418,20 +402,7 @@ impl CoreDaemonRuntime {
                 monitor.topology_role = TopologyRole::Secondary;
                 monitor.workspace_set_id
             };
-
-            let workspace_ids = self
-                .store
-                .state()
-                .workspace_sets
-                .get(&workspace_set_id)
-                .map(|workspace_set| workspace_set.ordered_workspace_ids.clone())
-                .unwrap_or_default();
-
-            for workspace_id in workspace_ids {
-                if let Some(workspace) = self.store.state_mut().workspaces.get_mut(&workspace_id) {
-                    workspace.strip.visible_region = fallback_monitor.work_area_rect;
-                }
-            }
+            self.refresh_workspace_set_monitor_projection(workspace_set_id);
         }
 
         if let Some(primary_monitor) = monitors
@@ -445,6 +416,49 @@ impl CoreDaemonRuntime {
         }
 
         Ok(())
+    }
+
+    fn refresh_workspace_set_monitor_projection(
+        &mut self,
+        workspace_set_id: flowtile_domain::WorkspaceSetId,
+    ) {
+        let Some(monitor_id) = self
+            .store
+            .state()
+            .workspace_sets
+            .get(&workspace_set_id)
+            .map(|workspace_set| workspace_set.monitor_id)
+        else {
+            return;
+        };
+        let Some(work_area_rect) = self
+            .store
+            .state()
+            .monitors
+            .get(&monitor_id)
+            .map(|monitor| monitor.work_area_rect)
+        else {
+            return;
+        };
+
+        self.store
+            .state_mut()
+            .normalize_workspace_set(workspace_set_id);
+
+        let workspace_ids = self
+            .store
+            .state()
+            .workspace_sets
+            .get(&workspace_set_id)
+            .map(|workspace_set| workspace_set.ordered_workspace_ids.clone())
+            .unwrap_or_default();
+
+        for workspace_id in workspace_ids {
+            if let Some(workspace) = self.store.state_mut().workspaces.get_mut(&workspace_id) {
+                workspace.monitor_id = monitor_id;
+                workspace.strip.visible_region = work_area_rect;
+            }
+        }
     }
 
     fn monitor_id_by_binding(&self, binding: &str) -> Option<MonitorId> {

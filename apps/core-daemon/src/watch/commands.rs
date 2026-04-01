@@ -10,7 +10,7 @@ use crate::{
     hotkeys::HotkeyListener,
     terminal::open_default_terminal,
     touchpad::TouchpadListener,
-    window_actions::close_window,
+    window_actions::{close_wallpaper_selector_window, close_window},
 };
 
 use super::support::{
@@ -64,13 +64,25 @@ pub(super) fn handle_watch_command(
             WatchCommandFlow::Continue
         }
         WatchCommand::OpenWallpaperSelector => {
-            run_manual_side_effect(
-                "open-wallpaper-selector",
-                open_wallpaper_selector,
-                "watch: open-wallpaper-selector-ok",
-                "watch: open-wallpaper-selector-error",
-                "open wallpaper selector failed",
-            );
+            match close_wallpaper_selector_window() {
+                Ok(true) => {
+                    write_runtime_log("watch: close-wallpaper-selector-ok");
+                    println!("manual command: close-wallpaper-selector");
+                }
+                Ok(false) => {
+                    run_manual_side_effect(
+                        "open-wallpaper-selector",
+                        open_wallpaper_selector,
+                        "watch: open-wallpaper-selector-ok",
+                        "watch: open-wallpaper-selector-error",
+                        "open wallpaper selector failed",
+                    );
+                }
+                Err(error) => {
+                    write_runtime_log(format!("watch: close-wallpaper-selector-error={error}"));
+                    eprintln!("close wallpaper selector failed: {error}");
+                }
+            }
             WatchCommandFlow::Continue
         }
         WatchCommand::CloseWindow => {

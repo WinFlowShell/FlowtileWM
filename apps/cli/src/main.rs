@@ -300,6 +300,23 @@ fn print_perf_summary(diagnostics: &DiagnosticsProjection) {
     println!("flowtile-cli perf");
     println!("management enabled: {}", diagnostics.management_enabled);
     println!("degraded flags: {}", diagnostics.degraded_flags.len());
+    println!(
+        "surrogate hosts: {}",
+        diagnostics.surrogate_presentation.active_hosts
+    );
+    println!(
+        "surrogate fallback/reject: {}/{}",
+        diagnostics.surrogate_presentation.native_fallbacks,
+        diagnostics.surrogate_presentation.classifier_rejections
+    );
+    println!(
+        "surrogate replay ok/fail: {}/{}",
+        diagnostics.surrogate_presentation.pointer_replay_successes,
+        diagnostics.surrogate_presentation.pointer_replay_failures
+    );
+    if let Some(last_event) = &diagnostics.surrogate_presentation.last_event {
+        println!("surrogate last event: {last_event}");
+    }
     if diagnostics.perf.metrics.is_empty() {
         println!("perf metrics: none");
         return;
