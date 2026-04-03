@@ -188,6 +188,7 @@ pub(super) fn focused_managed_hwnd(runtime: &CoreDaemonRuntime) -> Option<u64> {
         .focus
         .focused_window_id
         .and_then(|window_id| runtime.state().windows.get(&window_id))
+        .filter(|window| window.is_managed)
         .and_then(|window| window.current_hwnd_binding)
 }
 

@@ -74,6 +74,20 @@ impl CoreDaemonRuntime {
                 return Ok(());
             }
 
+            if self.should_hold_post_apply_for_focus_stabilization(
+                &validation_snapshot,
+                &remaining_operations,
+            ) {
+                self.consecutive_desync_cycles = 0;
+                self.push_degraded_reason("focus:stabilization-hold".to_string());
+                report.recovery_actions.push(format!(
+                    "focus-stabilization-hold:{}-ops-remain",
+                    remaining_operations.len()
+                ));
+                report.degraded_reasons = self.store.state().runtime.degraded_flags.clone();
+                return Ok(());
+            }
+
             self.push_degraded_reason("desync:post-apply-diverged".to_string());
             report.recovery_actions.push(format!(
                 "targeted-retry:{}-ops-remain",
@@ -109,22 +123,39 @@ impl CoreDaemonRuntime {
                     post_retry_remaining.len()
                 ));
             } else {
-                self.consecutive_desync_cycles += 1;
-                self.push_degraded_reason(format!(
-                    "desync:remaining-operations:{}",
-                    post_retry_remaining.len()
-                ));
-                report.recovery_actions.push(format!(
-                    "full-scan-escalation:{}-ops-still-diverged",
-                    post_retry_remaining.len()
-                ));
+                let topology_churn = has_transient_topology_churn(
+                    report.observed_window_count,
+                    validation_snapshot.windows.len(),
+                    post_retry_snapshot.windows.len(),
+                    report.discovered_windows,
+                    report.destroyed_windows,
+                );
 
-                if should_auto_unwind_after_desync(
-                    &post_retry_remaining,
-                    self.consecutive_desync_cycles,
-                ) {
-                    self.request_emergency_unwind("desync-recovery-escalated");
-                    report.recovery_actions.push("safe-mode-unwind".to_string());
+                if topology_churn {
+                    self.consecutive_desync_cycles = 0;
+                    self.push_degraded_reason("desync:topology-churn".to_string());
+                    report.recovery_actions.push(format!(
+                        "topology-churn-hold:{}-ops-still-diverged",
+                        post_retry_remaining.len()
+                    ));
+                } else {
+                    self.consecutive_desync_cycles += 1;
+                    self.push_degraded_reason(format!(
+                        "desync:remaining-operations:{}",
+                        post_retry_remaining.len()
+                    ));
+                    report.recovery_actions.push(format!(
+                        "full-scan-escalation:{}-ops-still-diverged",
+                        post_retry_remaining.len()
+                    ));
+
+                    if should_auto_unwind_after_desync(
+                        &post_retry_remaining,
+                        self.consecutive_desync_cycles,
+                    ) {
+                        self.request_emergency_unwind("desync-recovery-escalated");
+                        report.recovery_actions.push("safe-mode-unwind".to_string());
+                    }
                 }
             }
 
@@ -353,6 +384,23 @@ impl CoreDaemonRuntime {
             .into_iter()
             .filter_map(|operation| {
                 let window = windows_by_hwnd.get(&operation.hwnd)?;
+                if should_skip_strict_geometry_revalidation(
+                    window.process_name.as_deref(),
+                    &window.class_name,
+                    &window.title,
+                ) {
+                    if operation.activate {
+                        return Some(ApplyOperation {
+                            apply_geometry: false,
+                            suppress_visual_gap: false,
+                            window_switch_animation: None,
+                            ..operation
+                        });
+                    }
+
+                    return None;
+                }
+
                 let safety = classify_window_visual_safety(
                     window.process_name.as_deref(),
                     &window.class_name,

@@ -16,6 +16,7 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
     let touchpad = assess_touchpad_override(runtime.touchpad_config());
     let perf = runtime.perf_snapshot();
     let surrogate_presentation = runtime.surrogate_presentation_diagnostics();
+    let window_presentations = runtime.current_window_presentations().unwrap_or_default();
     let metadata_by_hwnd = runtime
         .last_snapshot()
         .map(|snapshot| {
@@ -94,6 +95,7 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
                 .current_hwnd_binding
                 .and_then(|hwnd| metadata_by_hwnd.get(&hwnd).copied());
             let workspace = state.workspaces.get(&window.workspace_id)?;
+            let presentation = window_presentations.get(&window.id);
 
             Some(WindowProjection {
                 window_id: window.id.get(),
@@ -112,6 +114,8 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
                 classification: window_classification_name(window.classification).to_string(),
                 is_managed: window.is_managed,
                 is_focused: state.focus.focused_window_id == Some(window.id),
+                presentation_mode: presentation.map(|projection| projection.mode.clone()),
+                presentation_reason: presentation.map(|projection| projection.reason.clone()),
             })
         })
         .collect::<Vec<_>>();
@@ -184,6 +188,10 @@ pub fn build_snapshot_projection(runtime: &CoreDaemonRuntime) -> SnapshotProject
                 active_hosts: surrogate_presentation.active_hosts,
                 show_requests: surrogate_presentation.show_requests,
                 hide_requests: surrogate_presentation.hide_requests,
+                foreign_scene_active_hosts: surrogate_presentation.foreign_scene_active_hosts,
+                foreign_scene_show_requests: surrogate_presentation.foreign_scene_show_requests,
+                foreign_scene_hide_requests: surrogate_presentation.foreign_scene_hide_requests,
+                foreign_scene_pruned_hosts: surrogate_presentation.foreign_scene_pruned_hosts,
                 classifier_rejections: surrogate_presentation.classifier_rejections,
                 native_fallbacks: surrogate_presentation.native_fallbacks,
                 transient_escapes: surrogate_presentation.transient_escapes,
@@ -266,4 +274,87 @@ fn window_classification_name(classification: WindowClassification) -> &'static 
 #[allow(dead_code)]
 fn _metadata_title(window: &PlatformWindowSnapshot) -> &str {
     &window.title
+}
+
+#[cfg(test)]
+mod tests {
+    use flowtile_domain::{Rect, RuntimeMode};
+    use flowtile_windows_adapter::{
+        PlatformMonitorSnapshot, PlatformSnapshot, PlatformWindowSnapshot,
+    };
+    use flowtile_wm_core::CoreDaemonRuntime;
+
+    use super::build_snapshot_projection;
+
+    #[test]
+    fn snapshot_projection_exposes_window_presentation_mode_and_reason() {
+        let snapshot = PlatformSnapshot {
+            foreground_hwnd: Some(100),
+            monitors: vec![PlatformMonitorSnapshot {
+                binding: "\\\\.\\DISPLAY1".to_string(),
+                work_area_rect: Rect::new(0, 0, 1600, 900),
+                dpi: 96,
+                is_primary: true,
+            }],
+            windows: vec![
+                PlatformWindowSnapshot {
+                    hwnd: 100,
+                    title: "Window 100".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4242,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(0, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: true,
+                    management_candidate: true,
+                },
+                PlatformWindowSnapshot {
+                    hwnd: 101,
+                    title: "Window 101".to_string(),
+                    class_name: "Notepad".to_string(),
+                    process_id: 4343,
+                    process_name: Some("notepad".to_string()),
+                    rect: Rect::new(420, 0, 420, 900),
+                    monitor_binding: "\\\\.\\DISPLAY1".to_string(),
+                    is_visible: true,
+                    is_focused: false,
+                    management_candidate: true,
+                },
+            ],
+        };
+        let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+        runtime
+            .sync_snapshot(snapshot, true)
+            .expect("initial sync should succeed");
+
+        let projection = build_snapshot_projection(&runtime);
+        let active_window = projection
+            .windows
+            .iter()
+            .find(|window| window.hwnd == Some(100))
+            .expect("active window projection should exist");
+        let inactive_window = projection
+            .windows
+            .iter()
+            .find(|window| window.hwnd == Some(101))
+            .expect("inactive window projection should exist");
+
+        assert_eq!(
+            active_window.presentation_mode.as_deref(),
+            Some("native-visible")
+        );
+        assert_eq!(
+            active_window.presentation_reason.as_deref(),
+            Some("active-window-native")
+        );
+        assert_eq!(
+            inactive_window.presentation_mode.as_deref(),
+            Some("surrogate-visible")
+        );
+        assert_eq!(
+            inactive_window.presentation_reason.as_deref(),
+            Some("inactive-fully-visible-surrogate")
+        );
+    }
 }

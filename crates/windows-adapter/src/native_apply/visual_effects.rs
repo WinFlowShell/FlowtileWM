@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ptr::null_mut,
     sync::{Mutex, OnceLock},
 };
@@ -10,6 +10,7 @@ use windows_sys::Win32::{
         DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
         DWMWCP_ROUND, DwmSetWindowAttribute,
     },
+    Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn},
     UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW,
@@ -19,7 +20,13 @@ use windows_sys::Win32::{
 
 use crate::{WindowOpacityMode, WindowVisualEmphasis};
 
-use super::last_error_message;
+use super::{
+    last_error_message,
+    window_geometry::{
+        FrameInsets, frame_insets, query_outer_window_rect, query_visible_frame_rect,
+        visible_frame_is_compatible,
+    },
+};
 
 const VISUAL_STYLE_REFRESH_FLAGS: u32 =
     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED;
@@ -190,6 +197,131 @@ pub(super) fn applied_visual_states() -> &'static Mutex<HashMap<isize, AppliedVi
     APPLIED_VISUAL_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(super) fn sync_window_native_clip_mask(
+    hwnd: HWND,
+    full_visible_rect: Option<flowtile_domain::Rect>,
+    clip_rect: Option<flowtile_domain::Rect>,
+) -> Result<(), String> {
+    let tracked_hwnd = hwnd as isize;
+    let Some(full_visible_rect) = full_visible_rect else {
+        clear_window_native_clip_mask(hwnd, tracked_hwnd);
+        return Ok(());
+    };
+    let Some(clip_rect) = clip_rect else {
+        clear_window_native_clip_mask(hwnd, tracked_hwnd);
+        return Ok(());
+    };
+
+    let outer_rect = query_outer_window_rect(hwnd)?;
+    let visible_rect = query_visible_frame_rect(hwnd)
+        .filter(|visible_rect| visible_frame_is_compatible(outer_rect, *visible_rect))
+        .unwrap_or(outer_rect);
+    let insets = frame_insets(outer_rect, visible_rect);
+    let Some(region_bounds) = native_clip_region_bounds(full_visible_rect, clip_rect, insets)
+    else {
+        clear_window_native_clip_mask(hwnd, tracked_hwnd);
+        return Ok(());
+    };
+
+    let region = unsafe {
+        CreateRectRgn(
+            region_bounds.left,
+            region_bounds.top,
+            region_bounds.right,
+            region_bounds.bottom,
+        )
+    };
+    if region.is_null() {
+        return Err(last_error_message("CreateRectRgn"));
+    }
+
+    let applied = unsafe { SetWindowRgn(hwnd, region, 1) };
+    if applied == 0 {
+        let _ = unsafe { DeleteObject(region as _) };
+        return Err(last_error_message("SetWindowRgn"));
+    }
+
+    native_clip_masked_hwnds()
+        .lock()
+        .expect("native clip mask registry lock should not be poisoned")
+        .insert(tracked_hwnd);
+    Ok(())
+}
+
+pub(super) fn native_clip_region_bounds(
+    full_visible_rect: flowtile_domain::Rect,
+    clip_rect: flowtile_domain::Rect,
+    insets: FrameInsets,
+) -> Option<windows_sys::Win32::Foundation::RECT> {
+    let full_right = full_visible_rect
+        .x
+        .saturating_add(full_visible_rect.width.min(i32::MAX as u32) as i32);
+    let full_bottom = full_visible_rect
+        .y
+        .saturating_add(full_visible_rect.height.min(i32::MAX as u32) as i32);
+    let clip_right = clip_rect
+        .x
+        .saturating_add(clip_rect.width.min(i32::MAX as u32) as i32);
+    let clip_bottom = clip_rect
+        .y
+        .saturating_add(clip_rect.height.min(i32::MAX as u32) as i32);
+    let intersection_left = full_visible_rect.x.max(clip_rect.x);
+    let intersection_top = full_visible_rect.y.max(clip_rect.y);
+    let intersection_right = full_right.min(clip_right);
+    let intersection_bottom = full_bottom.min(clip_bottom);
+    let width = intersection_right.saturating_sub(intersection_left);
+    let height = intersection_bottom.saturating_sub(intersection_top);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    if intersection_left == full_visible_rect.x
+        && intersection_top == full_visible_rect.y
+        && intersection_right == full_right
+        && intersection_bottom == full_bottom
+    {
+        return None;
+    }
+
+    let left = insets
+        .left
+        .saturating_add(intersection_left.saturating_sub(full_visible_rect.x));
+    let top = insets
+        .top
+        .saturating_add(intersection_top.saturating_sub(full_visible_rect.y));
+    Some(windows_sys::Win32::Foundation::RECT {
+        left,
+        top,
+        right: left.saturating_add(width),
+        bottom: top.saturating_add(height),
+    })
+}
+
+fn clear_window_native_clip_mask(hwnd: HWND, tracked_hwnd: isize) {
+    let was_masked = native_clip_masked_hwnds()
+        .lock()
+        .expect("native clip mask registry lock should not be poisoned")
+        .remove(&tracked_hwnd);
+    if was_masked {
+        let _ = unsafe { SetWindowRgn(hwnd, std::ptr::null_mut(), 1) };
+    }
+}
+
+fn native_clip_masked_hwnds() -> &'static Mutex<HashSet<isize>> {
+    static NATIVE_CLIP_MASKED_HWNDS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
+    NATIVE_CLIP_MASKED_HWNDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(super) fn native_clip_masked_hwnds_snapshot() -> BTreeSet<u64> {
+    native_clip_masked_hwnds()
+        .lock()
+        .expect("native clip mask registry lock should not be poisoned")
+        .iter()
+        .copied()
+        .filter(|hwnd| *hwnd > 0)
+        .map(|hwnd| hwnd as u64)
+        .collect()
+}
+
 pub(super) fn apply_gapless_visual_policy(hwnd: HWND) {
     set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, DWMWA_COLOR_NONE);
 }
@@ -198,6 +330,32 @@ pub(super) fn apply_window_border(hwnd: HWND, visual_emphasis: &WindowVisualEmph
     let border_color = visual_emphasis.border_color_rgb.unwrap_or(DWMWA_COLOR_NONE);
     let _ = visual_emphasis.border_thickness_px;
     set_dwm_u32_attribute(hwnd, DWMWA_BORDER_COLOR as u32, border_color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{native_clip_masked_hwnds, native_clip_masked_hwnds_snapshot};
+
+    #[test]
+    fn native_clip_mask_snapshot_reflects_tracked_hwnds() {
+        {
+            let mut hwnds = native_clip_masked_hwnds()
+                .lock()
+                .expect("native clip mask registry lock should not be poisoned");
+            hwnds.clear();
+            hwnds.extend([101_isize, 202_isize, -1_isize]);
+        }
+
+        assert_eq!(
+            native_clip_masked_hwnds_snapshot(),
+            [101_u64, 202_u64].into_iter().collect()
+        );
+
+        native_clip_masked_hwnds()
+            .lock()
+            .expect("native clip mask registry lock should not be poisoned")
+            .clear();
+    }
 }
 
 pub(super) fn apply_window_corners(hwnd: HWND, visual_emphasis: &WindowVisualEmphasis) {

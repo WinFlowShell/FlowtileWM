@@ -379,6 +379,7 @@ pub struct ConfigProjection {
     pub default_column_mode: ColumnMode,
     pub default_column_width: WidthSemantics,
     pub layout_spacing: LayoutSpacing,
+    pub managed_monitor_bindings: Vec<String>,
     pub active_rule_count: usize,
 }
 
@@ -394,8 +395,25 @@ impl Default for ConfigProjection {
             default_column_mode: ColumnMode::Normal,
             default_column_width: WidthSemantics::default(),
             layout_spacing: LayoutSpacing::default(),
+            managed_monitor_bindings: Vec::new(),
             active_rule_count: 0,
         }
+    }
+}
+
+impl ConfigProjection {
+    pub fn manages_monitor_binding(&self, binding: Option<&str>) -> bool {
+        if self.managed_monitor_bindings.is_empty() {
+            return true;
+        }
+
+        let Some(binding) = binding.map(str::trim).filter(|binding| !binding.is_empty()) else {
+            return false;
+        };
+
+        self.managed_monitor_bindings
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(binding))
     }
 }
 

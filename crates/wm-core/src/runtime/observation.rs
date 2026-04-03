@@ -1,5 +1,10 @@
 use super::*;
 
+struct DiscoveryReconcileResult {
+    discovered_windows: usize,
+    trace_logs: Vec<String>,
+}
+
 impl CoreDaemonRuntime {
     pub fn scan_and_sync(&mut self, dry_run: bool) -> Result<RuntimeCycleReport, RuntimeError> {
         let snapshot = self.adapter.scan_snapshot()?;
@@ -84,20 +89,46 @@ impl CoreDaemonRuntime {
                 .as_ref()
                 .map(|previous| diff_snapshots(previous, &snapshot))
                 .unwrap_or_else(|| SnapshotDiff::initial(&snapshot));
+            let reclassified_windows =
+                self.reclassify_state_windows_for_monitor_policy(&snapshot)?;
 
-            let discovered_windows = self.ingest_created_windows(
-                &diff.created_windows,
+            let discovery_result = self.reconcile_pending_window_discoveries(
+                &snapshot,
                 snapshot.actual_foreground_hwnd(),
                 had_previous_snapshot,
             )?;
-            let destroyed_windows = self.ingest_destroyed_windows(&diff.destroyed_hwnds)?
+            let discovered_windows = discovery_result.discovered_windows;
+            let destroyed_windows = reclassified_windows
+                + self.ingest_destroyed_windows(&diff.destroyed_hwnds)?
                 + self.prune_state_windows_missing_from_snapshot(&snapshot)?;
+            let stale_materialized_presentations = stale_materialized_presentation_hwnds(
+                &snapshot,
+                &self.adapter.materialized_presentation_hwnds(),
+            );
+            let mut stale_presentation_cleanup_count = 0;
+
+            if !dry_run
+                && !stale_materialized_presentations.is_empty()
+                && let Err(error) = self
+                    .adapter
+                    .clear_window_presentations(&stale_materialized_presentations)
+            {
+                self.push_degraded_reason(format!("stale-presentation-cleanup-failed:{error}"));
+            } else if !dry_run {
+                stale_presentation_cleanup_count = stale_materialized_presentations.len();
+            }
 
             if had_previous_snapshot && diff.monitor_topology_changed {
                 self.push_degraded_reason("monitor-topology-changed".to_string());
             }
 
             self.refresh_pending_focus_claim(snapshot.actual_foreground_hwnd());
+            if let Some(focused_hwnd) =
+                self.refresh_pending_platform_focus_candidate(snapshot.actual_foreground_hwnd())
+                && self.current_focused_hwnd() != Some(focused_hwnd)
+            {
+                self.observe_focus(focused_hwnd)?;
+            }
             if let Some(focused_hwnd) = diff.focused_hwnd
                 && self.current_focused_hwnd() != Some(focused_hwnd)
                 && !self.should_defer_platform_focus_observation(focused_hwnd)
@@ -130,6 +161,13 @@ impl CoreDaemonRuntime {
             let strip_movement_logs = self.describe_strip_movements(&snapshot, &planned_operations);
             let window_trace_logs =
                 self.describe_window_trace("plan", &snapshot, &planned_operations, None);
+            let mut recovery_actions = Vec::new();
+            if stale_presentation_cleanup_count > 0 {
+                recovery_actions.push(format!(
+                    "stale-presentation-cleanup:{}",
+                    stale_presentation_cleanup_count
+                ));
+            }
 
             let now = unix_timestamp();
             self.store.state_mut().runtime.last_full_scan_at = Some(now);
@@ -151,10 +189,11 @@ impl CoreDaemonRuntime {
                 apply_failure_messages,
                 recovery_rescans: 0,
                 validation_remaining_operations: 0,
-                recovery_actions: Vec::new(),
+                recovery_actions,
                 management_enabled: self.management_enabled,
                 dry_run,
                 degraded_reasons: self.store.state().runtime.degraded_flags.clone(),
+                discovery_trace_logs: discovery_result.trace_logs,
                 strip_movement_logs,
                 window_trace_logs,
                 validation_trace_logs: Vec::new(),
@@ -164,21 +203,58 @@ impl CoreDaemonRuntime {
         result
     }
 
-    fn ingest_created_windows(
+    fn reconcile_pending_window_discoveries(
         &mut self,
-        windows: &[PlatformWindowSnapshot],
+        snapshot: &PlatformSnapshot,
         focused_hwnd: Option<u64>,
-        follow_active_context: bool,
-    ) -> Result<usize, RuntimeError> {
+        had_previous_snapshot: bool,
+    ) -> Result<DiscoveryReconcileResult, RuntimeError> {
         let mut discovered_windows = 0;
+        let mut trace_logs = Vec::new();
+        let follow_active_context = had_previous_snapshot;
+        let assessments = self.adapter.assess_discovery_windows(snapshot);
+        let actual_hwnds = snapshot
+            .windows
+            .iter()
+            .map(|window| window.hwnd)
+            .collect::<std::collections::HashSet<_>>();
+        let bound_hwnds = self
+            .store
+            .state()
+            .windows
+            .values()
+            .filter_map(|window| window.current_hwnd_binding)
+            .collect::<std::collections::HashSet<_>>();
 
-        for window in windows {
-            if !window.management_candidate {
+        self.pending_discoveries
+            .retain(|hwnd, _| actual_hwnds.contains(hwnd) && !bound_hwnds.contains(hwnd));
+
+        for window in &snapshot.windows {
+            if self.find_window_id_by_hwnd(window.hwnd).is_some() {
+                let _ = self.pending_discoveries.remove(&window.hwnd);
                 continue;
             }
 
-            if self.find_window_id_by_hwnd(window.hwnd).is_some() {
+            let Some(assessment) = assessments.get(&window.hwnd) else {
                 continue;
+            };
+
+            match assessment.disposition {
+                PlatformWindowDisposition::RejectedNoise
+                | PlatformWindowDisposition::TransientEscapeSurface
+                | PlatformWindowDisposition::AuxiliaryAppSurface => {
+                    trace_logs.push(format_discovery_trace_line(
+                        window,
+                        assessment,
+                        None,
+                        None,
+                        blocked_discovery_action(assessment.disposition),
+                    ));
+                    let _ = self.pending_discoveries.remove(&window.hwnd);
+                    continue;
+                }
+                PlatformWindowDisposition::PendingPrimaryCandidate
+                | PlatformWindowDisposition::PromotablePrimaryCandidate => {}
             }
 
             let Some(actual_monitor_id) = self.monitor_id_by_binding(&window.monitor_binding)
@@ -187,62 +263,211 @@ impl CoreDaemonRuntime {
                     "missing-monitor-binding:{}",
                     window.monitor_binding
                 ));
+                trace_logs.push(format_discovery_trace_line(
+                    window,
+                    assessment,
+                    None,
+                    None,
+                    "blocked-missing-monitor",
+                ));
                 continue;
             };
 
+            let (should_promote, stable_ticks, required_ticks, preflight_blocks_promotion) = {
+                let now = Instant::now();
+                let entry = self
+                    .pending_discoveries
+                    .entry(window.hwnd)
+                    .or_insert_with(|| PendingDiscoveryEntry {
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        stable_ticks: 1,
+                        last_rect: window.rect,
+                        family_key: assessment.family_key.clone(),
+                        disposition: assessment.disposition,
+                        disposition_reason: assessment.disposition_reason.clone(),
+                        presentation_preflight: assessment.presentation_preflight,
+                        presentation_reason: assessment.presentation_reason.clone(),
+                    });
+
+                if pending_discovery_rect_is_stable(entry.last_rect, window.rect) {
+                    entry.stable_ticks = entry.stable_ticks.saturating_add(1);
+                } else {
+                    entry.stable_ticks = 1;
+                    entry.first_seen_at = now;
+                }
+                entry.last_seen_at = now;
+                entry.last_rect = window.rect;
+                entry.family_key = assessment.family_key.clone();
+                entry.disposition = assessment.disposition;
+                entry.disposition_reason = assessment.disposition_reason.clone();
+                entry.presentation_preflight = assessment.presentation_preflight;
+                entry.presentation_reason = assessment.presentation_reason.clone();
+
+                let required_ticks = pending_discovery_required_stable_ticks(
+                    assessment,
+                    window,
+                    had_previous_snapshot,
+                );
+                let preflight_blocks_promotion =
+                    assessment.presentation_preflight == PlatformPresentationPreflight::Rejected;
+
+                (
+                    !preflight_blocks_promotion && entry.stable_ticks >= required_ticks,
+                    entry.stable_ticks,
+                    required_ticks,
+                    preflight_blocks_promotion,
+                )
+            };
+
+            if !should_promote {
+                trace_logs.push(format_discovery_trace_line(
+                    window,
+                    assessment,
+                    Some(stable_ticks),
+                    Some(required_ticks),
+                    if preflight_blocks_promotion {
+                        "blocked-preflight"
+                    } else {
+                        "pending"
+                    },
+                ));
+                continue;
+            }
+
+            self.promote_pending_window_discovery(
+                window,
+                focused_hwnd,
+                follow_active_context,
+                actual_monitor_id,
+            )?;
+            let _ = self.pending_discoveries.remove(&window.hwnd);
+            discovered_windows += 1;
+            trace_logs.push(format_discovery_trace_line(
+                window,
+                assessment,
+                Some(stable_ticks),
+                Some(required_ticks),
+                "promoted",
+            ));
+        }
+
+        Ok(DiscoveryReconcileResult {
+            discovered_windows,
+            trace_logs,
+        })
+    }
+
+    fn promote_pending_window_discovery(
+        &mut self,
+        window: &PlatformWindowSnapshot,
+        focused_hwnd: Option<u64>,
+        follow_active_context: bool,
+        actual_monitor_id: flowtile_domain::MonitorId,
+    ) -> Result<(), RuntimeError> {
+        let mut decision = classify_window(
+            &self.active_config.rules,
+            &WindowRuleInput {
+                process_name: window.process_name.clone(),
+                class_name: window.class_name.clone(),
+                title: window.title.clone(),
+            },
+            &self.active_config.projection,
+        );
+        if decision.managed && !self.monitor_is_managed(actual_monitor_id) {
+            decision.managed = false;
+        }
+        let monitor_id = if follow_active_context {
+            self.discovery_target_monitor_id(actual_monitor_id, decision.managed)
+        } else {
+            actual_monitor_id
+        };
+        let discovery_width = self.discovered_width_semantics(&decision, window, monitor_id);
+        let placement = self.discovery_placement_for_window(
+            monitor_id,
+            &decision,
+            discovery_width,
+            follow_active_context,
+        );
+        let focus_behavior = self.discovery_focus_behavior_for_window(
+            window.hwnd,
+            focused_hwnd,
+            monitor_id,
+            &decision,
+        );
+        let correlation_id = self.next_correlation_id();
+        self.store.dispatch(DomainEvent::new(
+            flowtile_domain::DomainEventName::WindowDiscovered,
+            flowtile_domain::EventCategory::PlatformDerived,
+            flowtile_domain::EventSource::WindowsAdapter,
+            correlation_id,
+            DomainEventPayload::WindowDiscovered(flowtile_domain::WindowDiscoveredPayload {
+                monitor_id,
+                hwnd: window.hwnd,
+                classification: if decision.managed && decision.layer == WindowLayer::Tiled {
+                    flowtile_domain::WindowClassification::Application
+                } else {
+                    flowtile_domain::WindowClassification::Utility
+                },
+                desired_size: flowtile_domain::Size::new(window.rect.width, window.rect.height),
+                last_known_rect: window.rect,
+                placement,
+                focus_behavior,
+                layer: decision.layer,
+                managed: decision.managed,
+            }),
+        ))?;
+        Ok(())
+    }
+
+    fn reclassify_state_windows_for_monitor_policy(
+        &mut self,
+        snapshot: &PlatformSnapshot,
+    ) -> Result<usize, RuntimeError> {
+        let actual_windows = snapshot
+            .windows
+            .iter()
+            .map(|window| (window.hwnd, window))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut window_ids_to_destroy = Vec::new();
+
+        for window in self.store.state().windows.values() {
+            let Some(hwnd) = window.current_hwnd_binding else {
+                continue;
+            };
+            let Some(actual_window) = actual_windows.get(&hwnd) else {
+                continue;
+            };
+            let Some(actual_monitor_id) =
+                self.monitor_id_by_binding(&actual_window.monitor_binding)
+            else {
+                continue;
+            };
             let decision = classify_window(
                 &self.active_config.rules,
                 &WindowRuleInput {
-                    process_name: window.process_name.clone(),
-                    class_name: window.class_name.clone(),
-                    title: window.title.clone(),
+                    process_name: actual_window.process_name.clone(),
+                    class_name: actual_window.class_name.clone(),
+                    title: actual_window.title.clone(),
                 },
                 &self.active_config.projection,
             );
-            let monitor_id = if follow_active_context {
-                self.discovery_target_monitor_id(actual_monitor_id, decision.managed)
-            } else {
-                actual_monitor_id
-            };
-            let discovery_width = self.discovered_width_semantics(&decision, window, monitor_id);
-            let placement = self.discovery_placement_for_window(
-                monitor_id,
-                &decision,
-                discovery_width,
-                follow_active_context,
-            );
-            let focus_behavior = self.discovery_focus_behavior_for_window(
-                window.hwnd,
-                focused_hwnd,
-                monitor_id,
-                &decision,
-            );
-            let correlation_id = self.next_correlation_id();
-            self.store.dispatch(DomainEvent::new(
-                flowtile_domain::DomainEventName::WindowDiscovered,
-                flowtile_domain::EventCategory::PlatformDerived,
-                flowtile_domain::EventSource::WindowsAdapter,
-                correlation_id,
-                DomainEventPayload::WindowDiscovered(flowtile_domain::WindowDiscoveredPayload {
-                    monitor_id,
-                    hwnd: window.hwnd,
-                    classification: if decision.managed && decision.layer == WindowLayer::Tiled {
-                        flowtile_domain::WindowClassification::Application
-                    } else {
-                        flowtile_domain::WindowClassification::Utility
-                    },
-                    desired_size: flowtile_domain::Size::new(window.rect.width, window.rect.height),
-                    last_known_rect: window.rect,
-                    placement,
-                    focus_behavior,
-                    layer: decision.layer,
-                    managed: decision.managed,
-                }),
-            ))?;
-            discovered_windows += 1;
+            let desired_managed = decision.managed && self.monitor_is_managed(actual_monitor_id);
+
+            if window.is_managed != desired_managed {
+                window_ids_to_destroy.push(window.id);
+            }
         }
 
-        Ok(discovered_windows)
+        let mut destroyed_windows = 0;
+        for window_id in window_ids_to_destroy {
+            let correlation_id = self.next_correlation_id();
+            self.store
+                .dispatch(DomainEvent::window_destroyed(correlation_id, window_id))?;
+            destroyed_windows += 1;
+        }
+
+        Ok(destroyed_windows)
     }
 
     fn ingest_destroyed_windows(&mut self, hwnds: &[u64]) -> Result<usize, RuntimeError> {
@@ -471,6 +696,26 @@ impl CoreDaemonRuntime {
             })
     }
 
+    fn monitor_is_managed(&self, monitor_id: MonitorId) -> bool {
+        self.store
+            .state()
+            .monitors
+            .get(&monitor_id)
+            .is_some_and(|monitor| {
+                self.active_config
+                    .projection
+                    .manages_monitor_binding(monitor.platform_binding.as_deref())
+            })
+    }
+
+    fn first_managed_monitor_id(&self) -> Option<MonitorId> {
+        self.store
+            .state()
+            .monitor_ids_in_navigation_order()
+            .into_iter()
+            .find(|monitor_id| self.monitor_is_managed(*monitor_id))
+    }
+
     pub(super) fn find_window_id_by_hwnd(&self, hwnd: u64) -> Option<WindowId> {
         self.store
             .state()
@@ -499,7 +744,8 @@ impl CoreDaemonRuntime {
             return actual_monitor_id;
         }
 
-        self.store
+        if let Some(active_context_monitor_id) = self
+            .store
             .state()
             .focus
             .focused_window_id
@@ -507,7 +753,16 @@ impl CoreDaemonRuntime {
             .and_then(|window| self.store.state().workspaces.get(&window.workspace_id))
             .map(|workspace| workspace.monitor_id)
             .or(self.store.state().focus.focused_monitor_id)
-            .unwrap_or(actual_monitor_id)
+            && self.monitor_is_managed(active_context_monitor_id)
+        {
+            return active_context_monitor_id;
+        }
+
+        if self.monitor_is_managed(actual_monitor_id) {
+            return actual_monitor_id;
+        }
+
+        self.first_managed_monitor_id().unwrap_or(actual_monitor_id)
     }
 
     fn discovery_placement_for_window(
@@ -632,5 +887,80 @@ impl CoreDaemonRuntime {
                     .max(1)
             })
             .unwrap_or(1)
+    }
+}
+
+fn format_discovery_trace_line(
+    window: &PlatformWindowSnapshot,
+    assessment: &PlatformDiscoveryAssessment,
+    stable_ticks: Option<u8>,
+    required_ticks: Option<u8>,
+    action: &str,
+) -> String {
+    let stable_ticks = stable_ticks
+        .map(|ticks| ticks.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let required_ticks = required_ticks
+        .map(|ticks| ticks.to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "discovery-trace: hwnd={} process={} pid={} class={} title=\"{}\" monitor={} focused={} candidate={} family=\"{}\" role={} role_reason={} disposition={} disposition_reason={} preflight={} preflight_reason={} stable_ticks={} required_ticks={} action={}",
+        window.hwnd,
+        sanitize_log_text(window.process_name.as_deref().unwrap_or("unknown")),
+        window.process_id,
+        sanitize_log_text(&window.class_name),
+        sanitize_log_text(&window.title),
+        sanitize_log_text(&window.monitor_binding),
+        window.is_focused,
+        window.management_candidate,
+        sanitize_log_text(&assessment.family_key),
+        platform_window_role_name(assessment.role),
+        sanitize_log_text(&assessment.role_reason),
+        platform_window_disposition_name(assessment.disposition),
+        sanitize_log_text(&assessment.disposition_reason),
+        platform_presentation_preflight_name(assessment.presentation_preflight),
+        sanitize_log_text(&assessment.presentation_reason),
+        stable_ticks,
+        required_ticks,
+        action,
+    )
+}
+
+fn blocked_discovery_action(disposition: PlatformWindowDisposition) -> &'static str {
+    match disposition {
+        PlatformWindowDisposition::RejectedNoise => "blocked-noise",
+        PlatformWindowDisposition::TransientEscapeSurface => "blocked-transient",
+        PlatformWindowDisposition::AuxiliaryAppSurface => "blocked-auxiliary",
+        PlatformWindowDisposition::PendingPrimaryCandidate => "pending",
+        PlatformWindowDisposition::PromotablePrimaryCandidate => "promoted",
+    }
+}
+
+fn platform_window_role_name(role: PlatformWindowRole) -> &'static str {
+    match role {
+        PlatformWindowRole::Noise => "noise",
+        PlatformWindowRole::Transient => "transient",
+        PlatformWindowRole::Auxiliary => "auxiliary",
+        PlatformWindowRole::Primary => "primary",
+    }
+}
+
+fn platform_window_disposition_name(disposition: PlatformWindowDisposition) -> &'static str {
+    match disposition {
+        PlatformWindowDisposition::RejectedNoise => "rejected-noise",
+        PlatformWindowDisposition::TransientEscapeSurface => "transient-escape-surface",
+        PlatformWindowDisposition::AuxiliaryAppSurface => "auxiliary-app-surface",
+        PlatformWindowDisposition::PendingPrimaryCandidate => "pending-primary-candidate",
+        PlatformWindowDisposition::PromotablePrimaryCandidate => "promotable-primary-candidate",
+    }
+}
+
+fn platform_presentation_preflight_name(preflight: PlatformPresentationPreflight) -> &'static str {
+    match preflight {
+        PlatformPresentationPreflight::Unknown => "unknown",
+        PlatformPresentationPreflight::Eligible => "eligible",
+        PlatformPresentationPreflight::FallbackOnly => "fallback-only",
+        PlatformPresentationPreflight::Rejected => "rejected",
     }
 }

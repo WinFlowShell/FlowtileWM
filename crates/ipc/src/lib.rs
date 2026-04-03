@@ -166,6 +166,10 @@ pub struct WindowProjection {
     pub classification: String,
     pub is_managed: bool,
     pub is_focused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -212,6 +216,10 @@ pub struct SurrogatePresentationDiagnosticsProjection {
     pub active_hosts: usize,
     pub show_requests: u64,
     pub hide_requests: u64,
+    pub foreign_scene_active_hosts: usize,
+    pub foreign_scene_show_requests: u64,
+    pub foreign_scene_hide_requests: u64,
+    pub foreign_scene_pruned_hosts: u64,
     pub classifier_rejections: u64,
     pub native_fallbacks: u64,
     pub transient_escapes: u64,

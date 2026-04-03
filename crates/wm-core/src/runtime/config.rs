@@ -80,6 +80,9 @@ fn diff_config_sections(previous: &LoadedConfig, current: &LoadedConfig) -> Vec<
     {
         changed_sections.push("layout".to_string());
     }
+    if previous.projection.managed_monitor_bindings != current.projection.managed_monitor_bindings {
+        changed_sections.push("monitors".to_string());
+    }
     if previous.projection.bind_control_mode != current.projection.bind_control_mode
         || previous.hotkeys != current.hotkeys
         || previous.touchpad != current.touchpad

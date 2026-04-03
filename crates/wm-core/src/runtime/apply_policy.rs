@@ -90,6 +90,25 @@ pub(super) fn supports_tiled_window_switch_animation(
     )
 }
 
+pub(super) fn should_skip_strict_geometry_revalidation(
+    process_name: Option<&str>,
+    class_name: &str,
+    title: &str,
+) -> bool {
+    let normalized_process_name = normalize_process_name(process_name);
+    if matches!(
+        normalized_process_name.as_deref(),
+        Some("ayugram" | "windowsterminal")
+    ) {
+        return true;
+    }
+
+    matches!(
+        classify_window_visual_safety(process_name, class_name, title),
+        WindowVisualSafety::BrowserOpacityOnly | WindowVisualSafety::SkipVisualEmphasis
+    )
+}
+
 pub(super) struct WindowTraceLine<'a> {
     pub stage: &'a str,
     pub remaining_label: Option<&'a str>,
@@ -189,6 +208,19 @@ pub(super) fn should_auto_unwind_after_desync(
     affected_windows.len() > 1
 }
 
+pub(super) fn has_transient_topology_churn(
+    observed_window_count: usize,
+    validation_window_count: usize,
+    post_retry_window_count: usize,
+    discovered_windows: usize,
+    destroyed_windows: usize,
+) -> bool {
+    discovered_windows > 0
+        || destroyed_windows > 0
+        || validation_window_count != observed_window_count
+        || post_retry_window_count != validation_window_count
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WindowVisualSafety {
     SafeFullEmphasis,
@@ -282,6 +314,13 @@ pub(super) fn classify_window_visual_safety(
     }
 
     if matches!(process_name.as_str(), "wezterm-gui") {
+        return WindowVisualSafety::SkipVisualEmphasis;
+    }
+
+    if matches!(process_name.as_str(), "ayugram") {
+        // AyuGram top-level Qt windows can report unstable post-apply bounds for a few cycles
+        // after SetWindowPos. Keep them managed, but avoid geometry-retry escalation paths that
+        // would otherwise kick the runtime into emergency unwind.
         return WindowVisualSafety::SkipVisualEmphasis;
     }
 

@@ -394,12 +394,27 @@ impl StateStore {
         &self,
         requested_monitor_id: Option<MonitorId>,
     ) -> Result<MonitorId, CoreError> {
-        let monitor_id = requested_monitor_id
-            .or(self.state.focus.focused_monitor_id)
-            .or_else(|| self.state.monitors.keys().next().copied())
-            .ok_or(CoreError::InvalidEvent(
-                "workspace command requires a monitor context",
-            ))?;
+        let monitor_id = if let Some(requested_monitor_id) = requested_monitor_id {
+            requested_monitor_id
+        } else if self.has_explicit_managed_monitor_set() {
+            self.state
+                .focus
+                .focused_monitor_id
+                .filter(|monitor_id| self.monitor_is_managed(*monitor_id))
+                .or_else(|| self.first_managed_monitor_id())
+                .ok_or(CoreError::InvalidEvent(
+                    "workspace command requires at least one managed monitor",
+                ))?
+        } else {
+            self.state
+                .focus
+                .focused_monitor_id
+                .or_else(|| self.state.monitors.keys().next().copied())
+                .ok_or(CoreError::InvalidEvent(
+                    "workspace command requires a monitor context",
+                ))?
+        };
+
         self.state
             .monitors
             .contains_key(&monitor_id)
@@ -412,7 +427,11 @@ impl StateStore {
         source_monitor_id: MonitorId,
         forward: bool,
     ) -> Option<MonitorId> {
-        let monitor_ids = self.state.monitor_ids_in_navigation_order();
+        let monitor_ids = if self.has_explicit_managed_monitor_set() {
+            self.managed_monitor_ids_in_navigation_order()
+        } else {
+            self.state.monitor_ids_in_navigation_order()
+        };
         let source_index = monitor_ids
             .iter()
             .position(|monitor_id| *monitor_id == source_monitor_id)?;
@@ -526,6 +545,31 @@ impl StateStore {
     }
 
     pub(super) fn active_workspace_id_for_commands(&self) -> Result<WorkspaceId, CoreError> {
+        if let Some(window_id) = self.state.focus.focused_window_id
+            && let Some(window) = self.state.windows.get(&window_id)
+            && window.is_managed
+        {
+            return Ok(window.workspace_id);
+        }
+
+        if self.has_explicit_managed_monitor_set() {
+            if let Some(monitor_id) = self
+                .state
+                .focus
+                .focused_monitor_id
+                .filter(|monitor_id| self.monitor_is_managed(*monitor_id))
+                && let Some(workspace_id) = self.state.active_workspace_id_for_monitor(monitor_id)
+            {
+                return Ok(workspace_id);
+            }
+
+            if let Some(monitor_id) = self.first_managed_monitor_id()
+                && let Some(workspace_id) = self.state.active_workspace_id_for_monitor(monitor_id)
+            {
+                return Ok(workspace_id);
+            }
+        }
+
         if let Some(monitor_id) = self.state.focus.focused_monitor_id
             && let Some(workspace_id) = self.state.active_workspace_id_for_monitor(monitor_id)
         {
@@ -540,6 +584,36 @@ impl StateStore {
             .ok_or(CoreError::InvalidEvent(
                 "no active workspace is available for command handling",
             ))
+    }
+
+    fn has_explicit_managed_monitor_set(&self) -> bool {
+        !self
+            .state
+            .config_projection
+            .managed_monitor_bindings
+            .is_empty()
+    }
+
+    fn first_managed_monitor_id(&self) -> Option<MonitorId> {
+        self.managed_monitor_ids_in_navigation_order()
+            .into_iter()
+            .next()
+    }
+
+    fn managed_monitor_ids_in_navigation_order(&self) -> Vec<MonitorId> {
+        self.state
+            .monitor_ids_in_navigation_order()
+            .into_iter()
+            .filter(|monitor_id| self.monitor_is_managed(*monitor_id))
+            .collect()
+    }
+
+    fn monitor_is_managed(&self, monitor_id: MonitorId) -> bool {
+        self.state.monitors.get(&monitor_id).is_some_and(|monitor| {
+            self.state
+                .config_projection
+                .manages_monitor_binding(monitor.platform_binding.as_deref())
+        })
     }
 
     pub(super) fn command_window_id(

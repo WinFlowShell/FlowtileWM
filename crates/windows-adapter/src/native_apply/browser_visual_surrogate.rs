@@ -1,9 +1,10 @@
 use std::{
+    collections::BTreeSet,
     collections::HashMap,
     mem::zeroed,
     ptr::{null, null_mut},
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -65,6 +66,18 @@ struct BrowserVisualSurrogateController {
 
 static BROWSER_VISUAL_SURROGATE_CONTROLLER: OnceLock<BrowserVisualSurrogateController> =
     OnceLock::new();
+
+fn browser_visual_surrogate_active_owners() -> &'static Mutex<BTreeSet<u64>> {
+    static ACTIVE_OWNERS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+    ACTIVE_OWNERS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+pub(crate) fn active_browser_visual_surrogate_owner_hwnds_snapshot() -> BTreeSet<u64> {
+    browser_visual_surrogate_active_owners()
+        .lock()
+        .expect("browser visual surrogate active owners mutex poisoned")
+        .clone()
+}
 
 impl BrowserVisualSurrogateController {
     fn spawn() -> Result<Self, String> {
@@ -262,6 +275,10 @@ fn show_browser_visual_surrogate_internal(
         return Err(error);
     }
     surrogates.insert(owner_hwnd, surrogate);
+    browser_visual_surrogate_active_owners()
+        .lock()
+        .expect("browser visual surrogate active owners mutex poisoned")
+        .insert(owner_hwnd);
     Ok(())
 }
 
@@ -270,6 +287,10 @@ fn hide_browser_visual_surrogate_internal(
     owner_hwnd: u64,
 ) -> Result<(), String> {
     if let Some(surrogate) = surrogates.remove(&owner_hwnd) {
+        let _ = browser_visual_surrogate_active_owners()
+            .lock()
+            .expect("browser visual surrogate active owners mutex poisoned")
+            .remove(&owner_hwnd);
         return destroy_browser_visual_surrogate(surrogate);
     }
 
@@ -568,5 +589,34 @@ unsafe extern "system" fn browser_visual_surrogate_window_proc(
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        active_browser_visual_surrogate_owner_hwnds_snapshot,
+        browser_visual_surrogate_active_owners,
+    };
+
+    #[test]
+    fn active_owner_snapshot_reflects_browser_visual_surrogate_state() {
+        {
+            let mut owners = browser_visual_surrogate_active_owners()
+                .lock()
+                .expect("browser visual surrogate active owners mutex poisoned");
+            owners.clear();
+            owners.extend([101_u64, 202_u64]);
+        }
+
+        assert_eq!(
+            active_browser_visual_surrogate_owner_hwnds_snapshot(),
+            [101_u64, 202_u64].into_iter().collect()
+        );
+
+        browser_visual_surrogate_active_owners()
+            .lock()
+            .expect("browser visual surrogate active owners mutex poisoned")
+            .clear();
     }
 }

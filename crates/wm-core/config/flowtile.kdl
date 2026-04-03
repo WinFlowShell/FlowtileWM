@@ -2,6 +2,9 @@ general {
   mode "wm-only"
 }
 
+monitors {
+}
+
 layout {
   strip-scroll-step 240
   default-column-mode "normal"

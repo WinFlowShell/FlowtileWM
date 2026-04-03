@@ -63,7 +63,7 @@ fn compensated_visible_rect(operation: &ApplyOperation) -> Result<Rect, String> 
     ))
 }
 
-fn query_outer_window_rect(hwnd: HWND) -> Result<RECT, String> {
+pub(super) fn query_outer_window_rect(hwnd: HWND) -> Result<RECT, String> {
     let mut rect: RECT = unsafe { zeroed() };
     let ok = { unsafe { GetWindowRect(hwnd, &mut rect) != 0 } };
     if !ok {
@@ -72,7 +72,7 @@ fn query_outer_window_rect(hwnd: HWND) -> Result<RECT, String> {
     Ok(rect)
 }
 
-fn query_visible_frame_rect(hwnd: HWND) -> Option<RECT> {
+pub(super) fn query_visible_frame_rect(hwnd: HWND) -> Option<RECT> {
     let mut rect: RECT = unsafe { zeroed() };
     let result = {
         unsafe {

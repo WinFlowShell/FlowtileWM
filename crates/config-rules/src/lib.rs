@@ -250,6 +250,7 @@ fn parse_kdl_document(
                     }
                 }
             }
+            "monitors" => parse_monitors(node, &mut projection)?,
             "layout" => parse_layout(node, &mut projection)?,
             "input" => parse_input(node, &mut projection, &mut hotkeys, &mut touchpad)?,
             "rules" => parse_rules(node, &mut rules)?,
@@ -365,6 +366,20 @@ fn parse_kdl_like_source(
                     return Err(ConfigError::Validation(format!(
                         "unsupported general mode '{mode}'"
                     )));
+                }
+            }
+            Some("monitors") => {
+                if tokens[0] == "managed-binding" {
+                    let Some(binding) = tokens.get(1) else {
+                        return Err(ConfigError::Validation(
+                            "monitors managed-binding is missing value".to_string(),
+                        ));
+                    };
+                    append_managed_monitor_binding(
+                        &mut projection.managed_monitor_bindings,
+                        binding,
+                        "monitors managed-binding",
+                    )?;
                 }
             }
             Some("layout") => match tokens[0].as_str() {
@@ -721,6 +736,25 @@ fn parse_layout(node: &KdlNode, projection: &mut ConfigProjection) -> Result<(),
     Ok(())
 }
 
+fn parse_monitors(node: &KdlNode, projection: &mut ConfigProjection) -> Result<(), ConfigError> {
+    for child in child_nodes(node) {
+        if child.name().value() != "managed-binding" {
+            continue;
+        }
+
+        let binding = first_string(child)?.ok_or_else(|| {
+            ConfigError::Validation("monitors managed-binding is missing value".to_string())
+        })?;
+        append_managed_monitor_binding(
+            &mut projection.managed_monitor_bindings,
+            &binding,
+            "monitors managed-binding",
+        )?;
+    }
+
+    Ok(())
+}
+
 fn parse_input(
     node: &KdlNode,
     projection: &mut ConfigProjection,
@@ -963,6 +997,28 @@ fn parse_width_tokens(tokens: &[String]) -> Result<WidthSemantics, ConfigError> 
     }
 }
 
+fn append_managed_monitor_binding(
+    bindings: &mut Vec<String>,
+    binding: &str,
+    field_name: &str,
+) -> Result<(), ConfigError> {
+    let normalized = binding.trim();
+    if normalized.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+
+    if !bindings
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(normalized))
+    {
+        bindings.push(normalized.to_string());
+    }
+
+    Ok(())
+}
+
 fn tokenize_kdl_like(line: &str) -> Result<Vec<String>, ConfigError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -1143,6 +1199,9 @@ pub fn default_config_source() -> String {
         "  mode \"wm-only\"".to_string(),
         "}".to_string(),
         String::new(),
+        "monitors {".to_string(),
+        "}".to_string(),
+        String::new(),
         "layout {".to_string(),
         "  strip-scroll-step 240".to_string(),
         "  default-column-mode \"normal\"".to_string(),
@@ -1231,6 +1290,7 @@ mod tests {
             config.projection.bind_control_mode,
             BindControlMode::Coexistence
         );
+        assert!(config.projection.managed_monitor_bindings.is_empty());
         assert_eq!(config.projection.strip_scroll_step, 240);
         assert_eq!(config.projection.default_column_mode, ColumnMode::Normal);
         assert_eq!(config.projection.layout_spacing, LayoutSpacing::default());
@@ -1268,9 +1328,35 @@ mod tests {
         assert_eq!(config.projection.layout_spacing.column_gap, 12);
         assert_eq!(config.projection.layout_spacing.window_gap, 12);
         assert_eq!(config.projection.layout_spacing.floating_margin, 16);
+        assert!(config.projection.managed_monitor_bindings.is_empty());
         assert_eq!(config.rules.len(), 3);
         assert_eq!(config.projection.active_rule_count, 3);
         assert!(!config.touchpad.override_enabled);
+    }
+
+    #[test]
+    fn parses_managed_monitor_bindings_from_kdl() {
+        let path = unique_test_path("managed-monitors-kdl");
+        std::fs::create_dir_all(path.parent().expect("temp dir should exist"))
+            .expect("temp dir should be created");
+        std::fs::write(
+            &path,
+            r#"
+monitors {
+  managed-binding "\\.\DISPLAY2"
+  managed-binding "\\.\DISPLAY5"
+  managed-binding "\\.\display2"
+}
+"#,
+        )
+        .expect("config should be written");
+
+        let config = load_from_path(&path, 12).expect("kdl config should parse");
+
+        assert_eq!(
+            config.projection.managed_monitor_bindings,
+            vec!["\\\\.\\DISPLAY2".to_string(), "\\\\.\\DISPLAY5".to_string()]
+        );
     }
 
     #[test]
@@ -1340,6 +1426,7 @@ mod tests {
         assert_eq!(created_path, path);
         assert!(source.contains("bind-control-mode \"coexistence\""));
         assert!(source.contains("touchpad-override false"));
+        assert!(source.contains("monitors {"));
         assert!(source.contains("strip-scroll-step 240"));
         assert!(source.contains("outer-padding 16"));
         assert!(source.contains("column-gap 12"));
@@ -1426,6 +1513,25 @@ input {
         assert_eq!(config.touchpad.gestures[0].command, "focus-next");
         assert_eq!(config.touchpad.gestures[2].gesture, "three-finger-swipe-up");
         assert_eq!(config.touchpad.gestures[2].command, "focus-workspace-down");
+    }
+
+    #[test]
+    fn parses_managed_monitor_bindings_from_kdl_like_fallback() {
+        let source = r#"
+monitors {
+  managed-binding "\\.\DISPLAY2"
+  managed-binding "\\.\DISPLAY3"
+  managed-binding "\\.\display2"
+}
+"#;
+
+        let config = parse_kdl_like_source(source, std::path::Path::new(DEFAULT_CONFIG_PATH), 13)
+            .expect("kdl-like fallback should parse monitor bindings");
+
+        assert_eq!(
+            config.projection.managed_monitor_bindings,
+            vec!["\\\\.\\DISPLAY2".to_string(), "\\\\.\\DISPLAY3".to_string()]
+        );
     }
 
     fn unique_test_path(label: &str) -> std::path::PathBuf {

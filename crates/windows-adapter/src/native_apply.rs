@@ -2,11 +2,14 @@ mod activation;
 mod browser_dim_overlay;
 mod browser_visual_surrogate;
 mod clipped_window_surrogate;
+mod spill_mask_overlay;
 mod visual_effects;
 mod window_geometry;
+mod window_monitor_scene;
 mod window_switch_animation;
 
 use std::{
+    collections::{BTreeSet, HashMap},
     ptr::null_mut,
     thread,
     time::{Duration, Instant},
@@ -24,30 +27,44 @@ use windows_sys::Win32::{
 
 use self::{
     activation::activate_window,
-    browser_dim_overlay::{hide_browser_dim_overlay_if_initialized, show_browser_dim_overlay},
+    browser_dim_overlay::{
+        active_browser_dim_overlay_owner_hwnds_snapshot, hide_browser_dim_overlay_if_initialized,
+        show_browser_dim_overlay,
+    },
     browser_visual_surrogate::{
+        active_browser_visual_surrogate_owner_hwnds_snapshot,
         hide_browser_visual_surrogate_if_initialized, show_browser_visual_surrogate,
     },
     clipped_window_surrogate::{
+        active_clipped_window_surrogate_owner_hwnds_snapshot,
+        clear_clipped_window_surrogate_presentation_override,
         clipped_window_surrogate_classifier_reason, hide_clipped_window_surrogate_if_initialized,
         record_clipped_window_surrogate_native_fallback, should_use_clipped_window_surrogate,
         show_clipped_window_surrogate,
         surrogate_presentation_diagnostics_snapshot as clipped_surrogate_diagnostics_snapshot,
+        surrogate_presentation_overrides_snapshot as clipped_surrogate_overrides_snapshot,
+    },
+    spill_mask_overlay::{
+        active_spill_mask_overlay_owner_hwnds_snapshot, hide_spill_mask_overlay_if_initialized,
     },
     visual_effects::{
         AppliedVisualState, applied_visual_states, apply_window_border, apply_window_corners,
         apply_window_opacity, browser_surrogate_alpha, direct_layered_opacity_alpha, layered_hwnds,
-        normalized_visual_emphasis, overlay_dim_alpha, overlay_dim_alpha_from_window_opacity,
-        query_window_ex_style, should_skip_visual_write, style_has_layered,
+        native_clip_masked_hwnds_snapshot, normalized_visual_emphasis, overlay_dim_alpha,
+        overlay_dim_alpha_from_window_opacity, query_window_ex_style, should_skip_visual_write,
+        style_has_layered, sync_window_native_clip_mask,
     },
     window_geometry::translated_window_rect,
+    window_monitor_scene::active_window_monitor_scene_owner_hwnds_snapshot,
+    window_monitor_scene::{hide_window_monitor_scene_if_initialized, show_window_monitor_scene},
     window_switch_animation::{
         animated_frame_operation, ease_out_cubic, uses_window_switch_animation,
     },
 };
 use crate::{
     ApplyBatchResult, ApplyFailure, ApplyOperation, SurrogatePresentationDiagnostics,
-    WindowOpacityMode, WindowPresentation, WindowPresentationMode, WindowVisualEmphasis, dpi,
+    WindowOpacityMode, WindowPresentation, WindowPresentationMode, WindowPresentationOverride,
+    WindowVisualEmphasis, dpi,
 };
 
 use std::convert::TryFrom;
@@ -92,8 +109,13 @@ pub(crate) fn apply_operations(operations: &[ApplyOperation]) -> ApplyBatchResul
 }
 
 fn normalize_surrogate_presentation_operation(operation: &ApplyOperation) -> ApplyOperation {
-    if operation.presentation.mode != WindowPresentationMode::SurrogateClipped {
+    if !is_surrogate_presentation_mode(operation.presentation.mode) {
         return operation.clone();
+    }
+
+    if operation.activate {
+        return operation_with_native_visible_surrogate_fallback(operation)
+            .unwrap_or_else(|| operation.clone());
     }
 
     if should_use_clipped_window_surrogate(operation.hwnd) {
@@ -106,21 +128,77 @@ fn normalize_surrogate_presentation_operation(operation: &ApplyOperation) -> App
 }
 
 pub(crate) fn surrogate_presentation_diagnostics_snapshot() -> SurrogatePresentationDiagnostics {
-    clipped_surrogate_diagnostics_snapshot()
+    let mut diagnostics = clipped_surrogate_diagnostics_snapshot();
+    let window_monitor_scene_diagnostics =
+        window_monitor_scene::window_monitor_scene_diagnostics_snapshot();
+    diagnostics.foreign_scene_active_hosts = window_monitor_scene_diagnostics.active_hosts;
+    diagnostics.foreign_scene_show_requests = window_monitor_scene_diagnostics.show_requests;
+    diagnostics.foreign_scene_hide_requests = window_monitor_scene_diagnostics.hide_requests;
+    diagnostics.foreign_scene_pruned_hosts = window_monitor_scene_diagnostics.pruned_hosts;
+    diagnostics.dwm_thumbnail_backend_uses = diagnostics
+        .dwm_thumbnail_backend_uses
+        .saturating_add(window_monitor_scene_diagnostics.dwm_thumbnail_backend_uses);
+    if window_monitor_scene_diagnostics.last_event.is_some() {
+        diagnostics.last_event = window_monitor_scene_diagnostics.last_event;
+    }
+
+    diagnostics
+}
+
+pub(crate) fn surrogate_presentation_overrides_snapshot() -> HashMap<u64, WindowPresentationOverride>
+{
+    clipped_surrogate_overrides_snapshot()
+}
+
+pub(crate) fn materialized_presentation_hwnds_snapshot() -> BTreeSet<u64> {
+    let mut hwnds = active_clipped_window_surrogate_owner_hwnds_snapshot();
+    hwnds.extend(active_spill_mask_overlay_owner_hwnds_snapshot());
+    hwnds.extend(active_window_monitor_scene_owner_hwnds_snapshot());
+    hwnds.extend(active_browser_visual_surrogate_owner_hwnds_snapshot());
+    hwnds.extend(active_browser_dim_overlay_owner_hwnds_snapshot());
+    hwnds.extend(native_clip_masked_hwnds_snapshot());
+    hwnds
+}
+
+pub(crate) fn clear_window_presentations(raw_hwnds: &[u64]) -> Result<(), String> {
+    for raw_hwnd in raw_hwnds.iter().copied() {
+        hide_clipped_window_surrogate_if_initialized(raw_hwnd)?;
+        hide_spill_mask_overlay_if_initialized(raw_hwnd)?;
+        hide_window_monitor_scene_if_initialized(raw_hwnd)?;
+        hide_browser_visual_surrogate_if_initialized(raw_hwnd)?;
+        hide_browser_dim_overlay_if_initialized(raw_hwnd)?;
+        clear_clipped_window_surrogate_presentation_override(raw_hwnd);
+
+        if let Ok(hwnd) = hwnd_from_raw(raw_hwnd) {
+            if is_valid_window(hwnd) {
+                sync_window_native_clip_mask(hwnd, None, None)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn operation_with_native_visible_surrogate_fallback(
     operation: &ApplyOperation,
 ) -> Option<ApplyOperation> {
-    let native_visible_rect = operation
-        .presentation
-        .surrogate
-        .as_ref()?
-        .native_visible_rect;
+    let surrogate = operation.presentation.surrogate.clone()?;
+    let native_visible_rect = surrogate.native_visible_rect;
     let mut normalized = operation.clone();
     normalized.rect = native_visible_rect;
-    normalized.presentation = WindowPresentation::default();
+    normalized.presentation = WindowPresentation {
+        mode: WindowPresentationMode::NativeVisible,
+        surrogate: Some(surrogate),
+        monitor_scene: operation.presentation.monitor_scene.clone(),
+    };
     Some(normalized)
+}
+
+fn is_surrogate_presentation_mode(mode: WindowPresentationMode) -> bool {
+    matches!(
+        mode,
+        WindowPresentationMode::SurrogateVisible | WindowPresentationMode::SurrogateClipped
+    )
 }
 
 fn apply_operations_direct(operations: &[ApplyOperation]) -> ApplyBatchResult {
@@ -128,21 +206,12 @@ fn apply_operations_direct(operations: &[ApplyOperation]) -> ApplyBatchResult {
         return ApplyBatchResult::default();
     }
 
-    let (surrogate_operations, remaining_operations): (Vec<_>, Vec<_>) =
-        operations.iter().cloned().partition(|operation| {
-            operation.presentation.mode == WindowPresentationMode::SurrogateClipped
-        });
-    let (geometry_operations, visual_only_operations): (Vec<_>, Vec<_>) = remaining_operations
+    let (geometry_operations, visual_only_operations): (Vec<_>, Vec<_>) = operations
         .iter()
         .cloned()
         .partition(|operation| operation.apply_geometry);
 
     let mut result = ApplyBatchResult::default();
-    merge_apply_result(
-        &mut result,
-        apply_operations_individually(&surrogate_operations),
-    );
-
     if geometry_operations.is_empty() {
         merge_apply_result(
             &mut result,
@@ -175,7 +244,7 @@ fn apply_operations_individually(operations: &[ApplyOperation]) -> ApplyBatchRes
     let mut failures = Vec::new();
     let mut applied = 0_usize;
 
-    for operation in operations {
+    for operation in ordered_operations_for_presentation(operations) {
         match apply_operation(operation) {
             Ok(()) => {
                 applied += 1;
@@ -347,7 +416,7 @@ fn finalize_apply_without_animation(operations: &[ApplyOperation]) -> ApplyBatch
     let mut applied = operations.len();
     let mut failures = Vec::new();
 
-    for operation in operations {
+    for operation in ordered_operations_for_presentation(operations) {
         if let Err(message) = sync_window_presentation(operation) {
             applied = applied.saturating_sub(1);
             failures.push(ApplyFailure {
@@ -428,22 +497,68 @@ fn apply_gapless_visual_policy(hwnd: HWND) {
 }
 
 fn sync_window_presentations(operations: &[ApplyOperation]) -> Result<(), String> {
-    for operation in operations {
+    for operation in ordered_operations_for_presentation(operations) {
         sync_window_presentation(operation)?;
     }
 
     Ok(())
 }
 
+fn ordered_operations_for_presentation(operations: &[ApplyOperation]) -> Vec<&ApplyOperation> {
+    let mut ordered = operations.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by_key(|(index, operation)| (presentation_apply_priority(operation), *index));
+    ordered
+        .into_iter()
+        .map(|(_, operation)| operation)
+        .collect::<Vec<_>>()
+}
+
+fn presentation_apply_priority(operation: &ApplyOperation) -> u8 {
+    match (operation.presentation.mode, operation.activate) {
+        (WindowPresentationMode::NativeVisible, true) => 0,
+        (WindowPresentationMode::NativeVisible, false) => 1,
+        (WindowPresentationMode::SurrogateVisible, _)
+        | (WindowPresentationMode::SurrogateClipped, _) => 2,
+        (WindowPresentationMode::NativeHidden, _) => 3,
+    }
+}
+
 fn sync_window_presentation(operation: &ApplyOperation) -> Result<(), String> {
     match operation.presentation.mode {
         WindowPresentationMode::NativeVisible | WindowPresentationMode::NativeHidden => {
-            hide_clipped_window_surrogate_if_initialized(operation.hwnd)
+            hide_clipped_window_surrogate_if_initialized(operation.hwnd)?;
+            let hwnd = hwnd_from_raw(operation.hwnd)?;
+            if let Some(clip_rect) = native_visible_clip_rect(operation) {
+                // Keep the HWND full-size, but hard-clip native presentation to the home-monitor
+                // slice so the real window cannot leak onto foreign monitors underneath scenes.
+                sync_window_native_clip_mask(hwnd, Some(operation.rect), Some(clip_rect))?;
+                hide_spill_mask_overlay_if_initialized(operation.hwnd)?;
+            } else {
+                sync_window_native_clip_mask(hwnd, None, None)?;
+                hide_spill_mask_overlay_if_initialized(operation.hwnd)?;
+            }
+            if should_show_window_monitor_scene(&operation.presentation) {
+                show_window_monitor_scene(
+                    operation.hwnd,
+                    &operation.presentation.monitor_scene.slices,
+                )?;
+            } else {
+                hide_window_monitor_scene_if_initialized(operation.hwnd)?;
+            }
+            if operation.presentation.surrogate.is_none()
+                || operation.presentation.mode == WindowPresentationMode::NativeHidden
+            {
+                clear_clipped_window_surrogate_presentation_override(operation.hwnd);
+            }
+            Ok(())
         }
-        WindowPresentationMode::SurrogateClipped => {
+        WindowPresentationMode::SurrogateVisible | WindowPresentationMode::SurrogateClipped => {
+            let hwnd = hwnd_from_raw(operation.hwnd)?;
+            sync_window_native_clip_mask(hwnd, None, None)?;
+            hide_spill_mask_overlay_if_initialized(operation.hwnd)?;
             let surrogate = operation.presentation.surrogate.as_ref().ok_or_else(|| {
                 format!(
-                    "surrogate-clipped presentation for hwnd {} is missing clip metadata",
+                    "surrogate presentation for hwnd {} is missing metadata",
                     operation.hwnd
                 )
             })?;
@@ -452,9 +567,36 @@ fn sync_window_presentation(operation: &ApplyOperation) -> Result<(), String> {
                 surrogate.destination_rect,
                 surrogate.source_rect,
                 surrogate.native_visible_rect,
-            )
+            )?;
+            if should_show_window_monitor_scene(&operation.presentation) {
+                show_window_monitor_scene(
+                    operation.hwnd,
+                    &operation.presentation.monitor_scene.slices,
+                )
+            } else {
+                hide_window_monitor_scene_if_initialized(operation.hwnd)
+            }
         }
     }
+}
+
+fn should_show_window_monitor_scene(presentation: &WindowPresentation) -> bool {
+    presentation.mode != WindowPresentationMode::NativeHidden
+        && !presentation.monitor_scene.slices.is_empty()
+}
+
+fn native_visible_clip_rect(operation: &ApplyOperation) -> Option<flowtile_domain::Rect> {
+    if operation.presentation.mode != WindowPresentationMode::NativeVisible {
+        return None;
+    }
+
+    operation
+        .presentation
+        .surrogate
+        .as_ref()
+        .map(|surrogate| surrogate.destination_rect)
+        .or(operation.presentation.monitor_scene.home_visible_rect)
+        .filter(|clip_rect| *clip_rect != operation.rect)
 }
 
 fn apply_visual_emphasis_for_operation(operation: &ApplyOperation) -> Result<(), String> {
@@ -643,18 +785,22 @@ mod tests {
     use flowtile_domain::Rect;
 
     use crate::{
+        WindowMonitorScene, WindowMonitorSceneSlice, WindowMonitorSceneSliceKind,
         WindowOpacityMode, WindowPresentation, WindowPresentationMode, WindowSurrogateClip,
         WindowSwitchAnimation, WindowVisualEmphasis,
     };
 
     use super::{
         browser_visual_surrogate::source_relative_rect,
-        operation_with_native_visible_surrogate_fallback,
+        is_surrogate_presentation_mode, native_visible_clip_rect,
+        normalize_surrogate_presentation_operation,
+        operation_with_native_visible_surrogate_fallback, ordered_operations_for_presentation,
+        should_show_window_monitor_scene,
         visual_effects::{
             AppliedVisualState, browser_surrogate_alpha, direct_layered_opacity_alpha,
-            normalized_visual_emphasis, overlay_dim_alpha, overlay_dim_alpha_from_window_opacity,
-            should_clear_layered_style, should_refresh_after_layered_enable,
-            should_skip_visual_write,
+            native_clip_region_bounds, normalized_visual_emphasis, overlay_dim_alpha,
+            overlay_dim_alpha_from_window_opacity, should_clear_layered_style,
+            should_refresh_after_layered_enable, should_skip_visual_write,
         },
         window_geometry::{FrameInsets, frame_insets, visible_frame_is_compatible},
         window_switch_animation::{ease_out_cubic, interpolate_rect, uses_window_switch_animation},
@@ -741,6 +887,16 @@ mod tests {
                     source_rect: Rect::new(0, 0, 672, 868),
                     native_visible_rect: Rect::new(928, 16, 900, 868),
                 }),
+                monitor_scene: WindowMonitorScene {
+                    home_visible_rect: Some(Rect::new(928, 16, 672, 868)),
+                    slices: vec![WindowMonitorSceneSlice {
+                        kind: WindowMonitorSceneSliceKind::ForeignMonitorSurrogate,
+                        monitor_rect: Rect::new(1600, 0, 1440, 1200),
+                        destination_rect: Rect::new(1600, 16, 228, 868),
+                        source_rect: Rect::new(672, 0, 228, 868),
+                        native_visible_rect: Rect::new(928, 16, 900, 868),
+                    }],
+                },
             },
         };
 
@@ -748,7 +904,253 @@ mod tests {
             .expect("surrogate operation should downgrade back to native visible");
 
         assert_eq!(fallback.rect, Rect::new(928, 16, 900, 868));
-        assert_eq!(fallback.presentation, WindowPresentation::default());
+        assert_eq!(
+            fallback.presentation.mode,
+            WindowPresentationMode::NativeVisible
+        );
+        assert_eq!(
+            fallback
+                .presentation
+                .surrogate
+                .as_ref()
+                .expect(
+                    "fallback should preserve surrogate metadata for effective override tracking"
+                )
+                .native_visible_rect,
+            Rect::new(928, 16, 900, 868)
+        );
+        assert_eq!(fallback.presentation.monitor_scene.slices.len(), 1);
+    }
+
+    #[test]
+    fn activating_surrogate_operation_is_normalized_into_native_visible_handoff() {
+        let operation = crate::ApplyOperation {
+            hwnd: 200,
+            rect: Rect::new(4000, 0, 420, 900),
+            apply_geometry: true,
+            activate: true,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
+            visual_emphasis: None,
+            presentation: WindowPresentation {
+                mode: WindowPresentationMode::SurrogateVisible,
+                surrogate: Some(WindowSurrogateClip {
+                    destination_rect: Rect::new(420, 0, 420, 900),
+                    source_rect: Rect::new(0, 0, 420, 900),
+                    native_visible_rect: Rect::new(420, 0, 420, 900),
+                }),
+                monitor_scene: WindowMonitorScene::default(),
+            },
+        };
+
+        let normalized = normalize_surrogate_presentation_operation(&operation);
+        assert_eq!(
+            normalized.presentation.mode,
+            WindowPresentationMode::NativeVisible
+        );
+        assert_eq!(normalized.rect, Rect::new(420, 0, 420, 900));
+        assert!(normalized.activate);
+        assert_eq!(
+            normalized
+                .presentation
+                .surrogate
+                .as_ref()
+                .expect("activation handoff should preserve surrogate metadata")
+                .destination_rect,
+            Rect::new(420, 0, 420, 900)
+        );
+    }
+
+    #[test]
+    fn native_visible_presentation_with_monitor_scene_requests_foreign_scene_hosts() {
+        let presentation = WindowPresentation {
+            mode: WindowPresentationMode::NativeVisible,
+            surrogate: Some(WindowSurrogateClip {
+                destination_rect: Rect::new(928, 16, 672, 868),
+                source_rect: Rect::new(0, 0, 672, 868),
+                native_visible_rect: Rect::new(928, 16, 900, 868),
+            }),
+            monitor_scene: WindowMonitorScene {
+                home_visible_rect: Some(Rect::new(928, 16, 672, 868)),
+                slices: vec![WindowMonitorSceneSlice {
+                    kind: WindowMonitorSceneSliceKind::ForeignMonitorSurrogate,
+                    monitor_rect: Rect::new(1600, 0, 1440, 1200),
+                    destination_rect: Rect::new(1600, 16, 228, 868),
+                    source_rect: Rect::new(672, 0, 228, 868),
+                    native_visible_rect: Rect::new(928, 16, 900, 868),
+                }],
+            },
+        };
+
+        assert!(should_show_window_monitor_scene(&presentation));
+    }
+
+    #[test]
+    fn surrogate_presentations_with_monitor_scene_also_request_foreign_scene_hosts() {
+        assert!(should_show_window_monitor_scene(&WindowPresentation {
+            mode: WindowPresentationMode::SurrogateClipped,
+            surrogate: Some(WindowSurrogateClip {
+                destination_rect: Rect::new(928, 16, 672, 868),
+                source_rect: Rect::new(0, 0, 672, 868),
+                native_visible_rect: Rect::new(928, 16, 900, 868),
+            }),
+            monitor_scene: WindowMonitorScene {
+                home_visible_rect: Some(Rect::new(928, 16, 672, 868)),
+                slices: vec![WindowMonitorSceneSlice {
+                    kind: WindowMonitorSceneSliceKind::ForeignMonitorSurrogate,
+                    monitor_rect: Rect::new(1600, 0, 1440, 1200),
+                    destination_rect: Rect::new(1600, 16, 228, 868),
+                    source_rect: Rect::new(672, 0, 228, 868),
+                    native_visible_rect: Rect::new(928, 16, 900, 868),
+                }],
+            },
+        }));
+    }
+
+    #[test]
+    fn hidden_or_empty_presentations_do_not_request_foreign_scene_hosts() {
+        assert!(!should_show_window_monitor_scene(&WindowPresentation {
+            mode: WindowPresentationMode::NativeHidden,
+            surrogate: None,
+            monitor_scene: WindowMonitorScene {
+                home_visible_rect: Some(Rect::new(928, 16, 672, 868)),
+                slices: vec![WindowMonitorSceneSlice {
+                    kind: WindowMonitorSceneSliceKind::ForeignMonitorSurrogate,
+                    monitor_rect: Rect::new(1600, 0, 1440, 1200),
+                    destination_rect: Rect::new(1600, 16, 228, 868),
+                    source_rect: Rect::new(672, 0, 228, 868),
+                    native_visible_rect: Rect::new(928, 16, 900, 868),
+                }],
+            },
+        }));
+        assert!(!should_show_window_monitor_scene(
+            &WindowPresentation::default()
+        ));
+    }
+
+    #[test]
+    fn clear_window_presentations_tolerates_invalid_hwnds() {
+        assert!(super::clear_window_presentations(&[123]).is_ok());
+    }
+
+    #[test]
+    fn native_visible_clip_rect_falls_back_to_monitor_scene_home_visible_rect() {
+        let operation = crate::ApplyOperation {
+            hwnd: 200,
+            rect: Rect::new(928, 16, 900, 868),
+            apply_geometry: true,
+            activate: false,
+            suppress_visual_gap: false,
+            window_switch_animation: None,
+            visual_emphasis: None,
+            presentation: WindowPresentation {
+                mode: WindowPresentationMode::NativeVisible,
+                surrogate: None,
+                monitor_scene: WindowMonitorScene {
+                    home_visible_rect: Some(Rect::new(928, 16, 672, 868)),
+                    slices: vec![WindowMonitorSceneSlice {
+                        kind: WindowMonitorSceneSliceKind::ForeignMonitorSurrogate,
+                        monitor_rect: Rect::new(1600, 0, 1440, 1200),
+                        destination_rect: Rect::new(1600, 16, 228, 868),
+                        source_rect: Rect::new(672, 0, 228, 868),
+                        native_visible_rect: Rect::new(928, 16, 900, 868),
+                    }],
+                },
+            },
+        };
+
+        assert_eq!(
+            native_visible_clip_rect(&operation),
+            Some(Rect::new(928, 16, 672, 868))
+        );
+    }
+
+    #[test]
+    fn native_clip_region_bounds_keep_full_window_size_and_mask_only_visible_slice() {
+        let bounds = native_clip_region_bounds(
+            Rect::new(928, 16, 900, 868),
+            Rect::new(928, 16, 672, 868),
+            FrameInsets {
+                left: 8,
+                top: 8,
+                right: 8,
+                bottom: 8,
+            },
+        )
+        .expect("partial clip should produce a native region");
+
+        assert_eq!(bounds.left, 8);
+        assert_eq!(bounds.top, 8);
+        assert_eq!(bounds.right, 680);
+        assert_eq!(bounds.bottom, 876);
+    }
+
+    #[test]
+    fn surrogate_visible_is_normalized_as_surrogate_presentation() {
+        assert!(is_surrogate_presentation_mode(
+            WindowPresentationMode::SurrogateVisible
+        ));
+        assert!(is_surrogate_presentation_mode(
+            WindowPresentationMode::SurrogateClipped
+        ));
+        assert!(!is_surrogate_presentation_mode(
+            WindowPresentationMode::NativeVisible
+        ));
+    }
+
+    #[test]
+    fn presentation_order_prioritizes_native_activation_before_surrogate_handoff() {
+        let operations = vec![
+            crate::ApplyOperation {
+                hwnd: 200,
+                rect: Rect::new(4000, 0, 420, 900),
+                apply_geometry: true,
+                activate: false,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
+                visual_emphasis: None,
+                presentation: WindowPresentation {
+                    mode: WindowPresentationMode::SurrogateVisible,
+                    surrogate: Some(WindowSurrogateClip {
+                        destination_rect: Rect::new(420, 0, 420, 900),
+                        source_rect: Rect::new(0, 0, 420, 900),
+                        native_visible_rect: Rect::new(420, 0, 420, 900),
+                    }),
+                    monitor_scene: crate::WindowMonitorScene::default(),
+                },
+            },
+            crate::ApplyOperation {
+                hwnd: 100,
+                rect: Rect::new(0, 0, 420, 900),
+                apply_geometry: true,
+                activate: true,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
+                visual_emphasis: None,
+                presentation: WindowPresentation::default(),
+            },
+            crate::ApplyOperation {
+                hwnd: 300,
+                rect: Rect::new(5000, 0, 420, 900),
+                apply_geometry: true,
+                activate: false,
+                suppress_visual_gap: false,
+                window_switch_animation: None,
+                visual_emphasis: None,
+                presentation: WindowPresentation {
+                    mode: WindowPresentationMode::NativeHidden,
+                    surrogate: None,
+                    monitor_scene: crate::WindowMonitorScene::default(),
+                },
+            },
+        ];
+
+        let ordered = ordered_operations_for_presentation(&operations)
+            .into_iter()
+            .map(|operation| operation.hwnd)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec![100, 200, 300]);
     }
 
     #[test]

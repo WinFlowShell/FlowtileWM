@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -41,7 +41,8 @@ use windows_sys::Win32::{
 
 use super::{
     activate_window, hwnd_from_raw, is_valid_window, last_error_message, pump_overlay_messages,
-    widestring,
+    spill_mask_overlay::hide_spill_mask_overlay_if_initialized,
+    visual_effects::sync_window_native_clip_mask, widestring,
 };
 
 const CLIPPED_WINDOW_SURROGATE_CLASS: &str = "FlowTileClippedWindowSurrogate";
@@ -55,8 +56,11 @@ const WINDOW_CLASS_ALREADY_EXISTS: u32 = 1410;
 const CLASS_CHROME_WIDGET: &str = "chrome_widgetwin_1";
 const CLASS_MOZILLA_WINDOW: &str = "mozillawindowclass";
 const CLASS_TERMINAL_HOSTING_WINDOW: &str = "cascadia_hosting_window_class";
+#[cfg(test)]
 const CLASS_APPLICATION_FRAME_WINDOW: &str = "applicationframewindow";
+#[cfg(test)]
 const CLASS_WINDOWS_CORE_WINDOW: &str = "windows.ui.core.corewindow";
+#[cfg(test)]
 const CLASS_XAML_EXPLORER_HOST_ISLAND_WINDOW: &str = "xamlexplorerhostislandwindow";
 const CLASS_XAML_WINDOWED_POPUP: &str = "xaml_windowedpopupclass";
 const CLASS_WIN32_MENU: &str = "#32768";
@@ -78,6 +82,7 @@ struct ClippedWindowSurrogate {
 struct ClippedWindowSurrogateWindowState {
     owner_hwnd: u64,
     native_visible_rect: flowtile_domain::Rect,
+    native_clip_rect: flowtile_domain::Rect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,10 +123,23 @@ static CLIPPED_WINDOW_SURROGATE_CONTROLLER: OnceLock<ClippedWindowSurrogateContr
 static CLIPPED_WINDOW_SURROGATE_DIAGNOSTICS: OnceLock<
     Mutex<crate::SurrogatePresentationDiagnostics>,
 > = OnceLock::new();
+static CLIPPED_WINDOW_SURROGATE_PRESENTATION_OVERRIDES: OnceLock<
+    Mutex<HashMap<u64, crate::WindowPresentationOverride>>,
+> = OnceLock::new();
+static CLIPPED_WINDOW_SURROGATE_ACTIVE_OWNERS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
 
 fn clipped_window_surrogate_diagnostics() -> &'static Mutex<crate::SurrogatePresentationDiagnostics>
 {
     CLIPPED_WINDOW_SURROGATE_DIAGNOSTICS.get_or_init(|| Mutex::new(Default::default()))
+}
+
+fn clipped_window_surrogate_presentation_overrides()
+-> &'static Mutex<HashMap<u64, crate::WindowPresentationOverride>> {
+    CLIPPED_WINDOW_SURROGATE_PRESENTATION_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn clipped_window_surrogate_active_owners() -> &'static Mutex<BTreeSet<u64>> {
+    CLIPPED_WINDOW_SURROGATE_ACTIVE_OWNERS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
 pub(crate) fn surrogate_presentation_diagnostics_snapshot()
@@ -132,11 +150,55 @@ pub(crate) fn surrogate_presentation_diagnostics_snapshot()
         .clone()
 }
 
+pub(crate) fn surrogate_presentation_overrides_snapshot()
+-> HashMap<u64, crate::WindowPresentationOverride> {
+    clipped_window_surrogate_presentation_overrides()
+        .lock()
+        .expect("clipped window surrogate presentation override lock should not be poisoned")
+        .clone()
+}
+
+pub(crate) fn active_clipped_window_surrogate_owner_hwnds_snapshot() -> BTreeSet<u64> {
+    clipped_window_surrogate_active_owners()
+        .lock()
+        .expect("clipped window surrogate active owners lock should not be poisoned")
+        .clone()
+}
+
+fn set_clipped_window_surrogate_presentation_override(
+    raw_hwnd: u64,
+    mode: crate::WindowPresentationMode,
+    reason: impl Into<String>,
+) {
+    clipped_window_surrogate_presentation_overrides()
+        .lock()
+        .expect("clipped window surrogate presentation override lock should not be poisoned")
+        .insert(
+            raw_hwnd,
+            crate::WindowPresentationOverride {
+                mode,
+                reason: reason.into(),
+            },
+        );
+}
+
+pub(crate) fn clear_clipped_window_surrogate_presentation_override(raw_hwnd: u64) {
+    let _ = clipped_window_surrogate_presentation_overrides()
+        .lock()
+        .expect("clipped window surrogate presentation override lock should not be poisoned")
+        .remove(&raw_hwnd);
+}
+
 pub(crate) fn record_clipped_window_surrogate_native_fallback(raw_hwnd: u64, reason: &str) {
     update_clipped_window_surrogate_diagnostics(|diagnostics| {
         diagnostics.classifier_rejections = diagnostics.classifier_rejections.saturating_add(1);
         diagnostics.native_fallbacks = diagnostics.native_fallbacks.saturating_add(1);
     });
+    set_clipped_window_surrogate_presentation_override(
+        raw_hwnd,
+        crate::WindowPresentationMode::NativeVisible,
+        format!("native-fallback:{reason}"),
+    );
     log_clipped_window_surrogate_event("native-fallback", raw_hwnd, format!("reason={reason}"));
 }
 
@@ -434,6 +496,7 @@ fn show_clipped_window_surrogate_internal(
         ClippedWindowSurrogateWindowState {
             owner_hwnd,
             native_visible_rect,
+            native_clip_rect: destination_rect,
         },
     );
 
@@ -444,11 +507,16 @@ fn show_clipped_window_surrogate_internal(
         source_rect,
         surrogate,
     )?;
+    clear_clipped_window_surrogate_presentation_override(owner_hwnd);
     surrogates.insert(owner_hwnd, surrogate);
     if created_new_surrogate {
         update_clipped_window_surrogate_diagnostics(|diagnostics| {
             diagnostics.active_hosts = diagnostics.active_hosts.saturating_add(1);
         });
+        clipped_window_surrogate_active_owners()
+            .lock()
+            .expect("clipped window surrogate active owners lock should not be poisoned")
+            .insert(owner_hwnd);
     }
     if created_new_surrogate {
         log_clipped_window_surrogate_event(
@@ -481,6 +549,10 @@ fn hide_clipped_window_surrogate_internal(
         update_clipped_window_surrogate_diagnostics(|diagnostics| {
             diagnostics.active_hosts = diagnostics.active_hosts.saturating_sub(1);
         });
+        let _ = clipped_window_surrogate_active_owners()
+            .lock()
+            .expect("clipped window surrogate active owners lock should not be poisoned")
+            .remove(&owner_hwnd);
         log_clipped_window_surrogate_event("hide", owner_hwnd, "");
         return destroy_clipped_window_surrogate(surrogate);
     }
@@ -495,9 +567,23 @@ fn prune_stale_clipped_window_surrogates(surrogates: &mut HashMap<u64, ClippedWi
         .filter_map(|(owner_hwnd, surrogate)| {
             let owner = match hwnd_from_raw(*owner_hwnd).ok() {
                 Some(hwnd) if is_valid_window(hwnd) => hwnd,
-                _ => return Some(*owner_hwnd),
+                _ => {
+                    clear_clipped_window_surrogate_presentation_override(*owner_hwnd);
+                    let _ = clipped_window_surrogate_active_owners()
+                        .lock()
+                        .expect(
+                            "clipped window surrogate active owners lock should not be poisoned",
+                        )
+                        .remove(owner_hwnd);
+                    return Some(*owner_hwnd);
+                }
             };
             if !is_valid_window(surrogate.window) {
+                clear_clipped_window_surrogate_presentation_override(*owner_hwnd);
+                let _ = clipped_window_surrogate_active_owners()
+                    .lock()
+                    .expect("clipped window surrogate active owners lock should not be poisoned")
+                    .remove(owner_hwnd);
                 return Some(*owner_hwnd);
             }
 
@@ -512,9 +598,15 @@ fn prune_stale_clipped_window_surrogates(surrogates: &mut HashMap<u64, ClippedWi
                         state.owner_hwnd,
                         "reason=foreground-or-transient-surface",
                     );
+                    set_clipped_window_surrogate_presentation_override(
+                        state.owner_hwnd,
+                        crate::WindowPresentationMode::NativeVisible,
+                        "transient-escape".to_string(),
+                    );
                     let _ = promote_clipped_window_surrogate_owner_to_native(
                         state.owner_hwnd,
                         state.native_visible_rect,
+                        state.native_clip_rect,
                     );
                 }
                 return Some(*owner_hwnd);
@@ -533,6 +625,7 @@ fn destroy_all_clipped_window_surrogates(surrogates: &mut HashMap<u64, ClippedWi
     let owner_hwnds = surrogates.keys().copied().collect::<Vec<_>>();
     for owner_hwnd in owner_hwnds {
         let _ = hide_clipped_window_surrogate_internal(surrogates, owner_hwnd);
+        clear_clipped_window_surrogate_presentation_override(owner_hwnd);
     }
 }
 
@@ -720,6 +813,7 @@ fn clear_clipped_window_surrogate_window_state(hwnd: HWND) {
 fn promote_clipped_window_surrogate_owner_to_native(
     owner_hwnd: u64,
     native_visible_rect: flowtile_domain::Rect,
+    native_clip_rect: flowtile_domain::Rect,
 ) -> Result<(), String> {
     let owner = hwnd_from_raw(owner_hwnd)?;
     if !is_valid_window(owner) {
@@ -747,6 +841,9 @@ fn promote_clipped_window_surrogate_owner_to_native(
     if positioned == 0 {
         return Err(last_error_message("SetWindowPos"));
     }
+
+    sync_window_native_clip_mask(owner, Some(native_visible_rect), Some(native_clip_rect))?;
+    hide_spill_mask_overlay_if_initialized(owner_hwnd)?;
 
     activate_window(owner_hwnd)?;
     update_clipped_window_surrogate_diagnostics(|diagnostics| {
@@ -942,12 +1039,7 @@ fn is_transient_escape_class(class_name: &str) -> bool {
 fn is_problematic_clipped_window_class(class_name: &str) -> bool {
     matches!(
         class_name.trim().to_ascii_lowercase().as_str(),
-        CLASS_CHROME_WIDGET
-            | CLASS_MOZILLA_WINDOW
-            | CLASS_TERMINAL_HOSTING_WINDOW
-            | CLASS_APPLICATION_FRAME_WINDOW
-            | CLASS_WINDOWS_CORE_WINDOW
-            | CLASS_XAML_EXPLORER_HOST_ISLAND_WINDOW
+        CLASS_CHROME_WIDGET | CLASS_MOZILLA_WINDOW | CLASS_TERMINAL_HOSTING_WINDOW
     )
 }
 
@@ -997,8 +1089,16 @@ unsafe extern "system" fn clipped_window_surrogate_window_proc(
                 handoff_completed = promote_clipped_window_surrogate_owner_to_native(
                     state.owner_hwnd,
                     state.native_visible_rect,
+                    state.native_clip_rect,
                 )
                 .is_ok();
+                if handoff_completed {
+                    set_clipped_window_surrogate_presentation_override(
+                        state.owner_hwnd,
+                        crate::WindowPresentationMode::NativeVisible,
+                        "pointer-handoff".to_string(),
+                    );
+                }
             }
             let _ =
                 unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, SW_HIDE) };
@@ -1139,11 +1239,18 @@ mod tests {
     };
 
     use super::{
-        ClippedWindowSurrogateEscapeFacts, clipped_window_surrogate_candidate_reason,
-        is_problematic_clipped_window_class, is_safe_clipped_window_surrogate_candidate,
+        CLASS_APPLICATION_FRAME_WINDOW, CLASS_CHROME_WIDGET, CLASS_MOZILLA_WINDOW,
+        CLASS_TERMINAL_HOSTING_WINDOW, CLASS_WINDOWS_CORE_WINDOW,
+        CLASS_XAML_EXPLORER_HOST_ISLAND_WINDOW, ClippedWindowSurrogateEscapeFacts,
+        clear_clipped_window_surrogate_presentation_override,
+        clipped_window_surrogate_candidate_reason, is_problematic_clipped_window_class,
+        is_safe_clipped_window_surrogate_candidate, is_transient_escape_window,
         owner_requires_topmost_surrogate, pointer_replay_action_for_message,
-        should_escape_clipped_window_surrogate, should_escape_clipped_window_surrogate_from_facts,
+        record_clipped_window_surrogate_native_fallback, should_escape_clipped_window_surrogate,
+        should_escape_clipped_window_surrogate_from_facts,
+        surrogate_presentation_overrides_snapshot,
     };
+    use crate::WindowPresentationMode;
 
     #[test]
     fn source_rect_destination_can_share_same_partial_width() {
@@ -1164,13 +1271,19 @@ mod tests {
 
     #[test]
     fn browser_like_classes_are_rejected_for_clipped_surrogate() {
-        assert!(is_problematic_clipped_window_class("Chrome_WidgetWin_1"));
-        assert!(is_problematic_clipped_window_class("MozillaWindowClass"));
+        assert!(is_problematic_clipped_window_class(CLASS_CHROME_WIDGET));
+        assert!(is_problematic_clipped_window_class(CLASS_MOZILLA_WINDOW));
         assert!(is_problematic_clipped_window_class(
-            "CASCADIA_HOSTING_WINDOW_CLASS"
+            CLASS_TERMINAL_HOSTING_WINDOW
         ));
-        assert!(is_problematic_clipped_window_class(
-            "ApplicationFrameWindow"
+        assert!(!is_problematic_clipped_window_class(
+            CLASS_APPLICATION_FRAME_WINDOW
+        ));
+        assert!(!is_problematic_clipped_window_class(
+            CLASS_WINDOWS_CORE_WINDOW
+        ));
+        assert!(!is_problematic_clipped_window_class(
+            CLASS_XAML_EXPLORER_HOST_ISLAND_WINDOW
         ));
         assert!(!is_problematic_clipped_window_class("FlowtileAppWindow"));
     }
@@ -1220,6 +1333,37 @@ mod tests {
     }
 
     #[test]
+    fn menu_dialog_tooltip_and_ime_classes_are_treated_as_transient_escape_windows() {
+        for class_name in [
+            "#32768",
+            "#32770",
+            "tooltips_class32",
+            "msctfime ui",
+            "ime",
+            "xaml_windowedpopupclass",
+        ] {
+            assert!(is_transient_escape_window(Some(class_name), 0, 0));
+        }
+    }
+
+    #[test]
+    fn transient_escape_classes_publish_classifier_reason() {
+        for class_name in [
+            "#32768",
+            "#32770",
+            "tooltips_class32",
+            "msctfime ui",
+            "ime",
+            "xaml_windowedpopupclass",
+        ] {
+            assert_eq!(
+                clipped_window_surrogate_candidate_reason(Some(class_name), 0, 0, false),
+                "transient-escape-class"
+            );
+        }
+    }
+
+    #[test]
     fn owner_topmost_state_controls_surrogate_topmost_policy() {
         assert!(owner_requires_topmost_surrogate(WS_EX_TOPMOST));
         assert!(!owner_requires_topmost_surrogate(0));
@@ -1232,6 +1376,10 @@ mod tests {
             "problematic-class"
         );
         assert_eq!(
+            clipped_window_surrogate_candidate_reason(Some("ApplicationFrameWindow"), 0, 0, false),
+            "eligible"
+        );
+        assert_eq!(
             clipped_window_surrogate_candidate_reason(Some("FlowtileAppWindow"), 0, 0, false),
             "eligible"
         );
@@ -1242,5 +1390,27 @@ mod tests {
         assert!(pointer_replay_action_for_message(WM_LBUTTONDOWN).is_some());
         assert!(pointer_replay_action_for_message(WM_NCLBUTTONDOWN).is_some());
         assert!(pointer_replay_action_for_message(WM_RBUTTONDOWN).is_some());
+    }
+
+    #[test]
+    fn native_fallback_records_effective_native_override() {
+        clear_clipped_window_surrogate_presentation_override(777);
+        record_clipped_window_surrogate_native_fallback(777, "problematic-class");
+
+        let overrides = surrogate_presentation_overrides_snapshot();
+        let override_projection = overrides
+            .get(&777)
+            .expect("native fallback should publish an effective presentation override");
+
+        assert_eq!(
+            override_projection.mode,
+            WindowPresentationMode::NativeVisible
+        );
+        assert_eq!(
+            override_projection.reason,
+            "native-fallback:problematic-class"
+        );
+
+        clear_clipped_window_surrogate_presentation_override(777);
     }
 }

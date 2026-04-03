@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use flowtile_config_rules::{LoadedConfig, bootstrap as config_bootstrap};
 use flowtile_diagnostics::{
@@ -15,7 +15,8 @@ use flowtile_layout_engine::{
     LayoutError, WorkspaceLayoutProjection, bootstrap_modes, preserves_insert_invariant,
 };
 use flowtile_windows_adapter::{
-    PlatformSnapshot, WindowsAdapter, WindowsAdapterError, bootstrap as windows_bootstrap,
+    PlatformPresentationPreflight, PlatformSnapshot, PlatformWindowDisposition, WindowsAdapter,
+    WindowsAdapterError, bootstrap as windows_bootstrap,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,6 +147,7 @@ pub struct RuntimeCycleReport {
     pub management_enabled: bool,
     pub dry_run: bool,
     pub degraded_reasons: Vec<String>,
+    pub discovery_trace_logs: Vec<String>,
     pub strip_movement_logs: Vec<String>,
     pub window_trace_logs: Vec<String>,
     pub validation_trace_logs: Vec<String>,
@@ -190,6 +192,13 @@ impl RuntimeCycleReport {
                 "degraded reasons: {}",
                 self.degraded_reasons.join(", ")
             ));
+        }
+        if !self.discovery_trace_logs.is_empty() {
+            lines.push(format!(
+                "discovery trace entries: {}",
+                self.discovery_trace_logs.len()
+            ));
+            lines.extend(self.discovery_trace_logs.iter().cloned());
         }
         if !self.strip_movement_logs.is_empty() {
             lines.push(format!(
@@ -247,7 +256,9 @@ pub struct CoreDaemonRuntime {
     active_config: LoadedConfig,
     last_valid_config: LoadedConfig,
     last_snapshot: Option<PlatformSnapshot>,
+    pending_discoveries: HashMap<u64, PendingDiscoveryEntry>,
     pending_focus_claim: Option<PendingFocusClaim>,
+    pending_platform_focus_candidate: Option<PendingPlatformFocusCandidate>,
     pending_geometry_settle_until: Option<Instant>,
     management_enabled: bool,
     consecutive_desync_cycles: u32,
@@ -259,6 +270,25 @@ pub struct CoreDaemonRuntime {
 struct PendingFocusClaim {
     desired_hwnd: u64,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingPlatformFocusCandidate {
+    observed_hwnd: u64,
+    stable_snapshots: u8,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDiscoveryEntry {
+    first_seen_at: Instant,
+    last_seen_at: Instant,
+    stable_ticks: u8,
+    last_rect: flowtile_domain::Rect,
+    family_key: String,
+    disposition: PlatformWindowDisposition,
+    disposition_reason: String,
+    presentation_preflight: PlatformPresentationPreflight,
+    presentation_reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -279,7 +309,7 @@ struct NewColumnRequest {
 mod runtime;
 mod state_store;
 
-pub use runtime::ActiveTiledResizeTarget;
+pub use runtime::{ActiveTiledResizeTarget, WindowPresentationProjection};
 
 #[cfg(test)]
 mod tests;

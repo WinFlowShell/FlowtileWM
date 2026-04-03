@@ -2,6 +2,10 @@ general {
   mode "wm-only"
 }
 
+monitors {
+  managed-binding "\\.\DISPLAY5"
+}
+
 layout {
   strip-scroll-step 240
   default-column-mode "normal"

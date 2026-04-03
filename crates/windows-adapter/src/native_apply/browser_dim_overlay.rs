@@ -1,9 +1,10 @@
 use std::{
+    collections::BTreeSet,
     collections::HashMap,
     mem::zeroed,
     ptr::{null, null_mut},
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -52,6 +53,18 @@ struct BrowserDimOverlayController {
 }
 
 static BROWSER_DIM_OVERLAY_CONTROLLER: OnceLock<BrowserDimOverlayController> = OnceLock::new();
+
+fn browser_dim_overlay_active_owners() -> &'static Mutex<BTreeSet<u64>> {
+    static ACTIVE_OWNERS: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+    ACTIVE_OWNERS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+pub(crate) fn active_browser_dim_overlay_owner_hwnds_snapshot() -> BTreeSet<u64> {
+    browser_dim_overlay_active_owners()
+        .lock()
+        .expect("browser dim overlay active owners mutex poisoned")
+        .clone()
+}
 
 impl BrowserDimOverlayController {
     fn spawn() -> Result<Self, String> {
@@ -238,7 +251,12 @@ fn show_browser_dim_overlay_internal(
         }
     };
 
-    show_browser_dim_overlay_window(overlay, rect, alpha)
+    show_browser_dim_overlay_window(overlay, rect, alpha)?;
+    browser_dim_overlay_active_owners()
+        .lock()
+        .expect("browser dim overlay active owners mutex poisoned")
+        .insert(owner_hwnd);
+    Ok(())
 }
 
 fn hide_browser_dim_overlay_internal(
@@ -246,6 +264,10 @@ fn hide_browser_dim_overlay_internal(
     owner_hwnd: u64,
 ) -> Result<(), String> {
     if let Some(overlay) = overlays.remove(&owner_hwnd) {
+        let _ = browser_dim_overlay_active_owners()
+            .lock()
+            .expect("browser dim overlay active owners mutex poisoned")
+            .remove(&owner_hwnd);
         destroy_browser_dim_overlay_window(overlay);
     }
 
@@ -347,4 +369,32 @@ fn destroy_browser_dim_overlay_window(window: HWND) {
 
     let _ = { unsafe { ShowWindow(window, SW_HIDE) } };
     let _ = { unsafe { DestroyWindow(window) } };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        active_browser_dim_overlay_owner_hwnds_snapshot, browser_dim_overlay_active_owners,
+    };
+
+    #[test]
+    fn active_owner_snapshot_reflects_browser_dim_overlay_state() {
+        {
+            let mut owners = browser_dim_overlay_active_owners()
+                .lock()
+                .expect("browser dim overlay active owners mutex poisoned");
+            owners.clear();
+            owners.extend([101_u64, 202_u64]);
+        }
+
+        assert_eq!(
+            active_browser_dim_overlay_owner_hwnds_snapshot(),
+            [101_u64, 202_u64].into_iter().collect()
+        );
+
+        browser_dim_overlay_active_owners()
+            .lock()
+            .expect("browser dim overlay active owners mutex poisoned")
+            .clear();
+    }
 }

@@ -9,7 +9,7 @@ use flowtile_domain::{
 };
 use flowtile_windows_adapter::{
     ObservationEnvelope, ObservationKind, PlatformMonitorSnapshot, PlatformSnapshot,
-    PlatformWindowSnapshot,
+    PlatformWindowSnapshot, WindowPresentationMode,
 };
 
 use super::{CoreDaemonBootstrap, CoreDaemonRuntime, RuntimeError, StateStore};
@@ -630,6 +630,9 @@ fn location_change_observation_plans_prompt_reassert() {
 #[test]
 fn emergency_unwind_disables_management_before_next_sync() {
     let mut runtime = CoreDaemonRuntime::new(RuntimeMode::WmOnly);
+    runtime
+        .sync_snapshot(sample_snapshot(100, Rect::new(0, 0, 420, 900), true), true)
+        .expect("initial managed snapshot should succeed");
 
     runtime.request_emergency_unwind("test-case");
     let report = runtime
@@ -649,6 +652,14 @@ fn emergency_unwind_disables_management_before_next_sync() {
             .runtime
             .degraded_flags
             .contains(&"emergency-unwind:test-case".to_string())
+    );
+    assert!(
+        !runtime
+            .state()
+            .runtime
+            .degraded_flags
+            .iter()
+            .any(|flag| flag.starts_with("presentation-cleanup-failed:"))
     );
 }
 
@@ -1404,9 +1415,23 @@ fn scroll_command_changes_projected_geometry_and_apply_plan() {
     assert_eq!(
         planned_operations
             .iter()
+            .find(|operation| operation.hwnd == 100)
+            .map(|operation| operation.presentation.mode),
+        Some(WindowPresentationMode::NativeVisible)
+    );
+    assert_eq!(
+        planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 100)
+            .and_then(|operation| operation.presentation.monitor_scene.home_visible_rect),
+        Some(Rect::new(0, 16, 76, 868))
+    );
+    assert_eq!(
+        planned_operations
+            .iter()
             .find(|operation| operation.hwnd == 101)
             .map(|operation| operation.rect.x),
-        Some(88)
+        Some(601)
     );
     assert_eq!(
         planned_operations
@@ -1418,8 +1443,38 @@ fn scroll_command_changes_projected_geometry_and_apply_plan() {
     assert_eq!(
         planned_operations
             .iter()
+            .find(|operation| operation.hwnd == 101)
+            .map(|operation| operation.presentation.mode),
+        Some(WindowPresentationMode::SurrogateVisible)
+    );
+    assert_eq!(
+        planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 101)
+            .and_then(|operation| operation.presentation.surrogate.as_ref())
+            .map(|surrogate| surrogate.destination_rect.x),
+        Some(88)
+    );
+    assert_eq!(
+        planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 102)
+            .map(|operation| operation.presentation.mode),
+        Some(WindowPresentationMode::SurrogateClipped)
+    );
+    assert_eq!(
+        planned_operations
+            .iter()
             .find(|operation| operation.hwnd == 102)
             .map(|operation| operation.rect.x),
+        Some(601)
+    );
+    assert_eq!(
+        planned_operations
+            .iter()
+            .find(|operation| operation.hwnd == 102)
+            .and_then(|operation| operation.presentation.surrogate.as_ref())
+            .map(|surrogate| surrogate.destination_rect.x),
         Some(400)
     );
     assert_eq!(
@@ -1945,6 +2000,145 @@ fn move_workspace_to_next_monitor_preserves_identity_and_focus() {
 }
 
 #[test]
+fn overview_defaults_to_first_managed_monitor_when_primary_is_ordinary() {
+    let mut store = StateStore::new(RuntimeMode::WmOnly);
+    let ordinary_primary = store
+        .state_mut()
+        .add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+    let managed_secondary = store
+        .state_mut()
+        .add_monitor(Rect::new(1600, 0, 1600, 900), 96, false);
+    set_test_monitor_binding(&mut store, ordinary_primary, "\\\\.\\DISPLAY1");
+    set_test_monitor_binding(&mut store, managed_secondary, "\\\\.\\DISPLAY2");
+    set_test_managed_monitor_bindings(&mut store, &["\\\\.\\DISPLAY2"]);
+
+    store
+        .dispatch(DomainEvent::open_overview(CorrelationId::new(1), None))
+        .expect("open overview should succeed");
+
+    assert_eq!(store.state().overview.monitor_id, Some(managed_secondary));
+    assert_eq!(
+        store.state().overview.selection,
+        store
+            .state()
+            .active_workspace_id_for_monitor(managed_secondary)
+    );
+}
+
+#[test]
+fn focus_navigation_defaults_to_managed_monitor_when_primary_is_ordinary() {
+    let mut store = StateStore::new(RuntimeMode::WmOnly);
+    let ordinary_primary = store
+        .state_mut()
+        .add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+    let managed_secondary = store
+        .state_mut()
+        .add_monitor(Rect::new(1600, 0, 1600, 900), 96, false);
+    set_test_monitor_binding(&mut store, ordinary_primary, "\\\\.\\DISPLAY1");
+    set_test_monitor_binding(&mut store, managed_secondary, "\\\\.\\DISPLAY2");
+    set_test_managed_monitor_bindings(&mut store, &["\\\\.\\DISPLAY2"]);
+
+    let first_window = discover_tiled_window(
+        &mut store,
+        1,
+        managed_secondary,
+        100,
+        Rect::new(1600, 0, 420, 900),
+    );
+    let _second_window = discover_tiled_window(
+        &mut store,
+        2,
+        managed_secondary,
+        101,
+        Rect::new(2020, 0, 360, 900),
+    );
+
+    store.state_mut().focus.focused_monitor_id = Some(ordinary_primary);
+    store.state_mut().focus.focused_window_id = None;
+    store.state_mut().focus.focused_column_id = None;
+
+    store
+        .dispatch(DomainEvent::focus_next(
+            CorrelationId::new(3),
+            NavigationScope::WorkspaceStrip,
+        ))
+        .expect("focus navigation should succeed");
+
+    assert_eq!(
+        store.state().focus.focused_monitor_id,
+        Some(managed_secondary)
+    );
+    assert_eq!(store.state().focus.focused_window_id, Some(first_window));
+}
+
+#[test]
+fn move_workspace_to_next_monitor_skips_ordinary_monitors_when_managed_set_is_active() {
+    let mut store = StateStore::new(RuntimeMode::WmOnly);
+    let managed_left = store
+        .state_mut()
+        .add_monitor(Rect::new(0, 0, 1600, 900), 96, true);
+    let ordinary_middle = store
+        .state_mut()
+        .add_monitor(Rect::new(1600, 0, 1600, 900), 96, false);
+    let managed_right = store
+        .state_mut()
+        .add_monitor(Rect::new(3200, 0, 1600, 900), 96, false);
+    set_test_monitor_binding(&mut store, managed_left, "\\\\.\\DISPLAY1");
+    set_test_monitor_binding(&mut store, ordinary_middle, "\\\\.\\DISPLAY2");
+    set_test_monitor_binding(&mut store, managed_right, "\\\\.\\DISPLAY3");
+    set_test_managed_monitor_bindings(&mut store, &["\\\\.\\DISPLAY1", "\\\\.\\DISPLAY3"]);
+
+    let _window_a =
+        discover_tiled_window(&mut store, 1, managed_left, 100, Rect::new(0, 0, 420, 900));
+    let window_b = discover_tiled_window(
+        &mut store,
+        2,
+        managed_left,
+        101,
+        Rect::new(420, 0, 360, 900),
+    );
+
+    store
+        .dispatch(DomainEvent::move_column_to_workspace_down(
+            CorrelationId::new(3),
+            None,
+        ))
+        .expect("column move to workspace should succeed");
+
+    let moved_workspace_id = store
+        .state()
+        .active_workspace_id_for_monitor(managed_left)
+        .expect("active workspace should exist on left monitor");
+
+    store
+        .dispatch(DomainEvent::move_workspace_to_monitor_next(
+            CorrelationId::new(4),
+            None,
+        ))
+        .expect("move workspace to next managed monitor should succeed");
+
+    assert_eq!(store.state().focus.focused_monitor_id, Some(managed_right));
+    assert_eq!(
+        store.state().active_workspace_id_for_monitor(managed_right),
+        Some(moved_workspace_id)
+    );
+    assert_eq!(store.state().focus.focused_window_id, Some(window_b));
+    assert_eq!(
+        store
+            .state()
+            .workspaces
+            .get(&moved_workspace_id)
+            .expect("workspace should exist")
+            .monitor_id,
+        managed_right
+    );
+    assert!(
+        !ordered_workspace_ids_for_monitor(store.state(), ordinary_middle)
+            .contains(&moved_workspace_id)
+    );
+}
+
+#[test]
 fn directional_overview_commands_are_not_reduced_to_blind_toggle() {
     let mut store = StateStore::new(RuntimeMode::WmOnly);
     let monitor_id = store
@@ -2080,6 +2274,26 @@ fn sample_snapshot(hwnd: u64, rect: Rect, focused: bool) -> PlatformSnapshot {
         Rect::new(0, 0, 1600, 900),
         vec![(hwnd, rect, focused, true)],
     )
+}
+
+fn set_test_monitor_binding(
+    store: &mut StateStore,
+    monitor_id: flowtile_domain::MonitorId,
+    binding: &str,
+) {
+    store
+        .state_mut()
+        .monitors
+        .get_mut(&monitor_id)
+        .expect("monitor should exist")
+        .platform_binding = Some(binding.to_string());
+}
+
+fn set_test_managed_monitor_bindings(store: &mut StateStore, bindings: &[&str]) {
+    store.state_mut().config_projection.managed_monitor_bindings = bindings
+        .iter()
+        .map(|binding| (*binding).to_string())
+        .collect();
 }
 
 fn snapshot_with_windows(
